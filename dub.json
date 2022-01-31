@@ -1,0 +1,8 @@
+{
+	"name": "gyred",
+	"description": "Gyre reference implementation.",
+
+	"license": "Artistic-2.0",
+	"copyright": "Copyright © 2022, Gabriel B. Sant'Anna",
+	"authors": ["Gabriel B. Sant'Anna"]
+}
