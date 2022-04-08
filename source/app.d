@@ -1,9 +1,5 @@
-/// testing 1
 import gyre;
 
-/// this is a test
-void main() {
-	if (true) {
-		foo();
-	}
+int main(string[] args) {
+    return 0;
 }
