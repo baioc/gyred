@@ -6,8 +6,8 @@ Authors: [Gabriel B. Sant'Anna](baiocchi.gabriel@gmail.com)
 +/
 module gyre.set;
 
+import std.traits : isPointer, PointerTarget;
 import std.range.primitives : ElementType, isInputRange, isInfinite;
-import std.traits : isPointer;
 
 
 /++
@@ -23,9 +23,9 @@ struct Set(T) {
         // this is essentially a wrapper around a classic AA trick, but with a twist
         alias Unit = void[0];
         enum unit = Unit.init;
-        static if (isPointer!T) alias Key = HashablePointer!(typeof(*T));
+        static if (isPointer!T) alias Key = HashablePointer!(PointerTarget!T);
         else                    alias Key = T;
-        Unit[Key] aa;
+        Unit[Key] _aa;
     }
     nothrow pure @safe {
         /// Adds an element to the set.
@@ -34,7 +34,7 @@ struct Set(T) {
             assert(x in this, "added element should be in the set");
         } do {
             Key key = x;
-            this.aa[key] = unit;
+            this._aa[key] = unit;
         }
 
         /++
@@ -46,33 +46,34 @@ struct Set(T) {
             assert(x !in this, "removed element should not be in the set");
         } do {
             Key key = x;
-            return this.aa.remove(key);
+            return this._aa.remove(key);
         }
 
         /// Checks if an element is present in the set. Equivalent to the expression `x in set`
         bool contains()(auto ref T x) const {
             Key key = x;
-            return (key in this.aa) != null;
+            return (key in this._aa) != null;
         }
 
+        /// ditto
         bool opBinaryRight(string op)(auto ref T lhs) const if (op == "in") {
             return this.contains(lhs);
         }
 
         /// Returns the number of elements in the set.
         @property size_t length() const @nogc {
-            return this.aa.length;
+            return this._aa.length;
         }
 
         /// Returns a forward range which will iterate over the set's elements.
         auto byKey() const @nogc {
-            return this.aa.byKey;
+            return this._aa.byKey;
         }
     }
 
     /// Rehashes the set in place (so that lookups are more efficient).
     auto rehash() nothrow pure {
-        return this.aa.rehash();
+        return this._aa.rehash();
     }
 
     /// Returns an independent duplicate of this set.
@@ -81,14 +82,15 @@ struct Set(T) {
         assert(result.length == this.length, "duplicate set should have the same size as the original");
         foreach (ref T x; this) assert(x in result, "every element in the original should be in the new set");
     } do {
-        import std.algorithm : map;
         import std.traits : hasMember;
+        import std.algorithm : map;
         return this.byKey.map!((T x) {
             static if (hasMember!(T, "dup")) return x.dup;
             else                             return x;
         }).set;
     }
 
+    /// Can be used to iterate over this set's elements with a `foreach` loop.
     int opApply(F)(F iter) const { // templated for attribute inference
         foreach (ref T x; this.byKey) {
             int stop = iter(x);
@@ -110,12 +112,12 @@ nothrow pure unittest {
             debug usingCustomHash = true;
             return value * value;
         }
-        bool opEquals()(auto ref const(MyInt) other) const {
+        bool opEquals(ref const MyInt other) const {
             return this.value == other.value;
         }
     }
 
-    static immutable list = [0, 1, 42, int.max, int.min, 0];
+    immutable list = [0, 1, 42, int.max, int.min, 0];
     enum N = list.length;
     Set!(MyInt*) s = list.map!(n => new MyInt(n)).set;
     assert(s.length == N-1); // one less because of the duplicate (0)
@@ -164,7 +166,7 @@ struct HashablePointer(T) if (!isPointer!T) {
     static assert((HashablePointer!T).sizeof == (T*).sizeof, "HashablePointer!T should have the sizeof a T*");
 
  nothrow pure @safe:
-    inout this(return inout(T)* ptr) @nogc {
+    inout this(inout(T)* ptr) @nogc {
         this.ptr = ptr;
     }
 
@@ -172,7 +174,7 @@ struct HashablePointer(T) if (!isPointer!T) {
         return ptr == null ? 0 : typeid(T).getHash(ptr);
     }
 
-    bool opEquals()(auto ref const(HashablePointer!T) rhs) const {
+    bool opEquals(ref const HashablePointer!T rhs) const {
         if (this.ptr == rhs.ptr) return true;
         else return this.ptr != null && rhs.ptr != null && *this.ptr == *rhs.ptr;
     }
@@ -197,5 +199,5 @@ struct HashablePointer(T) if (!isPointer!T) {
     assert(p.baz == x.baz);
     assert(p.bar(p) == x.bar(&x)); // implicit conversion
     p = null;
-    assert(p == null);
+    assert(p is null);
 }
