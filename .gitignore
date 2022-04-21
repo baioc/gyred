@@ -16,3 +16,5 @@ gyred.dll
 gyred.a
 gyred.lib
 gyred-test-*
+
+perf.data

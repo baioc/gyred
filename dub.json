@@ -2,6 +2,33 @@
 	"name": "gyred",
 	"description": "Gyre reference implementation.",
 
+	"buildRequirements": ["allowWarnings"],
+	"dflags": ["-dip1000"],
+	"buildTypes": {
+		"debug": {
+			"buildOptions": ["debugMode", "debugInfo"],
+			"dflags": ["-betterC"]
+		},
+		"release": {
+			"buildOptions": ["releaseMode", "optimize", "inline"],
+			"dflags": ["-betterC"],
+			"dflags-ldc": ["-static"]
+		},
+		"release-debug": {
+			"buildOptions": ["releaseMode", "optimize", "inline", "debugInfo"],
+			"dflags": ["-betterC"],
+			"dflags-ldc": ["-static"]
+		},
+		"release-nobounds": {
+			"buildOptions": ["releaseMode", "optimize", "inline", "noBoundsCheck"],
+			"dflags": ["-betterC"],
+			"dflags-ldc": ["-static"]
+		},
+		"release-druntime": {
+			"buildOptions": ["releaseMode", "optimize", "inline", "debugInfo"]
+		}
+	},
+
 	"license": "Artistic-2.0",
 	"copyright": "Copyright © 2022, Gabriel B. Sant'Anna",
 	"authors": ["Gabriel B. Sant'Anna"]
