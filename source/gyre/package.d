@@ -9,26 +9,25 @@ Explicit concurrency comes with the addition of a [standard memory consistency m
 Several other features are "mashed up" in Gyre's design, coming from an extensive survey on compilers and portable IRs.
 
 Design_Principles:
-* Expressivity:
+### Expressivity:
     The IR must be able to represent, up to some level of detail, the essential properties of any program.
     Software which is not portable is also of interest, even if only to indicate where and how it uses machine-specific constructs and assumptions, or when compiling it to a compatible architecture.
-* Efficiency:
+### Efficiency:
     The IR's wire format should be fast to decode and validate.
     At the same time, the IR itself must not introduce unreasonable costs to transformations, nor impose unnecessary restrictions to program structure.
-* Progressivity:
+### Progressivity:
     Premature lowering decreases optimization potential, so the IR must be able to preserve "high-level" structure and information for as long as it is desirable to do so.
-* Parsimony:
+### Parsimony:
     The IR must not expand uncontrollably to accommodate new languages or machines.
     Instead, it ought to contain a well-defined "core" which is small, yet expressive.
-* Extensibility:
+### Extensibility:
     The IR should be amenable to extensions, both from users and to its own specification.
     These must to be clearly signaled for the sake of compatibility.
     This principle complements the previous one.
 
 See_Also:
-[Gyre graphs](./graph.html), [UNCOL](https://www.osdata.com/topic/language/uncol.htm)
+[Gyre graphs](./gyre.graph.html), [UNCOL](https://www.osdata.com/topic/language/uncol.htm)
 +/
 module gyre;
 
-public import gyre.core;
-public import gyre.hash;
+public import gyre.graph;

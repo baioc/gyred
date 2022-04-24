@@ -3,7 +3,7 @@ import core.stdc.stdio : printf;
 import core.stdc.time : clock, clock_t, CLOCKS_PER_SEC;
 
 
-version(D_BetterC) {
+version (D_BetterC) {
     extern (C) int main(int argc, const(char)** argv) {
         int n = argc > 1 ? atoi(argv[1]) : 0;
         int reserve = argc > 2 ? atoi(argv[2]) : 0;
@@ -29,13 +29,13 @@ void insertionBenchmark(int n, int reserve) {
     n = n > 0 ? n : 10_000_000;
     reserve = reserve >= 0 && reserve <= n ? reserve : 0;
 
-    version(D_BetterC) {
-        import gyre.hash : HashMap;
-        printf("Using gyre.hash.HashMap\n");
+    version (D_BetterC) {
+        import eris.hash_table;
+        printf("Using custom HashMap\n");
         HashMap!(ulong, int) dict;
-        scope(exit) dict.destroy();
+        scope(exit) dict.dispose();
     } else {
-        printf("Using D's built-in AAs\n");
+        printf("Using D's builtin AA\n");
         int[ulong] dict;
     }
 

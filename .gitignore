@@ -2,6 +2,7 @@
 *.o
 *.obj
 *.lst
+*.a
 
 .dub
 dub.selections.json
@@ -17,4 +18,4 @@ gyred.a
 gyred.lib
 gyred-test-*
 
-perf.data
+perf.data*

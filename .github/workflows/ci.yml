@@ -8,12 +8,11 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macOS-latest]
-        dc: [dmd-latest, ldc-latest]
-        include: # local dev versions
-          - dc: dmd-2.099.0
-            os: ubuntu-latest
-          - dc: ldc-1.28.1
-            os: ubuntu-latest
+        dc: [ldc-latest, dmd-latest]
+        cfg: [application, betterC]
+        exclude:
+          - dc: dmd-latest
+            cfg: betterC
 
     runs-on: ${{ matrix.os }}
     steps:
@@ -25,5 +24,8 @@ jobs:
         with:
           compiler: ${{ matrix.dc }}
 
+      - name: Build project ⚙️
+        run: dub build --config=${{ matrix.cfg }} --parallel
+
       - name: Run tests 🧪
-        run: dub test --parallel --coverage
+        run: dub test --coverage --parallel

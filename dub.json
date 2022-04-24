@@ -1,33 +1,28 @@
 {
 	"name": "gyred",
 	"description": "Gyre reference implementation.",
+	"homepage": "https://github.com/baioc/gyred",
+
+	"targetType": "executable",
+	"mainSourceFile": "source/app.d",
 
 	"buildRequirements": ["allowWarnings"],
 	"dflags": ["-dip1000"],
-	"buildTypes": {
-		"debug": {
-			"buildOptions": ["debugMode", "debugInfo"],
-			"dflags": ["-betterC"]
+
+	"configurations": [
+		{
+			"name": "application"
 		},
-		"release": {
-			"buildOptions": ["releaseMode", "optimize", "inline"],
+		{
+			"name": "betterC",
 			"dflags": ["-betterC"],
-			"dflags-ldc": ["-static"]
+			"dflags-linux-ldc": ["-static"],
+			"dflags-windows-ldc": ["-static"]
 		},
-		"release-debug": {
-			"buildOptions": ["releaseMode", "optimize", "inline", "debugInfo"],
-			"dflags": ["-betterC"],
-			"dflags-ldc": ["-static"]
-		},
-		"release-nobounds": {
-			"buildOptions": ["releaseMode", "optimize", "inline", "noBoundsCheck"],
-			"dflags": ["-betterC"],
-			"dflags-ldc": ["-static"]
-		},
-		"release-druntime": {
-			"buildOptions": ["releaseMode", "optimize", "inline", "debugInfo"]
+		{
+			"name": "unittest"
 		}
-	},
+	],
 
 	"license": "Artistic-2.0",
 	"copyright": "Copyright © 2022, Gabriel B. Sant'Anna",
