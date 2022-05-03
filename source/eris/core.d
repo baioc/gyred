@@ -1,14 +1,14 @@
-/// Common typedefs, templates and helper procedures for D as betterC.
+/// Core type definitions, templates and helper procedures for D as betterC.
 module eris.core;
 
-import core.stdc.stdlib : malloc, free;
+import core.stdc.stdlib : malloc, calloc, free;
 import std.traits : hasIndirections;
 
 
 /++
 Default zero-sized type. Carries no information at all.
 
-Make sure not to use this in `extern (C)` function signatures, as the ABI is unspecified.
+NOTE: Make sure not to use this in `extern (C)` function signatures, as the ABI is unspecified.
 +/
 alias Unit = void[0];
 
@@ -24,20 +24,23 @@ alias err_t = int;
 
 
 /++
-Allocates enough memory for a given number of elements of a certain type. Must be [deallocate](#deallocate)d later.
+Allocates enough memory for a given number of elements of a certain type.
 
-If the GC is enabled, the allocated memory block will be registered for GC scanning.
+The allocated memory must be later [deallocate](#deallocate)d.
+It will also be registered for GC scanning iff the GC is enabled.
 
 Params:
     n = Number of contiguous elements to allocate.
 
 Returns:
-    The allocated memory block, or null in case of failure, zero size or overflow.
+    Pointer to the allocated memory, or null in case of OOM, overflow or zero-sized allocation.
 
-See_Also: [deallocate](#free)
+See_Also: [deallocate](#deallocate)
+
+XXX: It would have been nice to parameterize this by global structs following the same duck-typed interface of the [core std.experimental allocators](https://dlang.org/phobos/std_experimental_allocator.html), but they don't seem to be linked in when compiling in betterC mode.
 +/
-pragma(inline) T* allocate(T)(size_t n = 1) @nogc nothrow
-@trusted // only because of the cast
+T* allocate(T)(size_t n = 1) @nogc nothrow
+@trusted // because malloc and friends can be trusted (there's also the cast)
 {
     import core.checkedint : mulu;
 
@@ -45,26 +48,27 @@ pragma(inline) T* allocate(T)(size_t n = 1) @nogc nothrow
     const size_t totalBytes = mulu(n, T.sizeof, overflow);
     if (overflow) return null;
 
-    void* ptr = malloc(totalBytes);
-    version (D_BetterC) {} else {
+    version (D_BetterC) {
+        void* ptr = malloc(totalBytes);
+    } else {
+        void* ptr = calloc(n, T.sizeof);
         static if (hasIndirections!T) {
             import core.memory : GC;
             if (ptr != null) GC.addRange(ptr, totalBytes);
         }
     }
+
     return cast(T*)(ptr);
 }
 
 /++
 Frees previously [allocate](#allocate)d memory block.
 
-If the GC is enabled, the memory block will be unregistered from GC scanning.
-
 Params:
-    ptr = Pointer to [allocate](#allocate)d memory block (or null, in which case nothing happens).
+    ptr = Pointer to previously [allocate](#allocate)d memory block (or null, in which case nothing happens).
     n = Must match the parameter used to [allocate](#allocate) the given block.
 +/
-pragma(inline) void deallocate(T)(T* ptr, size_t n = 1) @nogc nothrow {
+void deallocate(T)(T* ptr, size_t n = 1) @nogc nothrow @system {
     version (D_BetterC) {} else {
         static if (hasIndirections!T) {
             import core.memory : GC;
@@ -74,10 +78,10 @@ pragma(inline) void deallocate(T)(T* ptr, size_t n = 1) @nogc nothrow {
     free(ptr);
 }
 
-/// Consider using `scope(exit)` to ensure deallocation (but beware of double-free!).
+/// Consider using `scope(exit)` to ensure deallocation (but beware of double frees).
 @nogc nothrow unittest {
     auto cacheLine = allocate!ubyte(64);
-    scope(exit) deallocate(cacheLine);
+    scope(exit) deallocate(cacheLine, 64);
 }
 
 

@@ -31,11 +31,10 @@ void insertionBenchmark(int n, int reserve) {
 
     version (D_BetterC) {
         import eris.hash_table;
-        printf("Using custom HashMap\n");
+        printf("With custom hash table\n");
         HashMap!(ulong, int) dict;
-        scope(exit) dict.dispose();
     } else {
-        printf("Using D's builtin AA\n");
+        printf("Using D's built-in AAs\n");
         int[ulong] dict;
     }
 

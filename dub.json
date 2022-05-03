@@ -7,7 +7,12 @@
 	"mainSourceFile": "source/app.d",
 
 	"buildRequirements": ["allowWarnings"],
-	"dflags": ["-dip1000"],
+	"dflags": [
+		"-preview=fieldwise",
+		"-preview=inclusiveincontracts",
+		"-dip25",
+		"-dip1000"
+	],
 
 	"configurations": [
 		{
@@ -20,7 +25,8 @@
 			"dflags-windows-ldc": ["-static"]
 		},
 		{
-			"name": "unittest"
+			"name": "unittest",
+			"targetName": "gyred-test-unittest"
 		}
 	],
 

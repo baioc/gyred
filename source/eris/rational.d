@@ -10,15 +10,14 @@ import eris.core : opCmp, hash_t;
 /++
 [Reduced-form](https://en.wikipedia.org/wiki/Irreducible_fraction) rational number.
 
-NOTE: The current implementation doesn't even try to deal with overflows (yet).
+NOTE: The current implementation doesn't even try to deal with overflows.
 +/
-struct Rational(Z) {
+struct Rational(Z) if (__traits(isPOD, Z)) {
     private Z _numerator = 0;
     private Z _denominator = 1;
     invariant (_denominator > 0, "denominator must always be positive");
 
     version (D_BetterC) {} else {
-        /// Returns this rational number formatted as "numerator/denominator".
         string toString() const {
             import std.conv : to;
             import std.string : format;
@@ -38,7 +37,7 @@ struct Rational(Z) {
     }
 
     /// Constructs a Rational from given numerator and (non-zero) denominator.
-    this(inout(Z) numerator, inout(Z) denominator = 1) inout
+    this(inout(Z) numerator, inout(Z) denominator = 1) inout nothrow
     in (denominator != 0, "denominator must not be zero")
     {
         const bool invert = denominator < 0;
@@ -65,7 +64,7 @@ struct Rational(Z) {
         return this.denominator == 1 && this.numerator == rhs;
     }
 
-    /// ditto
+    /// Casts this rational to a floating-point type for comparison.
     bool opEquals(R)(R rhs) const if (isFloatingPoint!R) {
         return this.opCast!R == rhs;
     }
@@ -76,9 +75,9 @@ struct Rational(Z) {
 
     /// Compares two rationals based on their reduced form.
     int opCmp(const(Rational) rhs) const {
-        const commonMultiple = lcm(this.denominator, rhs.denominator);
-        const lhsNumerator = this.numerator * (commonMultiple / this.denominator);
-        const rhsNumerator = rhs.numerator * (commonMultiple / rhs.denominator);
+        auto commonMultiple = lcm(this.denominator, rhs.denominator);
+        auto lhsNumerator = this.numerator * (commonMultiple / this.denominator);
+        auto rhsNumerator = rhs.numerator * (commonMultiple / rhs.denominator);
         return lhsNumerator.opCmp(rhsNumerator);
     }
 
@@ -87,7 +86,7 @@ struct Rational(Z) {
         return this.numerator.opCmp(rhs * this.denominator);
     }
 
-    /// ditto
+    /// Casts this rational to a floating-point type for comparison.
     int opCmp(R)(R rhs) const if (isFloatingPoint!R) {
         return this.opCast!R().opCmp(rhs);
     }
@@ -99,9 +98,9 @@ struct Rational(Z) {
 
     /// Arithmetic operations on rationals and (after conversion) integers.
     Rational opBinary(string op : "+")(const(Rational) rhs) const {
-        const commonMultiple = lcm(this.denominator, rhs.denominator);
-        const lhsMultiple = commonMultiple / this.denominator;
-        const rhsMultiple = commonMultiple / rhs.denominator;
+        auto commonMultiple = lcm(this.denominator, rhs.denominator);
+        auto lhsMultiple = commonMultiple / this.denominator;
+        auto rhsMultiple = commonMultiple / rhs.denominator;
         return Rational(
             (this.numerator * lhsMultiple) + (rhs.numerator * rhsMultiple),
             commonMultiple

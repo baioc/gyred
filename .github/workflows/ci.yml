@@ -11,8 +11,7 @@ jobs:
         dc: [ldc-latest, dmd-latest]
         cfg: [application, betterC]
         exclude:
-          - dc: dmd-latest
-            cfg: betterC
+          - {dc: dmd-latest, cfg: betterC}
 
     runs-on: ${{ matrix.os }}
     steps:

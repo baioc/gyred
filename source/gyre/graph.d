@@ -13,6 +13,7 @@ module gyre.graph;
 import std.bitmanip : taggedPointer;
 
 import eris.hash_table;
+import eris.util : HashablePointer;
 
 
 /++
@@ -71,7 +72,7 @@ struct OutEdge {
         this.kind = kind;
         this.target = target;
         assert(
-            target is null || target.kind == this.kind,
+            target == null || target.kind == this.kind,
             "connecting edge slots must have matching kinds."
         );
     }
@@ -87,7 +88,6 @@ struct OutEdge {
     // data edges are directed from uses to defs
     use1.target = &def;
     use2.target = &def;
-    assert(use1.target == use2.target);
     assert(use1 == use2);
 }
 
@@ -118,13 +118,11 @@ struct InEdge {
 
 ///
 @nogc nothrow pure unittest {
-    Node node;
     auto A = OutEdge.control;
     auto B = InEdge.control;
     // in this example, control flows out from A and into B
     A.target = &B;
-    B.owner = &node;
-    assert(A.target.owner == &node);
+    assert(A.target.owner is B.owner);
 }
 
 
@@ -142,85 +140,108 @@ struct Node {
     HashSet!(Node*) observers; /// Set of in-neighbors which have edges pointing to this node.
 
     private static immutable(VTable) vtbl = VTable.init;
-    immutable struct VTable {
-     nothrow:
-        size_t function(ref const(Node)) toHash = (ref self) => 0;
-        bool function(ref const(Node), ref const(Node)) opEquals = (ref lhs, ref rhs) => lhs is rhs;
+    private immutable struct VTable {
+     @nogc nothrow @safe:
+        size_t function(const(Node)*) toHash = (self) => 0;
+        bool function(const(Node)*, const(Node)*) opEquals = (lhs, rhs) => lhs == rhs;
     }
 
- pragma(inline) nothrow:
+ @nogc nothrow @safe:
     size_t toHash() const {
-        return this.vptr.toHash(this);
+        return this.vptr.toHash(&this);
     }
 
-    bool opEquals()(auto ref const(Node) rhs) const {
-        return this.vptr.opEquals(this, rhs);
+    bool opEquals(ref const(Node) rhs) const {
+        return this.vptr.opEquals(&this, &rhs);
     }
 }
 
 // hand-made struct inheritance
-private mixin template NodeInheritance(Node.VTable vtable = Node.VTable.init) {
-    private static immutable(Node.VTable) vtbl = vtable;
+private mixin template NodeInheritance() {
+    private alias This = typeof(this);
 
-    public Node _node = { vptr: &vtbl };
-    public alias _node this;
+    private Node _node = { vptr: &vtbl };
+    static assert(
+        This._node.offsetof == 0,
+        "common Node prefix must be at a zero offset for safe struct inheritance"
+    );
 
-    public pragma(inline) nothrow {
-        @property ref inout(Node) asNode() inout @trusted {
-            static assert(
-                typeof(this)._node.offsetof == 0,
-                "common Node prefix must be at a zero offset for safe struct inheritance"
-            );
-            return cast(inout(Node))(this);
+    public @nogc nothrow pure @safe {
+        @property ref inout(HashSet!(Node*)) observers() inout {
+            return this._node.observers;
         }
 
+        inout(Node)* asNode() inout {
+            return &this._node;
+        }
+
+        static inout(This)* ofNode(inout(Node)* node) @trusted {
+            if (node == null || node.vptr != &vtbl) return null;
+            return cast(inout(This)*)(node);
+        }
+    }
+
+    static immutable(Node.VTable) vtbl = {
+        toHash: (const(Node)* node) @nogc nothrow @safe {
+            auto self = This.ofNode(node);
+            assert(self != null);
+            return (*self).toHash();
+        },
+        opEquals: (const(Node)* lhs, const(Node)* rhs) @nogc nothrow @safe {
+            auto self = This.ofNode(lhs);
+            assert(self != null);
+            if (auto other = This.ofNode(rhs)) {
+                return *self == *other;
+            }
+            return false;
+        },
+    };
+}
+
+version (unittest) private {
+    static bool usingCustomHash;
+    static bool usingCustomEquals;
+
+    struct UnittestNode {
+        mixin NodeInheritance;
+        int value;
+
+     @nogc nothrow @safe:
+        this(int value) { this.value = value; }
+
         size_t toHash() const {
-            return this.vptr.toHash(this.asNode);
+            debug usingCustomHash = true;
+            return value;
         }
 
         bool opEquals()(auto ref const(typeof(this)) rhs) const {
-            return this.vptr.opEquals(this.asNode, rhs.asNode);
+            debug usingCustomEquals = true;
+            return this.value == rhs.value;
         }
     }
 }
 
-///
-nothrow unittest {
-    static bool usingCustomHash;
-    static bool usingCustomEquals;
-    struct TestNode {
-        mixin NodeInheritance!(vtable);
-        enum Node.VTable vtable = {
-            toHash: (ref self) {
-                debug usingCustomHash = true;
-                return 0;
-            },
-            opEquals: (ref self, ref rhs) {
-                debug usingCustomEquals = true;
-                return self is rhs;
-            },
-        };
-    }
-
+@nogc nothrow @safe unittest {
     // subtype inherits Node's members
-    TestNode test;
-    assert(is(typeof(test.observers) == typeof(Node.observers)));
+    UnittestNode test = UnittestNode(1);
+    Node* nodep = test.asNode;
+    assert(nodep.observers is test.observers);
 
     // subtype's toHash and opEquals work normally
     debug usingCustomHash = usingCustomEquals = false;
-    bool[TestNode] monomorphic;
-    monomorphic[test] = true;
-    assert(test == test);
+    HashSet!UnittestNode monomorphic;
+    monomorphic.add(test);
+    static assert(!__traits(compiles, monomorphic.add(*nodep)));
+    UnittestNode other = UnittestNode(2);
+    assert(test != other);
     debug assert(usingCustomHash && usingCustomEquals);
 
     // they also dispatch correctly when using a polymorphic Node
     debug usingCustomHash = usingCustomEquals = false;
-    auto node = test.asNode;
-    assert(node == node);
-    debug assert(usingCustomEquals);
-    bool[Node] polymorphic;
-    polymorphic[node] = true;
-    debug assert(usingCustomHash);
+    HashSet!(HashablePointer!Node) polymorphic;
+    polymorphic.add(HashablePointer!Node(nodep));
+    assert(*nodep != *(other.asNode));
+    debug assert(usingCustomHash && usingCustomEquals);
 }
 
 /++
@@ -235,7 +256,7 @@ Since join nodes define subprocedures, one may want to know where such a definit
 A join node's scope begins with all of its parameters and control flow edges.
 Furthermore, whenever another node is connected to part of a join node's scope, it also becomes part of that scope.
 In other words: a join node's scope is implicitly defined by the set of nodes (a) which are transitively reachable by control flow in its body or (b) which have a transitive dependency on any one of its parameters.
-This idea originates from [Thorin](https://compilers.cs.uni-saarland.de/papers/lkh15_cgo.pdf).
+This idea originates from [Thorin](https://compilers.cs.uni-saarland.de/papers/lkh15_cgo.pdf)'s implicit scopes.
 
 The only way in which a Gyre subgraph may refer to a join node without becoming part of its scope is through an indirection: the join node's "definition" edge.
 Through its definition, external code may instantiate and invoke a join node.
@@ -267,6 +288,15 @@ struct JoinNode {
                 assert(param.kind != EdgeKind.control);
         }
     }
+
+ @nogc nothrow @safe: // TODO:
+    size_t toHash() const {
+        return 0;
+    }
+
+    bool opEquals()(auto ref const(typeof(this)) rhs) const {
+        return this is rhs;
+    }
 }
 
 /++
@@ -292,6 +322,15 @@ struct InstantiationNode {
         assert(continuations.length > 0);
         foreach (ref cont; continuations)
             assert(cont.kind == EdgeKind.data);
+    }
+
+ @nogc nothrow @safe: // TODO:
+    size_t toHash() const {
+        return 0;
+    }
+
+    bool opEquals()(auto ref const(typeof(this)) rhs) const {
+        return this is rhs;
     }
 }
 
@@ -327,6 +366,15 @@ struct JumpNode {
         foreach (ref arg; arguments)
             assert(arg.kind != EdgeKind.control);
     }
+
+ @nogc nothrow @safe: // TODO:
+    size_t toHash() const {
+        return 0;
+    }
+
+    bool opEquals()(auto ref const(typeof(this)) rhs) const {
+        return this is rhs;
+    }
 }
 
 struct BranchNode {
@@ -343,6 +391,15 @@ struct BranchNode {
             foreach (ref branch; options)
                 assert(branch.kind == control);
         }
+    }
+
+ @nogc nothrow @safe: // TODO:
+    size_t toHash() const {
+        return 0;
+    }
+
+    bool opEquals()(auto ref const(typeof(this)) rhs) const {
+        return this is rhs;
     }
 }
 
@@ -363,6 +420,15 @@ struct ForkNode {
                 assert(thread.kind == control);
         }
     }
+
+ @nogc nothrow @safe: // TODO:
+    size_t toHash() const {
+        return 0;
+    }
+
+    bool opEquals()(auto ref const(typeof(this)) rhs) const {
+        return this is rhs;
+    }
 }
 
 // TODO: other prim ops { literals, arithmetic, mem ops }
@@ -376,6 +442,15 @@ struct MacroNode {
     OutEdge[] controlOutgoing;
     OutEdge minThreads;
     OutEdge maxThreads;
+
+ @nogc nothrow @safe: // TODO:
+    size_t toHash() const {
+        return 0;
+    }
+
+    bool opEquals()(auto ref const(typeof(this)) rhs) const {
+        return this is rhs;
+    }
 }
 
 
@@ -389,6 +464,5 @@ This may enable subgraph deduplication and yield more opportunities to perform c
 See_Also: [EdgeKind](#EdgeKind), [Node](#Node)
 +/
 struct Graph { // TODO
-    /// Storage space for all (including unused) nodes within this graph.
-    Node[] arena;
+    HashSet!(HashablePointer!Node) nodes;
 }
