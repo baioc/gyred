@@ -6,7 +6,6 @@ import std.algorithm.mutation : moveEmplace, swap;
 import std.math.traits : isPowerOf2;
 import std.meta : ApplyRight;
 import std.traits : Parameters, ReturnType;
-import std.typecons : Flag;
 
 import eris.core : allocate, deallocate, err_t, Unit, hash_t;
 import eris.rational : Rational;
@@ -119,19 +118,40 @@ struct UnsafeHashMap(Key, Value) {
     // we only need to allocate a value array if its size is non-zero
     static if (Value.sizeof > 0) Value* values = null;
 
+    pragma(inline, true) {
+        @property size_t allocated() const scope {
+            return this.buckets.length;
+        }
+
+        inout(Value)* valueAt(size_t index) inout
+        @trusted // indexes raw pointer `values`
+        in (index < this.allocated)
+        {
+            static if (Value.sizeof > 0) {
+                assert(this.values != null);
+                return &this.values[index];
+            } else {
+                return null;
+            }
+        }
+    }
+
     // since we're doing closed hashing, for every set of slots we have:
     // used <= occupied <= allocate (where allocations are performed in bulk)
     invariant {
         assert(used <= occupied);
         assert(occupied <= allocated);
+        assert((buckets.ptr == null && allocated == 0)
+            || (buckets.ptr != null && allocated != 0));
         static if (Value.sizeof > 0) {
             assert((buckets.ptr == null && values == null)
                 || (buckets.ptr != null && values != null));
         }
     }
 
+ public:
     version (D_BetterC) {} else {
-        public string toString() const {
+        string toString() const scope {
             import std.array : appender;
             import std.conv : to;
             import std.string : format;
@@ -159,27 +179,8 @@ struct UnsafeHashMap(Key, Value) {
         }
     }
 
-    pragma(inline, true) {
-        @property size_t allocated() const {
-            return this.buckets.length;
-        }
-
-        inout(Value)* valueAt(size_t index) inout
-        @trusted // indexes raw pointer `values`
-        in (index < this.allocated)
-        {
-            static if (Value.sizeof > 0) {
-                assert(this.values != null);
-                return &this.values[index];
-            } else {
-                return null;
-            }
-        }
-    }
-
- public:
     /// Returns the structural hash of this table.
-    size_t toHash() const {
+    size_t toHash() const scope {
         // entry order does not matter in a hash table, so we accumulate with XOR
         hash_t tableHash = 0;
         foreach (entry; this.byKeyValue) {
@@ -197,7 +198,8 @@ struct UnsafeHashMap(Key, Value) {
     }
 
     /// Structural equality comparison.
-    bool opEquals(ref const(UnsafeHashMap) other) const {
+    bool opEquals(scope ref const(UnsafeHashMap) other) const scope {
+        if (this is other) return true;
         if (other.length != this.length) return false;
         foreach (entry; this.byKeyValue) {
             if (entry.key !in other || entry.value != other[entry.key]) return false;
@@ -210,7 +212,7 @@ struct UnsafeHashMap(Key, Value) {
 
     See_Also: [capacity](#UnsafeHashMap.capacity)
     +/
-    @property size_t length() const {
+    @property size_t length() const scope {
         return this.used;
     }
 
@@ -219,7 +221,7 @@ struct UnsafeHashMap(Key, Value) {
 
     See_Also: [length](#UnsafeHashMap.length)
     +/
-    @property size_t capacity() const {
+    @property size_t capacity() const scope {
         return cast(size_t)(this.allocated * maxLoadFactor);
     }
 
@@ -228,7 +230,7 @@ struct UnsafeHashMap(Key, Value) {
 
     See_Also: [get](#get)
     +/
-    inout(Key)* opBinaryRight(string op : "in")(auto ref const(Key) key) inout {
+    inout(Key)* opBinaryRight(string op : "in")(scope auto ref const(Key) key) inout scope {
         if (this.length == 0) return null;
         const k = this.buckets.probeFor!Key(key);
         auto bucket = &this.buckets[k];
@@ -240,7 +242,7 @@ struct UnsafeHashMap(Key, Value) {
 
     See_Also: [require](#require), [get](#get)
     +/
-    inout(Value) opIndex()(auto ref const(Key) key) inout
+    inout(Value) opIndex()(scope auto ref const(Key) key) inout scope
     out (value; key in this || value == Value.init)
     {
         inout(Key)* keyp;
@@ -259,7 +261,7 @@ struct UnsafeHashMap(Key, Value) {
 
     See_Also: [update](#update)
     +/
-    err_t opIndexAssign(Value value, Key key) {
+    err_t opIndexAssign(return scope Value value, return scope Key key) scope {
         err_t error;
         this.update(key, () => value, (ref Value old) => value, error);
         return error;
@@ -274,12 +276,10 @@ struct UnsafeHashMap(Key, Value) {
 }
 
 /// Frees all resources allocated by the hash table.
-void dispose(Flag!"destroy" destroy = Flag!"destroy".yes, K, V)(
-    ref UnsafeHashMap!(K,V) self
-) nothrow @system
+void dispose(K, V)(scope ref UnsafeHashMap!(K,V) self) nothrow @system
 out (; self.capacity == 0)
 {
-    static if (destroy) self.clear();
+    self.clear();
     assert(self.allocated == self.buckets.length);
     static if (V.sizeof > 0) self.values.deallocate(self.allocated);
     self.buckets.ptr.deallocate(self.allocated);
@@ -298,7 +298,7 @@ out (; self.capacity == 0)
 }
 
 /// Initializes a hash table.
-private err_t initialize(K, V)(out UnsafeHashMap!(K,V) self, size_t capacity) nothrow
+private err_t initialize(K, V)(scope out UnsafeHashMap!(K,V) self, size_t capacity) nothrow
 in (self.buckets.ptr == null)
 out (; self.length == 0)
 {
@@ -357,7 +357,7 @@ Returns:
     Zero on success, non-zero on failure.
     Reasons for failure include OOM, overflow or an invalid capacity.
 +/
-err_t rehash(K, V)(ref UnsafeHashMap!(K,V) self, size_t newCapacity) nothrow @system
+err_t rehash(K, V)(scope ref UnsafeHashMap!(K,V) self, size_t newCapacity) nothrow @system
 in (newCapacity >= self.length, "table capacity must be enough to fit its current entries")
 out (error; error || self.capacity >= newCapacity)
 {
@@ -365,7 +365,7 @@ out (error; error || self.capacity >= newCapacity)
 
     // edge case: rehash empty table to zero capacity
     if (newCapacity == 0 && self.length == 0) {
-        self.dispose!(Flag!"destroy".no);
+        self.dispose();
         const error = self.initialize(0);
         assert(!error, "zero capacity doesn't allocate and thus can't fail");
         return 0;
@@ -400,7 +400,7 @@ out (error; error || self.capacity >= newCapacity)
 }
 
 /// ditto
-err_t rehash(K, V)(ref UnsafeHashMap!(K,V) self) {
+err_t rehash(K, V)(scope ref UnsafeHashMap!(K,V) self) {
     enum targetLoadFactor = Rational!size_t(1, 2);
     enum allocationAdjustment = maxLoadFactor / targetLoadFactor;
     static assert(allocationAdjustment >= 1.0);
@@ -410,7 +410,7 @@ err_t rehash(K, V)(ref UnsafeHashMap!(K,V) self) {
 
 private pragma(inline, true) bool _get(K, V)(
     ref inout(UnsafeHashMap!(K,V)) self,
-    auto ref const(K) find,
+    scope auto ref const(K) find,
     out inout(Bucket!K)* bucket,
     out inout(V)* value,
 )
@@ -444,7 +444,7 @@ Returns: Whether or not the entry was found in the table.
 +/
 bool get(K, V)(
     ref inout(UnsafeHashMap!(K,V)) self,
-    auto ref const(K) find,
+    scope auto ref const(K) find,
     out inout(K)* keyp,
     out inout(V)* valp
 )
@@ -460,7 +460,7 @@ out (found; (found && *keyp in self) || (!found && keyp == null))
 /// ditto
 bool get(K, V)(
     ref inout(UnsafeHashMap!(K,V)) self,
-    auto ref const(K) find,
+    scope auto ref const(K) find,
     out inout(K)* keyp
 ) {
     inout(V)* valp;
@@ -472,7 +472,7 @@ Removes a key's entry from the table.
 
 Returns: Whether or not the key had an entry to begin with.
 +/
-bool remove(K, V)(ref UnsafeHashMap!(K,V) self, auto ref const(K) key) nothrow
+bool remove(K, V)(scope ref UnsafeHashMap!(K,V) self, scope auto ref const(K) key) nothrow
 out (; key !in self)
 {
     Bucket!(K)* bucket;
@@ -492,15 +492,18 @@ Removes all elements from the hash table, without changing its capacity.
 
 This procedure will also call `destroy` on each entry's key and value.
 +/
-void clear(K, V)(ref UnsafeHashMap!(K,V) self) nothrow
+void clear(K, V)(scope ref UnsafeHashMap!(K,V) self) nothrow
 out (; self.length == 0)
 {
+    size_t toBeCleared = self.length;
     foreach (size_t k, ref bucket; self.buckets) {
         if (!bucket.isOccupied || bucket.wasDeleted) continue;
         destroy!false(bucket.key);
         static if (V.sizeof > 0) destroy!false(*self.valueAt(k));
         bucket.isOccupied = false;
         bucket.wasDeleted = false;
+        --toBeCleared;
+        if (toBeCleared == 0) break;
     }
     self.occupied = 0;
     self.used = 0;
@@ -550,8 +553,8 @@ Params:
 Returns: The entry's final value (or its `.init` in case of failure).
 +/
 pragma(inline) V update(K, V, Create, Update)(
-    ref UnsafeHashMap!(K,V) self,
-    K key,
+    scope ref UnsafeHashMap!(K,V) self,
+    return scope K key,
     scope auto ref const(Create) create,
     scope auto ref const(Update) update,
     out err_t error
@@ -609,8 +612,8 @@ if (is(ReturnType!Create == V)
 
 /// ditto
 V update(K, V, Create, Update)(
-    ref UnsafeHashMap!(K,V) self,
-    K key,
+    scope ref UnsafeHashMap!(K,V) self,
+    return scope K key,
     scope auto ref const(Create) create,
     scope auto ref const(Update) update
 )
@@ -636,8 +639,8 @@ Params:
 Returns: The entry's final value (or its `.init` in case of failure).
 +/
 V require(K, V, Create)(
-    ref UnsafeHashMap!(K,V) self,
-    K key,
+    scope ref UnsafeHashMap!(K,V) self,
+    return scope K key,
     scope auto ref const(Create) create,
     out err_t error
 )
@@ -648,8 +651,8 @@ if (is(ReturnType!Create == V) && Parameters!Create.length == 0)
 
 /// ditto
 V require(K, V, Create)(
-    ref UnsafeHashMap!(K,V) self,
-    K key,
+    scope ref UnsafeHashMap!(K,V) self,
+    return scope K key,
     scope auto ref const(Create) create
 )
 if (is(ReturnType!Create == V) && Parameters!Create.length == 0)
@@ -686,24 +689,29 @@ if (is(ReturnType!Create == V) && Parameters!Create.length == 0)
 }
 
 private mixin template UnsafeRangeBoilerplate(K, V) {
-    private const(UnsafeHashMap!(K,V))* table;
+    // XXX: due to limitations with `scope`, we can't safely take the address of
+    // a table and store it in the range, so we take pointers to its guts instead
+    private const(Bucket!(K))[] buckets;
+    static if (V.sizeof > 0) private const(V)* values = null;
     private size_t index;
 
-    private this(const(UnsafeHashMap!(K,V))* t, size_t i = 0)
-    in (t != null)
-    {
-        this.table = t;
-        for (; i < this.table.buckets.length; ++i) {
-            const bucket = &this.table.buckets[i];
+    private this(return scope ref const(UnsafeHashMap!(K,V)) t) scope @safe {
+        this.buckets = t.buckets;
+        static if (V.sizeof > 0) this.values = t.values;
+        this.updateIndexFrom(0);
+    }
+
+    private void updateIndexFrom(size_t i) scope {
+        for (; i < this.buckets.length; ++i) {
+            const bucket = &this.buckets[i];
             if (bucket.isOccupied && !bucket.wasDeleted) break;
         }
         this.index = i;
     }
 
     invariant {
-        assert(this.table != null);
-        if (this.index < this.table.buckets.length) {
-            auto bucket = &this.table.buckets[this.index];
+        if (this.index < this.buckets.length) {
+            auto bucket = &this.buckets[this.index];
             assert(
                 bucket.isOccupied && !bucket.wasDeleted,
                 "tried using an invalidated hash table range"
@@ -711,12 +719,12 @@ private mixin template UnsafeRangeBoilerplate(K, V) {
         }
     }
 
-    public bool empty() const {
-        return this.index >= this.table.buckets.length;
+    public bool empty() const scope {
+        return this.index >= this.buckets.length;
     }
 
-    public void popFront() in (!this.empty) {
-        this = typeof(this)(this.table, this.index + 1);
+    public void popFront() scope in (!this.empty) {
+        this.updateIndexFrom(this.index + 1);
     }
 }
 
@@ -726,37 +734,40 @@ Can be used to iterate over this table's entries (in an unspecified order).
 NOTE: These must NEVER outlive their backing hash table.
     Furthermore, mutating a table invalidates any ranges over it.
 +/
-auto byKey(K, V)(ref const(UnsafeHashMap!(K,V)) self) {
+auto byKey(K, V)(return scope ref const(UnsafeHashMap!(K,V)) self) @safe {
     struct ByKey {
         mixin UnsafeRangeBoilerplate!(K,V);
-        public ref const(K) front() const in (!this.empty) {
-            return this.table.buckets[this.index].key;
+        public ref const(K) front() const return scope in (!this.empty) {
+            return this.buckets[this.index].key;
         }
     }
-    return ByKey(&self);
+    return ByKey(self);
 }
 
 /// ditto
-auto byValue(K, V)(ref const(UnsafeHashMap!(K,V)) self) if (V.sizeof > 0) {
+auto byValue(K, V)(return scope ref const(UnsafeHashMap!(K,V)) self) @safe if (V.sizeof > 0) {
     struct ByValue {
         mixin UnsafeRangeBoilerplate!(K,V);
-        public ref const(V) front() const in (!this.empty) {
-            return *this.table.valueAt(this.index);
+        public ref const(V) front() const return scope in (!this.empty) {
+            const(V)* value = () @trusted { return &this.values[this.index]; }();
+            return *value;
         }
     }
-    return ByValue(&self);
+    return ByValue(self);
 }
 
 /// ditto
-auto byKeyValue(K, V)(ref const(UnsafeHashMap!(K,V)) self) {
+auto byKeyValue(K, V)(return scope ref const(UnsafeHashMap!(K,V)) self) @safe {
     struct ByKeyValue {
         mixin UnsafeRangeBoilerplate!(K,V);
-        public const(KeyValue) front() const in (!this.empty) {
-            auto bucket = &this.table.buckets[this.index];
-            static if (V.sizeof > 0)
-                return KeyValue(bucket.key, *this.table.valueAt(this.index));
-            else
+        public const(KeyValue) front() const scope in (!this.empty) {
+            auto bucket = &this.buckets[this.index];
+            static if (V.sizeof > 0) {
+                const(V)* value = () @trusted { return &this.values[this.index]; }();
+                return KeyValue(bucket.key, *value);
+            } else {
                 return KeyValue(bucket.key);
+            }
         }
         struct KeyValue {
             const(K) key;
@@ -764,7 +775,7 @@ auto byKeyValue(K, V)(ref const(UnsafeHashMap!(K,V)) self) {
             else                     enum value = V.init;
         }
     }
-    return ByKeyValue(&self);
+    return ByKeyValue(self);
 }
 
 ///
@@ -772,8 +783,8 @@ auto byKeyValue(K, V)(ref const(UnsafeHashMap!(K,V)) self) {
     static assert(
         !__traits(compiles,
             () @safe {
-                UnsafeHashMap!(char, long) table; // local variable
-                return table.byKeyValue;          // Error: range outlives table
+                scope UnsafeHashMap!(char, long) table; // local marked as `scope`
+                return table.byKeyValue;                // Error: cannot return scope variable
             }
         ),
         "must not allow a range to outlive its backing hash table"
@@ -789,7 +800,7 @@ Params:
 
 Returns: A shallow copy of the given hash table, or an empty table in case of failure (OOM).
 +/
-UnsafeHashMap!(K,V) dup(K, V)(ref const(UnsafeHashMap!(K,V)) self, out err_t error) nothrow
+UnsafeHashMap!(K,V) dup(K, V)(scope ref const(UnsafeHashMap!(K,V)) self, out err_t error) nothrow
 out (copy) {
     if (!error) {
         assert(copy.length == self.length);
@@ -810,7 +821,7 @@ out (copy) {
 }
 
 /// ditto
-UnsafeHashMap!(K,V) dup(K, V)(ref const(UnsafeHashMap!(K,V)) self) {
+UnsafeHashMap!(K,V) dup(K, V)(scope ref const(UnsafeHashMap!(K,V)) self) {
     err_t ignored;
     return self.dup(ignored);
 }
@@ -828,7 +839,9 @@ Adds an element to the set, possibly causing a [rehash](#rehash).
 
 Returns: Zero on success, non-zero on failure (e.g. OOM or overflow).
 +/
-pragma(inline) err_t add(K, V)(ref UnsafeHashMap!(K, V) self, K element) if (V.sizeof == 0) {
+pragma(inline) err_t add(K, V)(scope ref UnsafeHashMap!(K, V) self, return scope K element)
+if (V.sizeof == 0)
+{
     return (self[element] = V.init);
 }
 
@@ -848,7 +861,7 @@ pragma(inline) err_t add(K, V)(ref UnsafeHashMap!(K, V) self, K element) if (V.s
     assert(a !is b && a == b); // structural equality works
 }
 
-nothrow unittest { // not @safe due to limitation in cyclic inference
+nothrow @safe unittest {
     HashSet!long a, b;
     a.add(0);
     b = a.dup;
@@ -887,7 +900,7 @@ struct HashMap(Key, Value) {
     struct RAIIUnsafeHashMap {
         UnsafeHashMap!(Key, Value) table;
         @disable this(this);
-        ~this() @trusted { this.table.dispose(); }
+        ~this() scope @trusted { this.table.dispose(); }
     }
 
     // since non-copyable types are a pain in the ass, we make the RAII table refcounted,
@@ -899,15 +912,15 @@ struct HashMap(Key, Value) {
     // which does not leak references to the hash table's internal storage
     // and then mark as @trusted any operation which could rehash (that's safe now)
     pragma(inline, true) @safe {
-        @property bool isInitialized() const {
+        @property bool isInitialized() const scope {
             return this.rc.refCountedStore.isInitialized;
         }
 
-        void ensureInitialized() {
+        void ensureInitialized() scope {
             this.rc.refCountedStore.ensureInitialized();
         }
 
-        @property ref inout(UnsafeHashMap!(Key, Value)) impl() inout @trusted {
+        @property ref inout(UnsafeHashMap!(Key, Value)) impl() inout return scope @trusted {
             assert(this.isInitialized);
             return this.rc.refCountedPayload.table;
         }
@@ -919,45 +932,45 @@ struct HashMap(Key, Value) {
 
  public pragma(inline):
     version (D_BetterC) {} else {
-        auto toString() const {
+        auto toString() const scope {
             if (!this.isInitialized) return "#{}";
             return this.impl.toString();
         }
     }
 
-    auto toHash() const {
+    auto toHash() const scope {
         if (!this.isInitialized) return 0;
         return this.impl.toHash();
     }
 
-    auto opEquals(ref const(HashMap) other) const {
+    auto opEquals(scope ref const(HashMap) other) const scope {
         if (!this.isInitialized && !other.isInitialized) return true; // both null
         if (!this.isInitialized || !other.isInitialized) return false; // one null
         return this.impl == other.impl; // both non-null
     }
 
-    @property auto length() const {
+    @property auto length() const scope {
         if (!this.isInitialized) return 0;
         return this.impl.length;
     }
 
-    @property auto capacity() const {
+    @property auto capacity() const scope {
         if (!this.isInitialized) return 0;
         return this.impl.capacity;
     }
 
     // changed to safely return a bool instead of internal pointer to key
-    bool opBinaryRight(string op : "in")(auto ref const(Key) key) const {
+    bool opBinaryRight(string op : "in")(scope auto ref const(Key) key) const scope {
         if (!this.isInitialized) return false;
         return (key in this.impl) != null;
     }
 
-    inout(Value) opIndex()(auto ref const(Key) key) inout {
+    inout(Value) opIndex()(scope auto ref const(Key) key) inout scope {
         if (!this.isInitialized) return Value.init;
         return this.impl[key];
     }
 
-    auto opIndexAssign(Value value, Key key) @trusted {
+    auto opIndexAssign(return scope Value value, return scope Key key) scope @trusted {
         this.ensureInitialized();
         return (this.impl[key] = value);
     }
@@ -982,48 +995,48 @@ struct HashMap(Key, Value) {
 pragma(inline) {
     // removed: dispose
 
-    auto rehash(K, V)(ref HashMap!(K,V) self, size_t newCapacity) @trusted {
+    auto rehash(K, V)(scope ref HashMap!(K,V) self, size_t newCapacity) @trusted {
         self.ensureInitialized();
         return self.impl.rehash(newCapacity);
     }
 
-    auto rehash(K, V)(ref HashMap!(K,V) self) @trusted {
+    auto rehash(K, V)(scope ref HashMap!(K,V) self) @trusted {
         self.ensureInitialized();
         return self.impl.rehash();
     }
 
     // removed: get
 
-    auto remove(K, V)(ref HashMap!(K,V) self, auto ref const(K) key) {
+    auto remove(K, V)(scope ref HashMap!(K,V) self, scope auto ref const(K) key) {
         self.ensureInitialized();
         return self.impl.remove(key);
     }
 
-    auto clear(K, V)(ref HashMap!(K,V) self) {
+    auto clear(K, V)(scope ref HashMap!(K,V) self) {
         self.ensureInitialized();
         return self.impl.clear();
     }
 
-    auto update(K, V, Args...)(ref HashMap!(K,V) self, Args args) @trusted {
+    auto update(K, V, Args...)(scope ref HashMap!(K,V) self, return scope K find, Args args) @trusted {
         self.ensureInitialized();
-        return self.impl.update(args);
+        return self.impl.update(find, args);
     }
 
-    auto require(K, V, Args...)(ref HashMap!(K,V) self, Args args) @trusted {
+    auto require(K, V, Args...)(scope ref HashMap!(K,V) self, return scope K find, Args args) @trusted {
         self.ensureInitialized();
-        return self.impl.require(args);
+        return self.impl.require(find, args);
     }
 
     private mixin template RangeBoilerplate(K, V) {
         private const(HashMap!(K,V)) table;
         private size_t index;
 
-        private this(const(HashMap!(K,V)) t) {
+        private this(return scope ref const(HashMap!(K,V)) t) scope @safe {
             this.table = t;
             this.updateIndexFrom(0);
         }
 
-        private void updateIndexFrom(size_t i) {
+        private void updateIndexFrom(size_t i) scope {
             if (!this.table.isInitialized) return;
             for (; i < this.table.impl.buckets.length; ++i) {
                 const bucket = &this.table.impl.buckets[i];
@@ -1042,43 +1055,50 @@ pragma(inline) {
             }
         }
 
-        public bool empty() const {
+        public bool empty() const scope {
             return !this.table.isInitialized || this.index >= this.table.impl.buckets.length;
         }
 
-        public void popFront() in (!this.empty) {
+        public void popFront() scope in (!this.empty) {
             this.updateIndexFrom(this.index + 1);
         }
 
-        public typeof(this) save() {
+        public typeof(this) save() return scope @safe {
             return this;
         }
     }
 
-    auto byKey(K, V)(ref const(HashMap!(K,V)) self) {
+    auto byKey(K, V)(return scope ref const(HashMap!(K,V)) self)
+    @trusted // XXX: apparently, the `return scope` on the range constructor is not enough
+    {
         struct ByKey {
             mixin RangeBoilerplate!(K,V);
-            public const(K) front() const in (!this.empty) {
+            public const(K) front() const scope in (!this.empty) {
                 return this.table.impl.buckets[this.index].key;
             }
         }
         return ByKey(self);
     }
 
-    auto byValue(K, V)(ref const(HashMap!(K,V)) self) if (V.sizeof > 0) {
+    auto byValue(K, V)(return scope ref const(HashMap!(K,V)) self)
+    @trusted // XXX: apparently, the `return scope` on the range constructor is not enough
+    if (V.sizeof > 0)
+    {
         struct ByValue {
             mixin RangeBoilerplate!(K,V);
-            public const(V) front() const in (!this.empty) {
+            public const(V) front() const scope in (!this.empty) {
                 return *this.table.impl.valueAt(this.index);
             }
         }
         return ByValue(self);
     }
 
-    auto byKeyValue(K, V)(ref const(HashMap!(K,V)) self) {
+    auto byKeyValue(K, V)(return scope ref const(HashMap!(K,V)) self)
+    @trusted // XXX: apparently, the `return scope` on the range constructor is not enough
+    {
         struct ByKeyValue {
             mixin RangeBoilerplate!(K,V);
-            public const(KeyValue) front() const in (!this.empty) {
+            public const(KeyValue) front() const scope in (!this.empty) {
                 auto bucket = &this.table.impl.buckets[this.index];
                 static if (V.sizeof > 0)
                     return KeyValue(bucket.key, *this.table.impl.valueAt(this.index));
@@ -1094,7 +1114,7 @@ pragma(inline) {
         return ByKeyValue(self);
     }
 
-    HashMap!(K,V) dup(K, V)(ref const(HashMap!(K,V)) self, out err_t error) @trusted {
+    HashMap!(K,V) dup(K, V)(scope ref const(HashMap!(K,V)) self, out err_t error) @trusted {
         if (!self.isInitialized) return HashMap!(K,V).init;
         HashMap!(K,V) copy;
         copy.ensureInitialized();
@@ -1102,12 +1122,14 @@ pragma(inline) {
         return copy;
     }
 
-    HashMap!(K,V) dup(K, V)(ref const(HashMap!(K,V)) self) {
+    HashMap!(K,V) dup(K, V)(scope ref const(HashMap!(K,V)) self) {
         err_t ignored;
         return self.dup(ignored);
     }
 
-    auto add(K, V)(ref HashMap!(K, V) self, K element) @trusted if (V.sizeof == 0) {
+    auto add(K, V)(scope ref HashMap!(K, V) self, return scope K element) @trusted
+    if (V.sizeof == 0)
+    {
         return (self[element] = V.init);
     }
 }

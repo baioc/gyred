@@ -26,7 +26,7 @@ Design_Principles:
     This principle complements the previous one.
 
 See_Also:
-[gyre.graph](./gyre.graph.html)
+[An in-depth description of the IR's structure](./gyre.graph.html)
 +/
 module gyre;
 

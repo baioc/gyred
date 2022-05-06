@@ -65,7 +65,7 @@ struct Rational(Z) if (__traits(isPOD, Z)) {
     }
 
     /// Casts this rational to a floating-point type for comparison.
-    bool opEquals(R)(R rhs) const if (isFloatingPoint!R) {
+    bool opEquals(R)(R rhs) const scope if (isFloatingPoint!R) {
         return this.opCast!R == rhs;
     }
 
@@ -87,7 +87,7 @@ struct Rational(Z) if (__traits(isPOD, Z)) {
     }
 
     /// Casts this rational to a floating-point type for comparison.
-    int opCmp(R)(R rhs) const if (isFloatingPoint!R) {
+    int opCmp(R)(R rhs) const scope if (isFloatingPoint!R) {
         return this.opCast!R().opCmp(rhs);
     }
 

@@ -1,5 +1,5 @@
 /++
-Program construction and transformation procedures.
+"Low-level" program construction and transformation procedures.
 
 When expressed in Gyre, programs become sets of nodes and edges: a directed graph.
 It is very important that these graphs have a low memory footprint and enable the efficient implementation of program transformations.
@@ -12,6 +12,7 @@ module gyre.graph;
 
 import std.bitmanip : taggedPointer;
 
+import eris.core : hash_t;
 import eris.hash_table;
 import eris.util : HashablePointer;
 
@@ -59,16 +60,38 @@ An outgoing edge slot.
 Connects to either zero or exactly one [InEdge](#InEdge).
 +/
 struct OutEdge {
+    // XXX: taggedPointer's generated accessors are not scope, so we need to make
+    // @trusted custom accessors, see https://issues.dlang.org/show_bug.cgi?id=23095
     mixin(taggedPointer!(
-        InEdge*, "target", /// Either points to another edge slot, or is null.
-        EdgeKind, "kind", 2 /// This edge's kind, fixed on construction.
+        InEdge*, "_target",
+        EdgeKind, "_kind", 2
     ));
 
  @nogc nothrow pure @safe:
+    /// Either points to another edge slot, or is null.
+    @property inout(InEdge)* target() inout return scope @trusted {
+        return this._target;
+    }
+
+    /// ditto
+    @property void target(return scope InEdge* target) scope @trusted {
+        this._target = target;
+    }
+
+    /// This edge's kind, fixed on construction.
+    @property EdgeKind kind() const scope @trusted {
+        return this._kind;
+    }
+
+    /// ditto
+    @property void kind(EdgeKind kind) scope @trusted {
+        this._kind = kind;
+    }
+
     @disable this();
 
     ///
-    this(EdgeKind kind, InEdge* target = null) {
+    this(EdgeKind kind, return scope InEdge* target = null) {
         this.kind = kind;
         this.target = target;
         assert(
@@ -96,19 +119,41 @@ An incoming edge slot.
 
 Can receive any number of [OutEdge](#OutEdge)s.
 
-See_Also: [Node](#Node)
+See_Also: [INode](#INode)
 +/
 struct InEdge {
+    // XXX: taggedPointer's generated accessors are not scope, so we need to make
+    // @trusted custom accessors, see https://issues.dlang.org/show_bug.cgi?id=23095
     mixin(taggedPointer!(
-        Node*, "owner", /// Points back to the node which owns this edge.
-        EdgeKind, "kind", 2 /// This edge's kind, fixed on construction.
+        INode*, "_owner",
+        EdgeKind, "_kind", 2
     ));
 
  @nogc nothrow pure @safe:
+    /// Points back to the node which owns this edge.
+    @property inout(INode)* owner() inout return scope @trusted {
+        return this._owner;
+    }
+
+    /// ditto
+    @property void owner(return scope INode* owner) scope @trusted {
+        this._owner = owner;
+    }
+
+    /// This edge's kind, fixed on construction.
+    @property EdgeKind kind() const scope @trusted {
+        return this._kind;
+    }
+
+    /// ditto
+    @property void kind(EdgeKind kind) scope @trusted {
+        this._kind = kind;
+    }
+
     @disable this();
 
     ///
-    this(EdgeKind kind, Node* owner = null) {
+    this(EdgeKind kind, return scope INode* owner = null) {
         this.kind = kind;
         this.owner = owner;
     }
@@ -127,32 +172,78 @@ struct InEdge {
 
 
 /++
-Common interface shared by all Gyre nodes.
+Common interface shared by all Gyre nodes; safely used only as a referece type.
 
-Through its [OutEdge](#OutEdge) slots, one can easily reach a node's out-neighbors.
-In order to achieve efficient def-use traversal and peephole transformations, every Node must also keep track of its in-neighbors set (i.e. those which have [OutEdge](#OutEdge)s to one of its [InEdge](#InEdge) slots).
-
-See_Also: [Hash sets](./eris.hash_table.html#HashSet)
+Other things all nodes have in common:
+Name | Description
+---- | -----------
+`asNode` | Method which upcasts (and this always works) a concrete node `ref` to a generic `INode*`.
+`ofNode` | Static method which tries to downcast a generic `INode*` to a pointer of a concrete type, returning `null` when the cast would not be valid.
 +/
-struct Node {
+struct INode {
+ pragma(inline) @nogc nothrow @safe:
     private immutable(VTable)* vptr = &vtbl;
 
-    HashSet!(Node*) observers; /// Set of in-neighbors which have edges pointing to this node.
+    /++
+    This node's cached structural hash; to be updated whenever this node's structure stabilizes.
+
+    NOTE: This is the value which gets returned when `toHash` is called on a node (e.g. by hash tables).
+        It is cached for performance reasons, as computing the structural hash of a node within an arbitrary graph can be costly.
+
+    See_Also: [updateHash](#INode.updateHash)
+    +/
+    @property hash_t hash() const scope pure { return this._hash; }
+    private hash_t _hash;
+
+    /++
+    Set of in-neighbors which have edges pointing to this node; to be updated along with graph structure.
+
+    Through its [OutEdge](#OutEdge) slots, one can easily reach a node's out-neighbors.
+    In order to achieve efficient graph traversals and program transformations, every node must also keep track of its in-neighbors set (i.e. those which have [OutEdge](#OutEdge)s to one of its [InEdge](#InEdge) slots).
+    Does not change this specific node's structure.
+
+    See_Also: [Hash sets](./eris.hash_table.html#UnsafeHashSet)
+    +/
+    HashSet!(INode*) observers;
 
     private static immutable(VTable) vtbl = VTable.init;
     private immutable struct VTable {
      @nogc nothrow @safe:
-        size_t function(const(Node)*) toHash = (self) => 0;
-        bool function(const(Node)*, const(Node)*) opEquals = (lhs, rhs) => lhs == rhs;
+        hash_t function(scope const(INode)*) computeHash = null;
+        bool function(scope const(INode)*, scope const(INode)*) opEquals = null;
     }
 
- @nogc nothrow @safe:
-    size_t toHash() const {
-        return this.vptr.toHash(&this);
+    size_t toHash() const scope pure {
+        return this.hash;
     }
 
-    bool opEquals(ref const(Node) rhs) const {
-        return this.vptr.opEquals(&this, &rhs);
+    /++
+    Recomputes this node's structural hash and stores it in its `hash` field.
+
+    The new hash is obtained as the return value of the `computeHash` virtual method.
+    +/
+    void updateHash() scope
+    @trusted // because we're taking the address of a scope input
+    {
+        this._hash = this.vptr.computeHash(&this);
+    }
+
+    /++
+    Compares two nodes for equality. Must be consistent with hash computation.
+
+    NOTE: In an arbitrary graph, this can be a costly operation, so early exits are checked before any virtual call.
+        Thus, custom overrides will only be called on non-aliased same-type nodes with matching hashes.
+
+    Returns: True if and only if one node can be entirely substituted by the other in a Gyre program.
+    +/
+    bool opEquals(scope ref const(INode) other) const scope
+    @trusted // because we're taking the address of scope inputs
+    {
+        const(INode)* lhs = &this, rhs = &other;
+        if (lhs == rhs) return true;
+        if (lhs.vptr != rhs.vptr) return false;
+        if (lhs.hash != rhs.hash) return false;
+        return lhs.vptr.opEquals(lhs, rhs);
     }
 }
 
@@ -160,40 +251,40 @@ struct Node {
 private mixin template NodeInheritance() {
     private alias This = typeof(this);
 
-    private Node _node = { vptr: &vtbl };
+    INode _node = { vptr: &vtbl };
+    alias _node this;
     static assert(
         This._node.offsetof == 0,
-        "common Node prefix must be at a zero offset for safe struct inheritance"
+        "common INode prefix must be at a zero offset for safe struct inheritance"
     );
 
-    public @nogc nothrow pure @safe {
-        @property ref inout(HashSet!(Node*)) observers() inout {
-            return this._node.observers;
-        }
-
-        inout(Node)* asNode() inout {
+    public pragma(inline) @nogc nothrow pure @safe {
+        inout(INode)* asNode() inout return {
             return &this._node;
         }
 
-        static inout(This)* ofNode(inout(Node)* node) @trusted {
+        static inout(This)* ofNode(return scope inout(INode)* node)
+        @trusted // cast is safe because of vptr check + common prefix
+        {
             if (node == null || node.vptr != &vtbl) return null;
             return cast(inout(This)*)(node);
         }
+
+        size_t toHash() const scope {
+            return this.hash;
+        }
     }
 
-    static immutable(Node.VTable) vtbl = {
-        toHash: (const(Node)* node) @nogc nothrow @safe {
+    private static immutable(INode.VTable) vtbl = {
+        computeHash: (scope const(INode)* node) @nogc nothrow @safe {
             auto self = This.ofNode(node);
             assert(self != null);
-            return (*self).toHash();
+            return (*self).computeHash();
         },
-        opEquals: (const(Node)* lhs, const(Node)* rhs) @nogc nothrow @safe {
-            auto self = This.ofNode(lhs);
-            assert(self != null);
-            if (auto other = This.ofNode(rhs)) {
-                return *self == *other;
-            }
-            return false;
+        opEquals: (scope const(INode)* lhs, scope const(INode)* rhs) @nogc nothrow @safe {
+            auto self = This.ofNode(lhs), other = This.ofNode(rhs);
+            assert(self != null && other != null);
+            return *self == *other;
         },
     };
 }
@@ -207,14 +298,14 @@ version (unittest) private {
         int value;
 
      @nogc nothrow @safe:
-        this(int value) { this.value = value; }
+        this(int value) scope { this.value = value; }
 
-        size_t toHash() const {
+        hash_t computeHash() const scope {
             debug usingCustomHash = true;
-            return value;
+            return this.value;
         }
 
-        bool opEquals()(auto ref const(typeof(this)) rhs) const {
+        bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
             debug usingCustomEquals = true;
             return this.value == rhs.value;
         }
@@ -222,26 +313,35 @@ version (unittest) private {
 }
 
 @nogc nothrow @safe unittest {
-    // subtype inherits Node's members
-    UnittestNode test = UnittestNode(1);
-    Node* nodep = test.asNode;
-    assert(nodep.observers is test.observers);
+    // subtype inherits INode's attributes
+    auto test = UnittestNode(1);
+    assert(is(typeof(test.observers) == typeof(INode.observers)));
 
-    // subtype's toHash and opEquals work normally
-    debug usingCustomHash = usingCustomEquals = false;
-    HashSet!UnittestNode monomorphic;
-    monomorphic.add(test);
-    static assert(!__traits(compiles, monomorphic.add(*nodep)));
-    UnittestNode other = UnittestNode(2);
+    // it also inheris its methods (e.g. updateHash)
+    debug usingCustomHash = false;
+    test.updateHash();
+    debug assert(usingCustomHash);
+
+    // subtype's opEquals works normally
+    debug usingCustomEquals = false;
+    auto test2 = test; // hash is up to date
+    assert(test == test2);
+    auto other = UnittestNode(-1);
+    other.updateHash();
     assert(test != other);
-    debug assert(usingCustomHash && usingCustomEquals);
+    debug assert(usingCustomEquals);
 
-    // they also dispatch correctly when using a polymorphic Node
-    debug usingCustomHash = usingCustomEquals = false;
-    HashSet!(HashablePointer!Node) polymorphic;
-    polymorphic.add(HashablePointer!Node(nodep));
-    assert(*nodep != *(other.asNode));
-    debug assert(usingCustomHash && usingCustomEquals);
+    HashablePointer!INode node = test.asNode;
+    HashablePointer!INode node2 = test2.asNode;
+
+    // they also dispatch correctly when using a polymorphic node
+    HashSet!(HashablePointer!INode) polymorphic;
+    polymorphic.add(node); polymorphic.add(node2);
+    assert(polymorphic.length == 1); // but node and node2 are equal
+    assert(*node != *other.asNode); // these are still different, tho
+
+    // storing a generic node in a subtyped variable does not work
+    static assert(!__traits(compiles, other = *node));
 }
 
 /++
@@ -257,6 +357,7 @@ A join node's scope begins with all of its parameters and control flow edges.
 Furthermore, whenever another node is connected to part of a join node's scope, it also becomes part of that scope.
 In other words: a join node's scope is implicitly defined by the set of nodes (a) which are transitively reachable by control flow in its body or (b) which have a transitive dependency on any one of its parameters.
 This idea originates from [Thorin](https://compilers.cs.uni-saarland.de/papers/lkh15_cgo.pdf)'s implicit scopes.
+Two scopes cannot intersect unless one is entirely contained within the other (i.e. they are "well-structured").
 
 The only way in which a Gyre subgraph may refer to a join node without becoming part of its scope is through an indirection: the join node's "definition" edge.
 Through its definition, external code may instantiate and invoke a join node.
@@ -290,11 +391,11 @@ struct JoinNode {
     }
 
  @nogc nothrow @safe: // TODO:
-    size_t toHash() const {
+    hash_t computeHash() const scope {
         return 0;
     }
 
-    bool opEquals()(auto ref const(typeof(this)) rhs) const {
+    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
         return this is rhs;
     }
 }
@@ -302,7 +403,7 @@ struct JoinNode {
 /++
 Instantiates a join node.
 
-Join nodes correspond to static ("dead") program code.
+Join nodes correspond to static ("dead") subprograms.
 In order to actually use a join node, one must first create a "live" instance of it.
 The result of such an instantiation is a non-empty collection of continuations, one for each channel in the join pattern.
 Using a continuation requires one to provide its parameters and jump into it.
@@ -325,11 +426,11 @@ struct InstantiationNode {
     }
 
  @nogc nothrow @safe: // TODO:
-    size_t toHash() const {
+    hash_t computeHash() const scope {
         return 0;
     }
 
-    bool opEquals()(auto ref const(typeof(this)) rhs) const {
+    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
         return this is rhs;
     }
 }
@@ -345,7 +446,7 @@ If a caller expects return values (or even to take control back at all), it need
 
 Jumps synchronize with each other when a join pattern triggers.
 Imagine a set of concurrent processes, each carrying a continuation corresponding to a different channel of some join pattern; once they've all jumped into their respective continuations, the join pattern triggers and its body executes.
-Therefore, every event in those processes which is ordered before the jump, also happens before all events in the triggered join pattern body.
+Then, every event in those processes which happens before the jump, also happens before all events in the triggered join pattern body.
 
 See_Also: [JoinNode](#JoinNode)
 +/
@@ -368,91 +469,802 @@ struct JumpNode {
     }
 
  @nogc nothrow @safe: // TODO:
-    size_t toHash() const {
+    hash_t computeHash() const scope {
         return 0;
     }
 
-    bool opEquals()(auto ref const(typeof(this)) rhs) const {
+    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
         return this is rhs;
     }
 }
 
+
+/++
+Directs control flow to exactly one of multiple possible edges.
+
+The choice of which branch to take is controled by a data dependency interpreted as an unsigned integer indexing an array of options.
+If the selector's value does not match the index of any option, program behavior is undefined.
+A Gyre compiler may assume that this never happens and either issue warnings / errors or optimize accordingly (e.g. by assuming that the selector's value is one of the valid indexes, if control flow reaches this branch node).
+
+See_Also: [MuxNode](#MuxNode)
++/
 struct BranchNode {
     mixin NodeInheritance;
 
+    /// Incoming control flow edge.
     InEdge control;
-    OutEdge selector;
-    OutEdge[] options;
+    invariant (control.kind == EdgeKind.control);
 
+    /// Data dependency used to choose the taken branch.
+    OutEdge selector;
+    invariant (selector.kind == EdgeKind.data);
+
+    /++
+    At least two outgoing control flow edges, only one of which will be taken.
+
+    Represented as a sparse mapping to avoid having an exponential number of unused options.
+    +/
+    HashMap!(size_t, OutEdge) options;
     invariant {
-        with (EdgeKind) {
-            assert(this.control.kind == control);
-            assert(selector.kind == data);
-            foreach (ref branch; options)
-                assert(branch.kind == control);
-        }
+        assert(options.length >= 2);
+        foreach (branch; options.byValue)
+            assert(branch.kind == EdgeKind.control);
     }
 
  @nogc nothrow @safe: // TODO:
-    size_t toHash() const {
+    hash_t computeHash() const scope {
         return 0;
     }
 
-    bool opEquals()(auto ref const(typeof(this)) rhs) const {
+    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
         return this is rhs;
     }
 }
 
+/++
+Forks a single control flow into multiple concurrent ones.
+
+Data-only Gyre graphs are always implicitly concurrent: there is no ordering relation between data-only nodes other than the one implied by their def-use chains.
+When a node also requires control flow, expressing the fact that it is concurrent with respect to another (i.e. one is not necessarily ordered before the other) would be impossible in a classic CFG.
+Fork nodes work around this by signaling explicit concurrency in a Gyre graph.
+
+Fork nodes tell the compiler "the following subprograms have no ordering constraints between each other".
+Therefore, it is an error for any of the resulting control flows to make direct use of a value produced in another one of its sibling 'threads'.
+Still, every event which happens before a fork also happens before the events of its resulting control flows.
+Merging concurrent flows back into one can be done at a [join node](#JoinNode).
+
+See_Also: [JoinNode](#JoinNode), [JumpNode](#JumpNode)
++/
 struct ForkNode {
     mixin NodeInheritance;
 
-    OutEdge minParallelism;
-    OutEdge maxParallelism;
+    /// Incoming single control flow.
     InEdge control;
-    OutEdge[] threads;
+    invariant (control.kind == EdgeKind.control);
 
+    /// At least two concurrent control flows resulting from this fork.
+    OutEdge[] threads;
     invariant {
-        with (EdgeKind) {
-            assert(minParallelism.kind == data);
-            assert(maxParallelism.kind == data);
-            assert(this.control.kind == control);
-            foreach (ref thread; threads)
-                assert(thread.kind == control);
-        }
+        assert(threads.length >= 2);
+        foreach (ref thread; threads)
+            assert(thread.kind == EdgeKind.control);
     }
 
  @nogc nothrow @safe: // TODO:
-    size_t toHash() const {
+    hash_t computeHash() const scope {
         return 0;
     }
 
-    bool opEquals()(auto ref const(typeof(this)) rhs) const {
+    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
         return this is rhs;
     }
 }
 
-// TODO: other prim ops { literals, arithmetic, mem ops }
+/++
+An operation which chooses one of its inputs to forward as a result.
 
-struct MacroNode {
+In a mux node, the choice of which input to forward is controled by an unsigned integer, as if it was indexing an array of inputs.
+If the selector's value does not match the index of any input, the result is a poison value.
+
+Meta:
+Starting at this one, most (but not all) other primitives are data-only, representing purely combinatorial operations.
+
+Poison:
+Each data-only operation has fixed-type inputs and outputs, but may have some conditions imposed on its inputs in order to produce a sane value.
+When the result of an operation isn't well-defined (e.g. integer division by zero), it produces a "poison".
+Poison values originate from [LLVM](https://llvm.org/docs/LangRef.html#poison-values) and indicate invalid program behavior.
+Furthermore, these values are poisonous because any operation with poison operands also produces poison (mux nodes are the exception, since poisoned inputs may not be chosen depending on the selector's value).
+
+This is not unlike C's infamous "Undefined Behavior", because a Gyre compiler may (while respecting program semantics) assume that poison values are never used, which in turn may help with some optimizations (e.g. [loop-invariant code motion](https://en.wikipedia.org/wiki/Loop-invariant_code_motion)).
+Another option is to issue warnings or errors when such erroneous behavior is detected.
+Therefore, this library's default is to ignore any detected undefined behavior / poison value usage.
+
+See_Also: [BranchNode](#BranchNode)
++/
+struct MuxNode {
     mixin NodeInheritance;
 
-    OutEdge[] dataUses;
-    InEdge[] dataDefs;
-    InEdge[] controlIncoming;
-    OutEdge[] controlOutgoing;
-    OutEdge minThreads;
-    OutEdge maxThreads;
+    /// Resulting value.
+    InEdge output;
+    invariant (output.kind == EdgeKind.data);
+
+    /// Data dependency used to choose which of the given inputs will be returned.
+    OutEdge selector;
+    invariant (selector.kind == EdgeKind.data);
+
+    /++
+    At least two inputs, one of which will be forwarded as output.
+
+    Represented as a sparse mapping to avoid having an exponential number of unused input edges.
+    +/
+    HashMap!(size_t, OutEdge) inputs;
+    invariant {
+        assert(inputs.length >= 2);
+        foreach (option; inputs.byValue)
+            assert(option.kind == EdgeKind.data);
+    }
 
  @nogc nothrow @safe: // TODO:
-    size_t toHash() const {
+    hash_t computeHash() const scope {
         return 0;
     }
 
-    bool opEquals()(auto ref const(typeof(this)) rhs) const {
+    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
         return this is rhs;
     }
 }
 
+/++
+Constructs a constant / literal value of a certain type.
+
+See_Also: [UndefinedNode](#UndefinedNode)
++/
+struct ConstantNode {
+    mixin NodeInheritance;
+
+    /// The constant's value.
+    InEdge value;
+    invariant (value.kind == EdgeKind.data);
+
+ @nogc nothrow @safe: // TODO:
+    hash_t computeHash() const scope {
+        return 0;
+    }
+
+    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+        return this is rhs;
+    }
+}
+
+/++
+Constructs a ["don't care"](https://en.wikipedia.org/wiki/Don%27t-care_term) value of a certain type.
+
+The compiler is free to make this node produce any value, as long as it is consistently seen by all of its uses.
+This notion of an "undefined value" originates from [Click's](https://scholarship.rice.edu/bitstream/handle/1911/96451/TR95-252.pdf) formalization of monotone analyses.
+
+Rationale:
+Undefined values cannot be produced by constant nodes, because the latter are subject to structural sharing, whereas different undefined nodes can resolve to different values and therefore have their own "identity".
++/
+struct UndefinedNode {
+    mixin NodeInheritance;
+
+    /// The resulting value.
+    InEdge value;
+    invariant (value.kind == EdgeKind.data);
+
+ @nogc nothrow @safe: // TODO:
+    hash_t computeHash() const scope {
+        return 0;
+    }
+
+    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+        return this is rhs;
+    }
+}
+
+/// Bitwise NOT operation.
+struct NotNode {
+    mixin NodeInheritance;
+
+    /// Bit pattern being negated.
+    OutEdge input;
+    invariant (input.kind == EdgeKind.data);
+
+    /// Resulting bit pattern.
+    InEdge output;
+    invariant (output.kind == EdgeKind.data);
+
+ @nogc nothrow @safe: // TODO:
+    hash_t computeHash() const scope {
+        return 0;
+    }
+
+    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+        return this is rhs;
+    }
+}
+
+/// Bitwise AND operation.
+struct AndNode {
+    mixin NodeInheritance;
+
+    /// Left-hand-side operand.
+    OutEdge lhs;
+    invariant (lhs.kind == EdgeKind.data);
+
+    /// Right-hand-side operand.
+    OutEdge rhs;
+    invariant (rhs.kind == EdgeKind.data);
+
+    /// Resulting bit pattern.
+    InEdge output;
+    invariant (output.kind == EdgeKind.data);
+
+ @nogc nothrow @safe: // TODO:
+    hash_t computeHash() const scope {
+        return 0;
+    }
+
+    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+        return this is rhs;
+    }
+}
+
+/// Bitwise OR operation.
+struct OrNode {
+    mixin NodeInheritance;
+
+    /// Left-hand-side operand.
+    OutEdge lhs;
+    invariant (lhs.kind == EdgeKind.data);
+
+    /// Right-hand-side operand.
+    OutEdge rhs;
+    invariant (rhs.kind == EdgeKind.data);
+
+    /// Resulting bit pattern.
+    InEdge output;
+    invariant (output.kind == EdgeKind.data);
+
+ @nogc nothrow @safe: // TODO:
+    hash_t computeHash() const scope {
+        return 0;
+    }
+
+    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+        return this is rhs;
+    }
+}
+
+/// Bitwise XOR operation.
+struct XorNode {
+    mixin NodeInheritance;
+
+    /// Left-hand-side operand.
+    OutEdge lhs;
+    invariant (lhs.kind == EdgeKind.data);
+
+    /// Right-hand-side operand.
+    OutEdge rhs;
+    invariant (rhs.kind == EdgeKind.data);
+
+    /// Resulting bit pattern.
+    InEdge output;
+    invariant (output.kind == EdgeKind.data);
+
+ @nogc nothrow @safe: // TODO:
+    hash_t computeHash() const scope {
+        return 0;
+    }
+
+    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+        return this is rhs;
+    }
+}
+
+/++
+Bitwise left-shift operation; bits shifted in are all zero.
+
+The shift amount must be no greater than the number of input bits, otherwise the result is a [poison](#MuxNode) value.
++/
+struct LeftShiftNode {
+    mixin NodeInheritance;
+
+    /// Initial bit pattern being shifted.
+    OutEdge input;
+    invariant (input.kind == EdgeKind.data);
+
+    /// Number of times the shift is performed.
+    OutEdge shift;
+    invariant (shift.kind == EdgeKind.data);
+
+    /// Resulting bit pattern.
+    InEdge output;
+    invariant (output.kind == EdgeKind.data);
+
+ @nogc nothrow @safe: // TODO:
+    hash_t computeHash() const scope {
+        return 0;
+    }
+
+    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+        return this is rhs;
+    }
+}
+
+/++
+Logical right-shift operation; bits shifted in are all zero.
+
+The shift amount must be no greater than the number of input bits, otherwise the result is a [poison](#MuxNode) value.
+
+See_Also: [SignedRightShiftNode](#SignedRightShiftNode)
++/
+struct UnsignedRightShiftNode {
+    mixin NodeInheritance;
+
+    /// Initial bit pattern being shifted.
+    OutEdge input;
+    invariant (input.kind == EdgeKind.data);
+
+    /// Number of times the shift is performed.
+    OutEdge shift;
+    invariant (shift.kind == EdgeKind.data);
+
+    /// Resulting bit pattern.
+    InEdge output;
+    invariant (output.kind == EdgeKind.data);
+
+ @nogc nothrow @safe: // TODO:
+    hash_t computeHash() const scope {
+        return 0;
+    }
+
+    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+        return this is rhs;
+    }
+}
+
+/++
+Arithmetic right-shift operation; bits shifted in are equal to the input's most significant bit.
+
+The shift amount must be no greater than the number of input bits, otherwise the result is a [poison](#MuxNode) value.
+
+See_Also: [UnsignedRightShiftNode](#UnsignedRightShiftNode)
++/
+struct SignedRightShiftNode {
+    mixin NodeInheritance;
+
+    /// Initial bit pattern being shifted.
+    OutEdge input;
+    invariant (input.kind == EdgeKind.data);
+
+    /// Number of times the shift is performed.
+    OutEdge shift;
+    invariant (shift.kind == EdgeKind.data);
+
+    /// Resulting bit pattern.
+    InEdge output;
+    invariant (output.kind == EdgeKind.data);
+
+ @nogc nothrow @safe: // TODO:
+    hash_t computeHash() const scope {
+        return 0;
+    }
+
+    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+        return this is rhs;
+    }
+}
+
+/// Two's complement addition operation (works for both signed and unsigned integers).
+struct AdditionNode {
+    mixin NodeInheritance;
+
+    /// Left-hand-side operand.
+    OutEdge lhs;
+    invariant (lhs.kind == EdgeKind.data);
+
+    /// Right-hand-side operand.
+    OutEdge rhs;
+    invariant (rhs.kind == EdgeKind.data);
+
+    /// Result of the addition.
+    InEdge result;
+    invariant (result.kind == EdgeKind.data);
+
+ @nogc nothrow @safe: // TODO:
+    hash_t computeHash() const scope {
+        return 0;
+    }
+
+    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+        return this is rhs;
+    }
+}
+
+/// Two's complement subtraction operation (works for both signed and unsigned integers).
+struct SubtractionNode {
+    mixin NodeInheritance;
+
+    /// Left-hand-side operand.
+    OutEdge lhs;
+    invariant (lhs.kind == EdgeKind.data);
+
+    /// Right-hand-side operand.
+    OutEdge rhs;
+    invariant (rhs.kind == EdgeKind.data);
+
+    /// Result of the subtraction.
+    InEdge result;
+    invariant (result.kind == EdgeKind.data);
+
+ @nogc nothrow @safe: // TODO:
+    hash_t computeHash() const scope {
+        return 0;
+    }
+
+    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+        return this is rhs;
+    }
+}
+
+/++
+Two's complement multiplication operation.
+
+Since this only produces the lower half of a full multiplication, it is the same for both signed and unsigned integers.
++/
+struct MultiplicationNode {
+    mixin NodeInheritance;
+
+    /// Left-hand-side operand.
+    OutEdge lhs;
+    invariant (lhs.kind == EdgeKind.data);
+
+    /// Right-hand-side operand.
+    OutEdge rhs;
+    invariant (rhs.kind == EdgeKind.data);
+
+    /// Result of the multiplication.
+    InEdge result;
+    invariant (result.kind == EdgeKind.data);
+
+ @nogc nothrow @safe: // TODO:
+    hash_t computeHash() const scope {
+        return 0;
+    }
+
+    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+        return this is rhs;
+    }
+}
+
+/++
+Two's complement division operation for unsigned operands, rounds towards zero.
+
+The divisor must not be zero, otherwise the result is a [poison](#MuxNode) value.
+
+See_Also: [SignedDivisionNode](#SignedDivisionNode)
++/
+struct UnsignedDivisionNode {
+    mixin NodeInheritance;
+
+    /// Dividend operand.
+    OutEdge dividend;
+    invariant (dividend.kind == EdgeKind.data);
+
+    /// Divisor operand.
+    OutEdge divisor;
+    invariant (divisor.kind == EdgeKind.data);
+
+    /// Resulting quotient.
+    InEdge quotient;
+    invariant (quotient.kind == EdgeKind.data);
+
+ @nogc nothrow @safe: // TODO:
+    hash_t computeHash() const scope {
+        return 0;
+    }
+
+    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+        return this is rhs;
+    }
+}
+
+/++
+Two's complement division operation for signed operands, rounds towards zero.
+
+The divisor must not be zero, otherwise the result is a [poison](#MuxNode) value.
+Furthermore, dividing the "most negative" value representable (i.e. `-1 * 2^(N-1)` for N-bit integers) by `-1` also results in poison.
+
+See_Also: [UnsignedDivisionNode](#UnsignedDivisionNode)
++/
+struct SignedDivisionNode {
+    mixin NodeInheritance;
+
+    /// Dividend operand.
+    OutEdge dividend;
+    invariant (dividend.kind == EdgeKind.data);
+
+    /// Divisor operand.
+    OutEdge divisor;
+    invariant (divisor.kind == EdgeKind.data);
+
+    /// Resulting quotient.
+    InEdge quotient;
+    invariant (quotient.kind == EdgeKind.data);
+
+ @nogc nothrow @safe: // TODO:
+    hash_t computeHash() const scope {
+        return 0;
+    }
+
+    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+        return this is rhs;
+    }
+}
+
+/++
+Two's complement remainder operation for unsigned operands, rounds towards zero.
+
+The divisor must not be zero, otherwise the result is a [poison](#MuxNode) value.
+
+See_Also: [SignedRemainderNode](#SignedRemainderNode)
++/
+struct UnsignedRemainderNode {
+    mixin NodeInheritance;
+
+    /// Dividend operand.
+    OutEdge dividend;
+    invariant (dividend.kind == EdgeKind.data);
+
+    /// Divisor operand.
+    OutEdge divisor;
+    invariant (divisor.kind == EdgeKind.data);
+
+    /// Resulting remainder.
+    InEdge remainder;
+    invariant (remainder.kind == EdgeKind.data);
+
+ @nogc nothrow @safe: // TODO:
+    hash_t computeHash() const scope {
+        return 0;
+    }
+
+    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+        return this is rhs;
+    }
+}
+
+/++
+Two's complement remainder operation for signed operands, rounds towards zero.
+
+The divisor must not be zero, otherwise the result is a [poison](#MuxNode) value.
+Furthermore, dividing the "most negative" value representable (i.e. `-1 * 2^(N-1)` for N-bit integers) by `-1` also results in poison.
+
+See_Also: [UnsignedRemainderNode](#UnsignedRemainderNode)
++/
+struct SignedRemainderNode {
+    mixin NodeInheritance;
+
+    /// Dividend operand.
+    OutEdge dividend;
+    invariant (dividend.kind == EdgeKind.data);
+
+    /// Divisor operand.
+    OutEdge divisor;
+    invariant (divisor.kind == EdgeKind.data);
+
+    /// Resulting remainder.
+    InEdge remainder;
+    invariant (remainder.kind == EdgeKind.data);
+
+ @nogc nothrow @safe: // TODO:
+    hash_t computeHash() const scope {
+        return 0;
+    }
+
+    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+        return this is rhs;
+    }
+}
+
+/// Compares two bit patterns for equality.
+struct EqualNode {
+    mixin NodeInheritance;
+
+    /// Left-hand-side operand.
+    OutEdge lhs;
+    invariant (lhs.kind == EdgeKind.data);
+
+    /// Right-hand-side operand.
+    OutEdge rhs;
+    invariant (rhs.kind == EdgeKind.data);
+
+    /// A single resulting bit indicating whether the operands are equal.
+    InEdge output;
+    invariant (output.kind == EdgeKind.data);
+
+ @nogc nothrow @safe: // TODO:
+    hash_t computeHash() const scope {
+        return 0;
+    }
+
+    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+        return this is rhs;
+    }
+}
+
+/// Computes whether a two's complement integer is strictly less than another (both unsigned).
+struct UnsignedLessThanNode {
+    mixin NodeInheritance;
+
+    /// Left-hand-side operand.
+    OutEdge lhs;
+    invariant (lhs.kind == EdgeKind.data);
+
+    /// Right-hand-side operand.
+    OutEdge rhs;
+    invariant (rhs.kind == EdgeKind.data);
+
+    /// A single resulting bit indicating whether `lhs < rhs`.
+    InEdge output;
+    invariant (output.kind == EdgeKind.data);
+
+ @nogc nothrow @safe: // TODO:
+    hash_t computeHash() const scope {
+        return 0;
+    }
+
+    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+        return this is rhs;
+    }
+}
+
+/// Computes whether a two's complement integer is strictly less than another (both signed).
+struct SignedLessThanNode {
+    mixin NodeInheritance;
+
+    /// Left-hand-side operand.
+    OutEdge lhs;
+    invariant (lhs.kind == EdgeKind.data);
+
+    /// Right-hand-side operand.
+    OutEdge rhs;
+    invariant (rhs.kind == EdgeKind.data);
+
+    /// A single resulting bit indicating whether `lhs < rhs`.
+    InEdge output;
+    invariant (output.kind == EdgeKind.data);
+
+ @nogc nothrow @safe: // TODO:
+    hash_t computeHash() const scope {
+        return 0;
+    }
+
+    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+        return this is rhs;
+    }
+}
+
+/// Computes whether a two's complement integer is greater or equal than another (both unsigned).
+struct UnsignedGreaterOrEqualNode {
+    mixin NodeInheritance;
+
+    /// Left-hand-side operand.
+    OutEdge lhs;
+    invariant (lhs.kind == EdgeKind.data);
+
+    /// Right-hand-side operand.
+    OutEdge rhs;
+    invariant (rhs.kind == EdgeKind.data);
+
+    /// A single resulting bit indicating whether `lhs >= rhs`.
+    InEdge output;
+    invariant (output.kind == EdgeKind.data);
+
+ @nogc nothrow @safe: // TODO:
+    hash_t computeHash() const scope {
+        return 0;
+    }
+
+    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+        return this is rhs;
+    }
+}
+
+/// Computes whether a two's complement integer is greater or equal than another (both signed).
+struct SignedGreaterOrEqualNode {
+    mixin NodeInheritance;
+
+    /// Left-hand-side operand.
+    OutEdge lhs;
+    invariant (lhs.kind == EdgeKind.data);
+
+    /// Right-hand-side operand.
+    OutEdge rhs;
+    invariant (rhs.kind == EdgeKind.data);
+
+    /// A single resulting bit indicating whether `lhs >= rhs`.
+    InEdge output;
+    invariant (output.kind == EdgeKind.data);
+
+ @nogc nothrow @safe: // TODO:
+    hash_t computeHash() const scope {
+        return 0;
+    }
+
+    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+        return this is rhs;
+    }
+}
+
+/// Truncation operation: given a bit pattern, yields only the lower bits.
+struct TruncationNode {
+    mixin NodeInheritance;
+
+    /// Bit pattern being truncated.
+    OutEdge input;
+    invariant (input.kind == EdgeKind.data);
+
+    /// Lowermost input bits.
+    InEdge output;
+    invariant (output.kind == EdgeKind.data);
+
+ @nogc nothrow @safe: // TODO:
+    hash_t computeHash() const scope {
+        return 0;
+    }
+
+    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+        return this is rhs;
+    }
+}
+
+/// Extension operation: returns a wider version of its input, with added bits set to zero.
+struct UnsignedExtensionNode {
+    mixin NodeInheritance;
+
+    /// Bit pattern being extended.
+    OutEdge input;
+    invariant (input.kind == EdgeKind.data);
+
+    /// Resulting bit pattern.
+    InEdge output;
+    invariant (output.kind == EdgeKind.data);
+
+ @nogc nothrow @safe: // TODO:
+    hash_t computeHash() const scope {
+        return 0;
+    }
+
+    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+        return this is rhs;
+    }
+}
+
+/// Extension operation: returns a wider version of its input, with added bits equal to the input's sign bit.
+struct SignedExtensionNode {
+    mixin NodeInheritance;
+
+    /// Bit pattern being extended.
+    OutEdge input;
+    invariant (input.kind == EdgeKind.data);
+
+    /// Resulting bit pattern.
+    InEdge output;
+    invariant (output.kind == EdgeKind.data);
+
+ @nogc nothrow @safe: // TODO:
+    hash_t computeHash() const scope {
+        return 0;
+    }
+
+    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+        return this is rhs;
+    }
+}
+
+// TODO: mem ops, macro nodes and type ops
 
 /++
 Graph structure storing a Gyre (sub)program.
@@ -461,8 +1273,8 @@ Every Graph independently operates under the assumption that it fully owns the e
 When multiple Gyre graphs are being used to represent a program (e.g. if each one was independently generated from a separate procedure / module / compilation unit), it is often a good idea to unite them in a single Graph.
 This may enable subgraph deduplication and yield more opportunities to perform certain optimizations (e.g. [CSE](https://en.wikipedia.org/wiki/Common_subexpression_elimination)).
 
-See_Also: [EdgeKind](#EdgeKind), [Node](#Node)
+See_Also: [EdgeKind](#EdgeKind), [INode](#INode)
 +/
 struct Graph { // TODO
-    HashSet!(HashablePointer!Node) nodes;
+    HashSet!(HashablePointer!INode) nodes;
 }

@@ -33,12 +33,12 @@ struct HashablePointer(T) if (!isPointer!T) {
     static assert((HashablePointer!T).sizeof == (T*).sizeof);
 
  pragma(inline):
-    this(inout(T)* ptr) inout {
+    this(return scope inout(T)* ptr) inout {
         this.ptr = ptr;
     }
 
     size_t toHash() const {
-        return ptr == null ? 0 : hashOf(*ptr);
+        return this.ptr == null ? 0 : hashOf(*this.ptr);
     }
 
     bool opEquals(ref const(HashablePointer!T) rhs) const {
@@ -50,6 +50,13 @@ struct HashablePointer(T) if (!isPointer!T) {
     bool opEquals(const(T*) rhs) const {
         const HashablePointer!T other = rhs;
         return this == other;
+    }
+
+    version (D_BetterC) {} else {
+        string toString() const {
+            import std.conv : to;
+            return this.ptr == null ? "null" : to!string(*this.ptr);
+        }
     }
 }
 
@@ -138,7 +145,7 @@ if (!is(T == class) && !(is(T == interface)))
 
      public pragma(inline):
         ///
-        @property bool isInitialized() const {
+        @property bool isInitialized() const scope {
             static assert(__traits(compiles, { static T t; }),
                 "Cannot automatically initialize `" ~ fullyQualifiedName!T ~
                 "` because `" ~ fullyQualifiedName!T ~
@@ -147,7 +154,9 @@ if (!is(T == class) && !(is(T == interface)))
         }
 
         ///
-        void ensureInitialized() out (; this.isInitialized) {
+        void ensureInitialized() scope
+        out (; this.isInitialized)
+        {
             if (!this.isInitialized) initialize();
         }
     }
@@ -208,7 +217,7 @@ if (!is(T == class) && !(is(T == interface)))
         }
     }
     /// ditto
-    @property ref inout(T) refCountedPayload() inout return @system {
+    @property ref inout(T) refCountedPayload() inout @system {
         assert(this._refCounted.isInitialized, "attempted to access payload");
         return this._refCounted.store.payload;
     }
