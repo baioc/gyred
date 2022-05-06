@@ -1,4 +1,8 @@
-/// This module provides hash tables with deterministic memory usage (not reliant on the GC), as a betterC alternative to the built-in AAs. Includes both safe (refcounted) and unsafe (explicitly managed) hash-based abstract data types.
+/++
+This module provides hash tables with deterministic memory usage (not reliant on the GC), as a betterC alternative to the built-in AAs.
+
+Includes both unsafe (explicitly managed) and safe (refcounted) hash-based data types.
++/
 module eris.hash_table;
 
 import core.stdc.errno : ENOMEM, EINVAL;
@@ -99,13 +103,12 @@ private {
 }
 
 /++
-Dense hash map acting as a mostly-compatible AA replacement.
+Dense hash map acting as a mostly-compatible (even if unsafe) AA replacement.
 
 The mechanism used to override hashing and comparison functions is [the same as for standard AAs](https://dlang.org/spec/hash-map.html#using_struct_as_key).
-Unlike AA's, however, this hash table does NOT guarantee that references to its internal storage will be kept stable between rehashes.
-Other than explicit calls to [rehash](#rehash), only insertions may (unsafely) invalidate such references.
+Unlike AA's, however, this hash table does NOT guarantee that references to its internal storage will be kept stable between [rehash]es, which may also be caused by insertion operations.
 
-See_Also: The safer [HashMap](#HashMap)
+See_Also: The safer [HashMap]
 +/
 struct UnsafeHashMap(Key, Value) {
  private:
@@ -179,7 +182,7 @@ struct UnsafeHashMap(Key, Value) {
         }
     }
 
-    /// Returns the structural hash of this table.
+    /// Structural hash of this table.
     size_t toHash() const scope {
         // entry order does not matter in a hash table, so we accumulate with XOR
         hash_t tableHash = 0;
@@ -208,27 +211,27 @@ struct UnsafeHashMap(Key, Value) {
     }
 
     /++
-    Returns the number of entries currently being used in the hash table.
+    Number of entries currently being used in the hash table.
 
-    See_Also: [capacity](#UnsafeHashMap.capacity)
+    See_Also: [capacity]
     +/
     @property size_t length() const scope {
         return this.used;
     }
 
     /++
-    Returns the number of entries this table can hold without being rehashed.
+    Entries the table can hold without being rehashed.
 
-    See_Also: [length](#UnsafeHashMap.length)
+    See_Also: [length]
     +/
     @property size_t capacity() const scope {
         return cast(size_t)(this.allocated * maxLoadFactor);
     }
 
     /++
-    Returns a pointer to a matching KEY in the table, or `null` if there isn't one.
+    Returns a pointer to a matching KEY in the table, or `null`
 
-    See_Also: [get](#get)
+    See_Also: [get]
     +/
     inout(Key)* opBinaryRight(string op : "in")(scope auto ref const(Key) key) inout scope {
         if (this.length == 0) return null;
@@ -238,9 +241,9 @@ struct UnsafeHashMap(Key, Value) {
     }
 
     /++
-    Returns the value associated with a given key, or its `.init` if there isn't one.
+    Returns the value associated with a given key, or its `.init`
 
-    See_Also: [require](#require), [get](#get)
+    See_Also: [require], [get]
     +/
     inout(Value) opIndex()(scope auto ref const(Key) key) inout scope
     out (value; key in this || value == Value.init)
@@ -255,11 +258,11 @@ struct UnsafeHashMap(Key, Value) {
     }
 
     /++
-    Upserts a `<key,value>` entry in the hash table. May cause a [rehash](#rehash).
+    Upserts an entry in the hash table. May cause a [rehash].
 
     Returns: Zero on success, non-zero on failure (e.g. OOM or overflow).
 
-    See_Also: [update](#update)
+    See_Also: [update]
     +/
     err_t opIndexAssign(return scope Value value, return scope Key key) scope {
         err_t error;
@@ -268,14 +271,70 @@ struct UnsafeHashMap(Key, Value) {
     }
 }
 
-/// This type optimizes storage when value types are zero-sized (e.g. for [UnsafeHashSet](#UnsafeHashSet)).
+/// This type optimizes storage when value types are zero-sized (e.g. for [UnsafeHashSet]).
 @nogc nothrow pure @safe unittest {
     alias NonZero = long;
     alias Zero = void[0];
     static assert(UnsafeHashMap!(char, Zero).sizeof < UnsafeHashMap!(char, NonZero).sizeof);
 }
 
-/// Frees all resources allocated by the hash table.
+/// Basic usage:
+@nogc nothrow @safe unittest {
+    HashMap!(char, long) table;
+    assert(table.length == 0);
+
+    assert('a' !in table);
+    table['a'] = 0; // inserts
+    assert('a' in table);
+    table['a'] = 1; // updates
+    assert(table.length == 1);
+
+    assert(table.remove('a') == true);
+    assert('a' !in table);
+    assert(table.remove('a') == false);
+    assert(table.length == 0);
+
+    static immutable reverse = ['a', 'b', 'c', 'd', 'e'];
+    foreach (i, c; reverse) table[c] = i + 1;
+    table.rehash(); // must preserve elements
+    assert(table.length == reverse.length);
+    foreach (key; table.byKey) assert(key == reverse[table[key] - 1]);
+    foreach (val; table.byValue) assert(val == table[reverse[val - 1]]);
+
+    const cap = table.capacity;
+    table.clear(); // preserves capacity
+    assert(table.length == 0);
+    assert(table.capacity == cap);
+}
+
+/// Sligthly more advanced example with `require` and `update`:
+@nogc nothrow @safe unittest {
+    import core.stdc.ctype : isalnum;
+    import eris.util : empty;
+
+    bool isAnagram(const(string) a, const(string) b) {
+        // count letter frequencies in A
+        HashMap!(char, long) letters;
+        foreach (c; a) {
+            if (!c.isalnum) continue;
+            const freq = letters.require(c, () => 0L);
+            letters[c] = freq + 1;
+        }
+        // check if they match B's
+        foreach (c; b) {
+            if (!c.isalnum) continue;
+            const freq = letters.update(c, () => -1L, (ref long f) => f - 1);
+            if (freq < 0) return false;
+            else if (freq == 0) letters.remove(c);
+        }
+        return letters.empty;
+    }
+
+    assert(  isAnagram("tom marvolo riddle", "i am lord voldemort") );
+    assert( !isAnagram("aabaa", "bbabb")                            );
+}
+
+/// [clear]s and frees the table's internal storage.
 void dispose(K, V)(scope ref UnsafeHashMap!(K,V) self) nothrow @system
 out (; self.capacity == 0)
 {
@@ -344,18 +403,18 @@ out (; self.length == 0)
 }
 
 /++
-Rehashes the table (possibly making future lookups more efficient).
+Rehashes the table.
 
-This is the only way to reduce a hash table's memory footprint.
-Nothing happens in case of failure.
+Manual rehashes may make future lookups more efficient.
+This is also the only way to reduce a hash table's memory footprint.
+Nothing happens to the table in case of failure.
 
 Params:
     self = Hash table.
-    newCapacity = Min pre-allocated entries. Must be enough to fit current entries.
+    newCapacity = Min number of pre-allocated entries, must be enough to fit current entries.
 
 Returns:
-    Zero on success, non-zero on failure.
-    Reasons for failure include OOM, overflow or an invalid capacity.
+    Zero on success, non-zero on failure (on OOM, overflow or an invalid capacity).
 +/
 err_t rehash(K, V)(scope ref UnsafeHashMap!(K,V) self, size_t newCapacity) nothrow @system
 in (newCapacity >= self.length, "table capacity must be enough to fit its current entries")
@@ -431,8 +490,7 @@ private pragma(inline, true) bool _get(K, V)(
 /++
 Looks up an entry in the table's internal storage.
 
-This procedure yields pointers to the hash table's internal storage.
-These will be invalidated by any [rehash](#rehash)es.
+Yields pointers to the hash table's internal storage, which may be invalidated by any [rehash]es.
 
 Params:
     self = Backing hash table.
@@ -470,6 +528,8 @@ bool get(K, V)(
 /++
 Removes a key's entry from the table.
 
+This procedure will also call `destroy` on both key and value.
+
 Returns: Whether or not the key had an entry to begin with.
 +/
 bool remove(K, V)(scope ref UnsafeHashMap!(K,V) self, scope auto ref const(K) key) nothrow
@@ -488,9 +548,7 @@ out (; key !in self)
 }
 
 /++
-Removes all elements from the hash table, without changing its capacity.
-
-This procedure will also call `destroy` on each entry's key and value.
+[remove]s all elements from the hash table, without changing its capacity.
 +/
 void clear(K, V)(scope ref UnsafeHashMap!(K,V) self) nothrow
 out (; self.length == 0)
@@ -509,39 +567,8 @@ out (; self.length == 0)
     self.used = 0;
 }
 
-///
-@nogc nothrow @safe unittest {
-    HashMap!(char, long) table;
-    assert(table.length == 0);
-
-    assert('a' !in table);
-    table['a'] = 0; // inserts
-    assert('a' in table);
-    table['a'] = 1; // updates
-    assert(table.length == 1);
-
-    assert(table.remove('a') == true);
-    assert('a' !in table);
-    assert(table.remove('a') == false);
-    assert(table.length == 0);
-
-    static immutable reverse = ['a', 'b', 'c', 'd', 'e'];
-    foreach (i, c; reverse) table[c] = i + 1;
-    table.rehash(); // must preserve elements
-    assert(table.length == reverse.length);
-    foreach (key; table.byKey) assert(key == reverse[table[key] - 1]);
-    foreach (val; table.byValue) assert(val == table[reverse[val - 1]]);
-
-    const cap = table.capacity;
-    table.clear(); // preserves capacity
-    assert(table.length == 0);
-    assert(table.capacity == cap);
-}
-
 /++
-Looks up a key's entry in the table, then either updates it or creates a new one.
-
-If a new entry needs to be created, a [rehash](#rehash) may happen.
+Looks up a key's entry in the table, then either updates it or creates a new one (may [rehash]).
 
 Params:
     self = Hash table.
@@ -628,7 +655,7 @@ if (is(ReturnType!Create == V)
 }
 
 /++
-Looks up a key, inserting an entry if there isn't any (may [rehash](#rehash)).
+Looks up a key's entry, inserting one if not found (may [rehash]).
 
 Params:
     self = Hash table.
@@ -659,33 +686,6 @@ if (is(ReturnType!Create == V) && Parameters!Create.length == 0)
 {
     err_t ignored;
     return self.require(key, create, ignored);
-}
-
-///
-@nogc nothrow @safe unittest {
-    import core.stdc.ctype : isalnum;
-    import eris.util : empty;
-
-    bool isAnagram(string a, string b) @nogc nothrow @safe {
-        // count letter frequencies in A
-        HashMap!(char, long) letters;
-        foreach (c; a) {
-            if (!c.isalnum) continue;
-            const freq = letters.require(c, () => 0L);
-            letters[c] = freq + 1;
-        }
-        // check if they match B's
-        foreach (c; b) {
-            if (!c.isalnum) continue;
-            const freq = letters.update(c, () => -1L, (ref long f) => f - 1);
-            if (freq < 0) return false;
-            else if (freq == 0) letters.remove(c);
-        }
-        return letters.empty;
-    }
-
-    assert(  isAnagram("tom marvolo riddle", "i am lord voldemort") );
-    assert( !isAnagram("aabaa", "bbabb")                            );
 }
 
 private mixin template UnsafeRangeBoilerplate(K, V) {
@@ -729,10 +729,10 @@ private mixin template UnsafeRangeBoilerplate(K, V) {
 }
 
 /++
-Can be used to iterate over this table's entries (in an unspecified order).
+Can be used to iterate over this table's entries (but iteration order is unspecified ).
 
-NOTE: These must NEVER outlive their backing hash table.
-    Furthermore, mutating a table invalidates any ranges over it.
+NOTE: Mutating a table silently invalidates any ranges over it.
+    Also, ranges must NEVER outlive their backing tables if they are unsafe (this is ok only for the refcounted versions).
 +/
 auto byKey(K, V)(return scope ref const(UnsafeHashMap!(K,V)) self) @safe {
     struct ByKey {
@@ -781,10 +781,10 @@ auto byKeyValue(K, V)(return scope ref const(UnsafeHashMap!(K,V)) self) @safe {
 ///
 @nogc nothrow pure @safe unittest {
     static assert(
-        !__traits(compiles,
+        !__traits(compiles, // only because local is marked as `scope`
             () @safe {
-                scope UnsafeHashMap!(char, long) table; // local marked as `scope`
-                return table.byKeyValue;                // Error: cannot return scope variable
+                scope UnsafeHashMap!(char, long) table;
+                return table.byKeyValue; // <- escapes ref to local
             }
         ),
         "must not allow a range to outlive its backing hash table"
@@ -792,7 +792,9 @@ auto byKeyValue(K, V)(return scope ref const(UnsafeHashMap!(K,V)) self) @safe {
 }
 
 /++
-Creates an independent (shallow) copy of a given hash table.
+Creates an independent copy of a hash table.
+
+Elements are copied by simple assignment, which may translate into a shallow copy.
 
 Params:
     self = Hash table to be copied.
@@ -830,20 +832,9 @@ UnsafeHashMap!(K,V) dup(K, V)(scope ref const(UnsafeHashMap!(K,V)) self) {
 /++
 Unordered hash set.
 
-See_Also: The safer [HashSet](#HashSet)
+See_Also: The safer [HashSet]
 +/
 alias UnsafeHashSet = ApplyRight!(UnsafeHashMap, Unit);
-
-/++
-Adds an element to the set, possibly causing a [rehash](#rehash).
-
-Returns: Zero on success, non-zero on failure (e.g. OOM or overflow).
-+/
-pragma(inline) err_t add(K, V)(scope ref UnsafeHashMap!(K, V) self, return scope K element)
-if (V.sizeof == 0)
-{
-    return (self[element] = V.init);
-}
 
 ///
 @nogc nothrow @safe unittest {
@@ -877,11 +868,23 @@ nothrow @safe unittest {
     assert(b !in stringified); // but be careful with mutability
 }
 
+/++
+Adds an element to the hash set; may [rehash].
+
+Returns: Zero on success, non-zero on failure (e.g. OOM or overflow).
++/
+pragma(inline) err_t add(K, V)(scope ref UnsafeHashMap!(K, V) self, return scope K element)
+if (V.sizeof == 0)
+{
+    return (self[element] = V.init);
+}
+
 
 /++
-Safe version of [UnsafeHashMap](#UnsafeHashMap).
+Safe version of [UnsafeHashMap]; same API.
 
-Uses reference counting to avoid deallocation problems and never exposes references to its internal storage.
+Uses reference counting to avoid manual deallocation problems (i.e. double free) and never exposes references to its internal storage (so the API is actually just slightly different).
+Again, this type uses reference counting, so cycles must be avoided to ensure memory doesn't leak.
 +/
 struct HashMap(Key, Value) {
  private:
@@ -980,12 +983,14 @@ struct HashMap(Key, Value) {
 @nogc nothrow @safe unittest {
     HashMap!(char, long) outer;
     outer['o'] = 0; // outer -> { 'o': 0 }
+
     {
         HashMap!(char, long) inner;
         inner['i'] = 1; // inner -> { 'i': 1 }
         outer = inner;
-        // with the previous assignment, the table { 'o': 0 } was deallocated
+        // with the previous assignment, { 'o': 0 } was deallocated
     }
+
     // as inner goes out of scope, it decreases the ref count of { 'i': 1 }
     // but since outer still holds a reference to it, it wasn't deallocated
     assert(outer['i'] == 1); // outer -> { 'i': 1 }
@@ -1134,5 +1139,5 @@ pragma(inline) {
     }
 }
 
-/// Safe version of [UnsafeHashSet](#UnsafeHashSet).
+/// Safe version of [UnsafeHashSet].
 alias HashSet = ApplyRight!(HashMap, Unit);

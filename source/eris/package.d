@@ -1,13 +1,7 @@
 /++
 A non-standard library to empower D as a betterC.
 
-I would have called it `deimos`, but that name is already taken.
-
-See_Also:
-[eris.core](./eris.core.html),
-[eris.rational](./eris.rational.html),
-[eris.util](./eris.util.html),
-[eris.hash_table](./eris.hash_table.html)
+I would have called it `deimos`, but that name is [already taken](https://wiki.dlang.org/Deimos).
 +/
 module eris;
 

@@ -15,9 +15,13 @@ pragma(inline) bool empty(T)(ref const(T) arg) if (is(typeof(arg.length) : size_
 
 ///
 @nogc nothrow pure @safe unittest {
-    struct S { size_t length = 0; }
-    S s;
+    struct S { size_t length; }
+
+    S s = { length: 0 };
     assert(s.empty);
+
+    s.length = 1;
+    assert(!s.empty);
 }
 
 
@@ -91,6 +95,7 @@ nothrow pure @safe unittest {
     bool[S*] withRaw;
     withRaw[&x] = true;
     debug assert(!usingCustomHash);
+
     // hashable pointer behaviour:
     bool[HashablePointer!S] withHashable;
     withHashable[ptr] = true;
@@ -101,7 +106,8 @@ nothrow pure @safe unittest {
 /++
 Adapted [RefCounted](https://dlang.org/library/std/typecons/ref_counted.html#1) with a `@trusted` destructor.
 
-XXX: See related [bug reports](https://issues.dlang.org/show_bug.cgi?id=17867) and [pull requests](https://github.com/dlang/phobos/pull/8368).
+Version:
+    XXX: See related [bug reports](https://issues.dlang.org/show_bug.cgi?id=17867) and [pull requests](https://github.com/dlang/phobos/pull/8368).
 +/
 struct RefCountedTrusted(T, RefCountedAutoInitialize autoInit = RefCountedAutoInitialize.yes)
 if (!is(T == class) && !(is(T == interface)))
@@ -181,6 +187,7 @@ if (!is(T == class) && !(is(T == interface)))
         this._refCounted.store._refCount++;
     }
 
+    /// Can be `@trusted` as long as this type is used correctly.
     ~this() nothrow @trusted {
         if (!this._refCounted.isInitialized) return;
         assert(this._refCounted.store._refCount > 0);
@@ -200,7 +207,7 @@ if (!is(T == class) && !(is(T == interface)))
         move(rhs, this._refCounted.store.payload);
     }
 
-    /// Accesses the refcounted store (usually to check or ensure it is initialized).
+    /// Accesses the refcounted store (usually to check if - or ensure that - it is initialized).
     @property ref inout(RefCountedStore) refCountedStore() inout {
         return this._refCounted;
     }
@@ -234,6 +241,7 @@ if (!is(T == class) && !(is(T == interface)))
 
     {
         RefCountedTrusted!Resource rc;
+
         assert(!rc.refCountedStore.isInitialized);
         rc.refCountedStore.ensureInitialized();
         assert(rc.refCountedStore.isInitialized);
@@ -245,7 +253,7 @@ if (!is(T == class) && !(is(T == interface)))
             () @trusted { assert(rc3.refCountedPayload.name == "thing"); }();
         }
 
-        // rc2 and rc3 didn't destroy the resource: there's still one ref
+        // ~rc2 and ~rc3 didn't destroy the resource: there's still one ref
         debug assert(nDestroyed == 0);
     }
 

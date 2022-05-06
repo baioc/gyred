@@ -1,12 +1,34 @@
 /++
-"Low-level" program construction and transformation procedures.
+"Low-level" structuring of the IR, including descriptions of its primitives.
 
-When expressed in Gyre, programs become sets of nodes and edges: a directed graph.
+When expressed in Gyre, programs become sets of nodes and edges: a directed [Graph].
 It is very important that these graphs have a low memory footprint and enable the efficient implementation of program transformations.
 Following the design of Click's "sea of nodes", our graphs are represented as mutable objects with (possibly cyclic) references to each other.
 In order to understand the benefits of such an IR, refer to [libFIRM (sec. 2.3)](http://beza1e1.tuxen.de/pdfs/braun11wir.pdf).
 
-See_Also: [Graph](#Graph)
+
+$(H3 Recommended Reading Order)
+
+$(NUMBERED_LIST
+    * [EdgeKind|Edge slots]
+    * [OutEdge|Outgoing] and [InEdge|incoming] edges
+    * Primitive control operations: [JoinNode|join], [InstantiationNode|inst.], [JumpNode|jump], [ForkNode|fork] and [BranchNode|branch]
+    * Poison values and undefined behavior (see below)
+    * The [INode|generic node] interface and other data ops. (e.g. [MultiplexerNode|mux] and [UndefinedNode|undefined])
+    * [Graph|Gyre graphs]
+)
+
+
+$(H3 Poison)
+
+In Gyre, every operation may have some conditions imposed on its inputs in order to produce correct behavior / a sane value.
+When the result of a data-only operation isn't well-defined (e.g. integer division by zero), it produces a "poison".
+Poison values originate from [LLVM](https://llvm.org/docs/LangRef.html#poison-values) and indicate invalid program behavior.
+Furthermore, these values are poisonous because most operations with poison operands also produce poison (conditionals/selections being the exception, since poisoned inputs may not affect their result in all cases).
+
+This is not unlike C's infamous "Undefined Behavior", because a Gyre compiler may (while respecting program semantics) assume that poison values are never used, which in turn may help with some optimizations (e.g. [loop-invariant code motion](https://en.wikipedia.org/wiki/Loop-invariant_code_motion)).
+Another option is to issue warnings or errors when such erroneous behavior is detected.
+Therefore, this library's default is to ignore any detected undefined behavior / poison value usage.
 +/
 module gyre.graph;
 
@@ -27,18 +49,20 @@ There are different kinds of edge slots, which indicate their meaning.
 Every pair of connecting edge slots must have a matching kind.
 Slot types provide factory members named after each EdgeKind (see examples below).
 
-Enum_Members:
-Name | Description
----- | -----------
-`control` | A control flow edge going from node A to B indicates that, after control reaches node A, it may then proceed to B. Multiple control flow edges leaving a node indicate either concurrency or a decision point (e.g. an `if`).
-`data`    | Data dependency edges represent use-def relations. They go from nodes using the value to the one which produced it.
-`memory`  | Memory dependencies are mostly like discriminated data dependencies. They must be treated differently because, unlike data dependencies which represent immutable values, memory is mutable and thus subject to problems such as scheduling constraints, aliasing and races.
-
 Please note the directionality difference between "dependency" and "flow" edges.
 
-See_Also: [OutEdge](#OutEdge), [InEdge](#InEdge)
+See_Also: [OutEdge], [InEdge]
 +/
-enum EdgeKind : ubyte { control, data, memory, }
+enum EdgeKind : ubyte {
+    /// A control flow edge going from node A to B indicates that, after control reaches node A, it may then proceed to B. Multiple control flow edges leaving a node indicate either concurrency or a decision point (e.g. an `if`).
+    control,
+
+    /// Data dependency edges represent use-def relations. They go from nodes using the value to the one which produced it.
+    data,
+
+    /// Memory dependencies are mostly like discriminated data dependencies. They must be treated differently because, unlike data dependencies which represent immutable values, memory is mutable and thus subject to problems such as scheduling constraints, aliasing and races.
+    memory,
+}
 
 // this enum is better kept with at most 2 bits of information for pointer tagging
 static assert(EdgeKind.min >= 0 && EdgeKind.max < 4, "EdgeKind should have at most 2 useful bits");
@@ -57,7 +81,7 @@ private mixin template StaticEdgeFactories() {
 /++
 An outgoing edge slot.
 
-Connects to either zero or exactly one [InEdge](#InEdge).
+Connects to either zero or exactly one [InEdge].
 +/
 struct OutEdge {
     // XXX: taggedPointer's generated accessors are not scope, so we need to make
@@ -117,9 +141,7 @@ struct OutEdge {
 /++
 An incoming edge slot.
 
-Can receive any number of [OutEdge](#OutEdge)s.
-
-See_Also: [INode](#INode)
+Can receive any number of [OutEdge]s.
 +/
 struct InEdge {
     // XXX: taggedPointer's generated accessors are not scope, so we need to make
@@ -172,37 +194,35 @@ struct InEdge {
 
 
 /++
-Common interface shared by all Gyre nodes; safely used only as a referece type.
+Common interface shared by all Gyre nodes; safely used ONLY as a referece type.
 
-Other things all nodes have in common:
-Name | Description
----- | -----------
-`asNode` | Method which upcasts (and this always works) a concrete node `ref` to a generic `INode*`.
-`ofNode` | Static method which tries to downcast a generic `INode*` to a pointer of a concrete type, returning `null` when the cast would not be valid.
+$(SMALL_TABLE
+    Other things all nodes have in common:
+    Name | Description
+    ---- | -----------
+    `asNode` | Method which upcasts (always works) a concrete node `ref` to a generic `INode*`.
+    `ofNode` | Static method which tries to downcast a generic `INode*` to a pointer of a concrete type, returning `null` when the cast would result in an invalid reference.
+)
 +/
 struct INode {
  pragma(inline) @nogc nothrow @safe:
     private immutable(VTable)* vptr = &vtbl;
 
     /++
-    This node's cached structural hash; to be updated whenever this node's structure stabilizes.
+    This node's cached structural hash; to be [updateHash|updated] whenever this node's structure changes.
 
     NOTE: This is the value which gets returned when `toHash` is called on a node (e.g. by hash tables).
         It is cached for performance reasons, as computing the structural hash of a node within an arbitrary graph can be costly.
-
-    See_Also: [updateHash](#INode.updateHash)
     +/
     @property hash_t hash() const scope pure { return this._hash; }
     private hash_t _hash;
 
     /++
-    Set of in-neighbors which have edges pointing to this node; to be updated along with graph structure.
+    Set of in-neighbors which have edges pointing to this node; to be updated with graph structure.
 
-    Through its [OutEdge](#OutEdge) slots, one can easily reach a node's out-neighbors.
-    In order to achieve efficient graph traversals and program transformations, every node must also keep track of its in-neighbors set (i.e. those which have [OutEdge](#OutEdge)s to one of its [InEdge](#InEdge) slots).
-    Does not change this specific node's structure.
-
-    See_Also: [Hash sets](./eris.hash_table.html#UnsafeHashSet)
+    Through its [OutEdge] slots, one can easily reach a node's out-neighbors.
+    However, in order to achieve efficient graph traversals and program transformations, every node must also keep track of its in-neighbors set (i.e. those which have [OutEdge]s to one of its [InEdge] slots).
+    Since this is an optimization, this set is part of a node's structure (e.g. for hashing or equality).
     +/
     HashSet!(INode*) observers;
 
@@ -229,10 +249,10 @@ struct INode {
     }
 
     /++
-    Compares two nodes for equality. Must be consistent with hash computation.
+    Compares two nodes for equality. Must be [consistent](https://dlang.org/spec/operatoroverloading.html#eqcmp) with hash computation.
 
     NOTE: In an arbitrary graph, this can be a costly operation, so early exits are checked before any virtual call.
-        Thus, custom overrides will only be called on non-aliased same-type nodes with matching hashes.
+        Thus, custom overrides will only be called on non-aliased same-type nodes.
 
     Returns: True if and only if one node can be entirely substituted by the other in a Gyre program.
     +/
@@ -242,7 +262,6 @@ struct INode {
         const(INode)* lhs = &this, rhs = &other;
         if (lhs == rhs) return true;
         if (lhs.vptr != rhs.vptr) return false;
-        if (lhs.hash != rhs.hash) return false;
         return lhs.vptr.opEquals(lhs, rhs);
     }
 }
@@ -350,7 +369,7 @@ Gyre's main mechanism for procedural abstraction, the join node.
 Join nodes are used to define the (external) interface and (internal) contents of procedures and basic blocks.
 They interact with the outside world through zero or more parameters.
 As a join node begins to execute, control flows into its body, where all of its parameters are made available.
-Therefore, a join node behaves like the entry block of a [CFG](https://en.wikipedia.org/wiki/Control-flow_graph) (i.e. a function header), but combined with a set of [SSA](https://en.wikipedia.org/wiki/Static_single_assignment_form) phi instructions (one for each parameter).
+Therefore, a join node behaves like the entry block of a [CFG](https://en.wikipedia.org/wiki/Control-flow_graph), but combined with a set of [SSA](https://en.wikipedia.org/wiki/Static_single_assignment_form) phi instructions (one for each parameter).
 
 Since join nodes define subprocedures, one may want to know where such a definitions begins and ends.
 A join node's scope begins with all of its parameters and control flow edges.
@@ -366,7 +385,7 @@ Furthermore, parameters are divided into (one or more) groups, called channels.
 All parameters within a channel need to be provided at the same time, but each channel can receive its inputs from a different source in the calling code.
 Thus, join nodes can also be used to merge concurrent control flows, which should not be surprising to those familiar with the join calculus: join nodes correspond to linear [join patterns](https://en.wikipedia.org/wiki/Join-pattern).
 
-See_Also: [InstantiationNode](#InstantiationNode)
+See_Also: [InstantiationNode]
 +/
 struct JoinNode {
     mixin NodeInheritance;
@@ -408,7 +427,7 @@ In order to actually use a join node, one must first create a "live" instance of
 The result of such an instantiation is a non-empty collection of continuations, one for each channel in the join pattern.
 Using a continuation requires one to provide its parameters and jump into it.
 
-See_Also: [JumpNode](#JumpNode)
+See_Also: [JumpNode]
 +/
 struct InstantiationNode {
     mixin NodeInheritance;
@@ -448,7 +467,7 @@ Jumps synchronize with each other when a join pattern triggers.
 Imagine a set of concurrent processes, each carrying a continuation corresponding to a different channel of some join pattern; once they've all jumped into their respective continuations, the join pattern triggers and its body executes.
 Then, every event in those processes which happens before the jump, also happens before all events in the triggered join pattern body.
 
-See_Also: [JoinNode](#JoinNode)
+See_Also: [JoinNode]
 +/
 struct JumpNode {
     mixin NodeInheritance;
@@ -486,7 +505,7 @@ The choice of which branch to take is controled by a data dependency interpreted
 If the selector's value does not match the index of any option, program behavior is undefined.
 A Gyre compiler may assume that this never happens and either issue warnings / errors or optimize accordingly (e.g. by assuming that the selector's value is one of the valid indexes, if control flow reaches this branch node).
 
-See_Also: [MuxNode](#MuxNode)
+See_Also: [MultiplexerNode]
 +/
 struct BranchNode {
     mixin NodeInheritance;
@@ -495,7 +514,7 @@ struct BranchNode {
     InEdge control;
     invariant (control.kind == EdgeKind.control);
 
-    /// Data dependency used to choose the taken branch.
+    /// Data selector used to choose the taken branch.
     OutEdge selector;
     invariant (selector.kind == EdgeKind.data);
 
@@ -531,9 +550,9 @@ Fork nodes work around this by signaling explicit concurrency in a Gyre graph.
 Fork nodes tell the compiler "the following subprograms have no ordering constraints between each other".
 Therefore, it is an error for any of the resulting control flows to make direct use of a value produced in another one of its sibling 'threads'.
 Still, every event which happens before a fork also happens before the events of its resulting control flows.
-Merging concurrent flows back into one can be done at a [join node](#JoinNode).
+Merging concurrent flows back into one can be done at a [JoinNode].
 
-See_Also: [JoinNode](#JoinNode), [JumpNode](#JumpNode)
+See_Also: [JoinNode], [JumpNode]
 +/
 struct ForkNode {
     mixin NodeInheritance;
@@ -563,25 +582,12 @@ struct ForkNode {
 /++
 An operation which chooses one of its inputs to forward as a result.
 
-In a mux node, the choice of which input to forward is controled by an unsigned integer, as if it was indexing an array of inputs.
-If the selector's value does not match the index of any input, the result is a poison value.
+In a multiplexer node, the choice of which input to forward is controled by an unsigned integer, as if it was indexing an array of inputs.
+If the selector's value does not match the index of any input, the result is a [poison](gyre.graph.html#details) value.
 
-Meta:
-Starting at this one, most (but not all) other primitives are data-only, representing purely combinatorial operations.
-
-Poison:
-Each data-only operation has fixed-type inputs and outputs, but may have some conditions imposed on its inputs in order to produce a sane value.
-When the result of an operation isn't well-defined (e.g. integer division by zero), it produces a "poison".
-Poison values originate from [LLVM](https://llvm.org/docs/LangRef.html#poison-values) and indicate invalid program behavior.
-Furthermore, these values are poisonous because any operation with poison operands also produces poison (mux nodes are the exception, since poisoned inputs may not be chosen depending on the selector's value).
-
-This is not unlike C's infamous "Undefined Behavior", because a Gyre compiler may (while respecting program semantics) assume that poison values are never used, which in turn may help with some optimizations (e.g. [loop-invariant code motion](https://en.wikipedia.org/wiki/Loop-invariant_code_motion)).
-Another option is to issue warnings or errors when such erroneous behavior is detected.
-Therefore, this library's default is to ignore any detected undefined behavior / poison value usage.
-
-See_Also: [BranchNode](#BranchNode)
+See_Also: [BranchNode]
 +/
-struct MuxNode {
+struct MultiplexerNode {
     mixin NodeInheritance;
 
     /// Resulting value.
@@ -615,9 +621,9 @@ struct MuxNode {
 }
 
 /++
-Constructs a constant / literal value of a certain type.
+Constructs a constant value of a certain type.
 
-See_Also: [UndefinedNode](#UndefinedNode)
+See_Also: [UndefinedNode]
 +/
 struct ConstantNode {
     mixin NodeInheritance;
@@ -640,10 +646,11 @@ struct ConstantNode {
 Constructs a ["don't care"](https://en.wikipedia.org/wiki/Don%27t-care_term) value of a certain type.
 
 The compiler is free to make this node produce any value, as long as it is consistently seen by all of its uses.
-This notion of an "undefined value" originates from [Click's](https://scholarship.rice.edu/bitstream/handle/1911/96451/TR95-252.pdf) formalization of monotone analyses.
+This notion of an "undefined value" originates from [Click's thesis](https://scholarship.rice.edu/bitstream/handle/1911/96451/TR95-252.pdf).
 
-Rationale:
-Undefined values cannot be produced by constant nodes, because the latter are subject to structural sharing, whereas different undefined nodes can resolve to different values and therefore have their own "identity".
+Rationale: Undefined values cannot be produced by [ConstantNode]s, because the latter are subject to structural sharing, whereas different undefined nodes can resolve to different values and therefore have their own "identity".
+
+See_Also: [ConstantNode]
 +/
 struct UndefinedNode {
     mixin NodeInheritance;
@@ -763,9 +770,9 @@ struct XorNode {
 }
 
 /++
-Bitwise left-shift operation; bits shifted in are all zero.
+Bitwise left-shift operation; shifts in zeros.
 
-The shift amount must be no greater than the number of input bits, otherwise the result is a [poison](#MuxNode) value.
+Shift amount must be no greater than the number of input bits, otherwise results in [poison](gyre.graph.html#details).
 +/
 struct LeftShiftNode {
     mixin NodeInheritance;
@@ -793,11 +800,11 @@ struct LeftShiftNode {
 }
 
 /++
-Logical right-shift operation; bits shifted in are all zero.
+Logical right-shift operation; shifts in zeros.
 
-The shift amount must be no greater than the number of input bits, otherwise the result is a [poison](#MuxNode) value.
+Shift amount must be no greater than the number of input bits, otherwise results in [poison](gyre.graph.html#details).
 
-See_Also: [SignedRightShiftNode](#SignedRightShiftNode)
+See_Also: [SignedRightShiftNode]
 +/
 struct UnsignedRightShiftNode {
     mixin NodeInheritance;
@@ -827,9 +834,9 @@ struct UnsignedRightShiftNode {
 /++
 Arithmetic right-shift operation; bits shifted in are equal to the input's most significant bit.
 
-The shift amount must be no greater than the number of input bits, otherwise the result is a [poison](#MuxNode) value.
+Shift amount must be no greater than the number of input bits, otherwise results in [poison](gyre.graph.html#details).
 
-See_Also: [UnsignedRightShiftNode](#UnsignedRightShiftNode)
+See_Also: [UnsignedRightShiftNode]
 +/
 struct SignedRightShiftNode {
     mixin NodeInheritance;
@@ -941,9 +948,9 @@ struct MultiplicationNode {
 /++
 Two's complement division operation for unsigned operands, rounds towards zero.
 
-The divisor must not be zero, otherwise the result is a [poison](#MuxNode) value.
+The divisor must not be zero, otherwise the result is a [poison](gyre.graph.html#details) value.
 
-See_Also: [SignedDivisionNode](#SignedDivisionNode)
+See_Also: [SignedDivisionNode]
 +/
 struct UnsignedDivisionNode {
     mixin NodeInheritance;
@@ -973,10 +980,10 @@ struct UnsignedDivisionNode {
 /++
 Two's complement division operation for signed operands, rounds towards zero.
 
-The divisor must not be zero, otherwise the result is a [poison](#MuxNode) value.
-Furthermore, dividing the "most negative" value representable (i.e. `-1 * 2^(N-1)` for N-bit integers) by `-1` also results in poison.
+The divisor must not be zero, otherwise the result is a [poison](gyre.graph.html#details) value.
+Furthermore, dividing the "most negative" value representable (`-1 * 2^(N-1)` for N bits) by `-1` also results in poison.
 
-See_Also: [UnsignedDivisionNode](#UnsignedDivisionNode)
+See_Also: [UnsignedDivisionNode]
 +/
 struct SignedDivisionNode {
     mixin NodeInheritance;
@@ -1006,9 +1013,9 @@ struct SignedDivisionNode {
 /++
 Two's complement remainder operation for unsigned operands, rounds towards zero.
 
-The divisor must not be zero, otherwise the result is a [poison](#MuxNode) value.
+The divisor must not be zero, otherwise the result is a [poison](gyre.graph.html#details) value.
 
-See_Also: [SignedRemainderNode](#SignedRemainderNode)
+See_Also: [SignedRemainderNode]
 +/
 struct UnsignedRemainderNode {
     mixin NodeInheritance;
@@ -1038,10 +1045,10 @@ struct UnsignedRemainderNode {
 /++
 Two's complement remainder operation for signed operands, rounds towards zero.
 
-The divisor must not be zero, otherwise the result is a [poison](#MuxNode) value.
-Furthermore, dividing the "most negative" value representable (i.e. `-1 * 2^(N-1)` for N-bit integers) by `-1` also results in poison.
+The divisor must not be zero, otherwise the result is a [poison](gyre.graph.html#details) value.
+Furthermore, dividing the "most negative" value representable (`-1 * 2^(N-1)` for N bits) by `-1` also results in poison.
 
-See_Also: [UnsignedRemainderNode](#UnsignedRemainderNode)
+See_Also: [UnsignedRemainderNode]
 +/
 struct SignedRemainderNode {
     mixin NodeInheritance;
@@ -1106,7 +1113,7 @@ struct UnsignedLessThanNode {
     OutEdge rhs;
     invariant (rhs.kind == EdgeKind.data);
 
-    /// A single resulting bit indicating whether `lhs < rhs`.
+    /// A single resulting bit indicating `lhs < rhs`.
     InEdge output;
     invariant (output.kind == EdgeKind.data);
 
@@ -1132,7 +1139,7 @@ struct SignedLessThanNode {
     OutEdge rhs;
     invariant (rhs.kind == EdgeKind.data);
 
-    /// A single resulting bit indicating whether `lhs < rhs`.
+    /// A single resulting bit indicating `lhs < rhs`.
     InEdge output;
     invariant (output.kind == EdgeKind.data);
 
@@ -1158,7 +1165,7 @@ struct UnsignedGreaterOrEqualNode {
     OutEdge rhs;
     invariant (rhs.kind == EdgeKind.data);
 
-    /// A single resulting bit indicating whether `lhs >= rhs`.
+    /// A single resulting bit indicating `lhs >= rhs`.
     InEdge output;
     invariant (output.kind == EdgeKind.data);
 
@@ -1184,7 +1191,7 @@ struct SignedGreaterOrEqualNode {
     OutEdge rhs;
     invariant (rhs.kind == EdgeKind.data);
 
-    /// A single resulting bit indicating whether `lhs >= rhs`.
+    /// A single resulting bit indicating `lhs >= rhs`.
     InEdge output;
     invariant (output.kind == EdgeKind.data);
 
@@ -1198,7 +1205,7 @@ struct SignedGreaterOrEqualNode {
     }
 }
 
-/// Truncation operation: given a bit pattern, yields only the lower bits.
+/// Yields the lowermost bits of its input.
 struct TruncationNode {
     mixin NodeInheritance;
 
@@ -1220,7 +1227,7 @@ struct TruncationNode {
     }
 }
 
-/// Extension operation: returns a wider version of its input, with added bits set to zero.
+/// Yields a wider version of its input, with added bits set to zero.
 struct UnsignedExtensionNode {
     mixin NodeInheritance;
 
@@ -1242,7 +1249,7 @@ struct UnsignedExtensionNode {
     }
 }
 
-/// Extension operation: returns a wider version of its input, with added bits equal to the input's sign bit.
+/// Yields a wider version of its input, with added bits equal to the input's sign bit.
 struct SignedExtensionNode {
     mixin NodeInheritance;
 
@@ -1269,11 +1276,14 @@ struct SignedExtensionNode {
 /++
 Graph structure storing a Gyre (sub)program.
 
-Every Graph independently operates under the assumption that it fully owns the entire (sub)program, so node and edge objects cannot be shared between different graphs.
-When multiple Gyre graphs are being used to represent a program (e.g. if each one was independently generated from a separate procedure / module / compilation unit), it is often a good idea to unite them in a single Graph.
-This may enable subgraph deduplication and yield more opportunities to perform certain optimizations (e.g. [CSE](https://en.wikipedia.org/wiki/Common_subexpression_elimination)).
+NOTE: Every [Graph] independently operates under the assumption that it fully owns the entire (sub)program, so node and edge objects can NOT be shared between different [Graph]s.
 
-See_Also: [EdgeKind](#EdgeKind), [INode](#INode)
+
+When multiple Gyre graphs are being used to represent a program (e.g. if each one was independently generated from a separate procedure / module / compilation unit), it is often a good idea to unite them in a single one.
+This may enable subgraph deduplication and yield more opportunities to perform certain optimizations (e.g. [CSE](https://en.wikipedia.org/wiki/Common_subexpression_elimination)).
+On the other hand, it's probably better to leave them separate when doing concurrent transformations.
+
+See_Also: [EdgeKind], [INode]
 +/
 struct Graph { // TODO
     HashSet!(HashablePointer!INode) nodes;

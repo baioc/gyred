@@ -6,9 +6,9 @@ import std.traits : hasIndirections;
 
 
 /++
-Default zero-sized type. Carries no information at all.
+Zero-sized type carrying no information at all.
 
-NOTE: Make sure not to use this in `extern (C)` function signatures, as the ABI is unspecified.
+NOTE: Make sure not to use this in `extern (C)` signatures, as the ABI is unspecified.
 +/
 alias Unit = void[0];
 
@@ -16,7 +16,7 @@ alias Unit = void[0];
 alias hash_t = size_t;
 
 /++
-A (signed integer) type for error codes, should be zero on success.
+Error code signaling; zero is success.
 
 Rationale: Compatible with C (and with D's `opApply` delegate parameter).
 +/
@@ -26,8 +26,8 @@ alias err_t = int;
 /++
 Allocates enough memory for a given number of elements of a certain type.
 
-The allocated memory must be later [deallocate](#deallocate)d.
-It will also be registered for GC scanning iff the GC is enabled.
+The allocated memory must be later [deallocate]d if one wishes to avoid leaks.
+It will also be registered for GC scanning in case this is compiled in a GC-enabled mode (not betterC).
 
 Params:
     n = Number of contiguous elements to allocate.
@@ -35,9 +35,8 @@ Params:
 Returns:
     Pointer to the allocated memory, or null in case of OOM, overflow or zero-sized allocation.
 
-See_Also: [deallocate](#deallocate)
-
-XXX: It would have been nice to parameterize this by global structs following the same duck-typed interface of the [core std.experimental allocators](https://dlang.org/phobos/std_experimental_allocator.html), but they don't seem to be linked in when compiling in betterC mode.
+Version:
+    XXX: It would have been nice to parameterize this by global structs following the same duck-typed interface of the [core std.experimental allocators](https://dlang.org/phobos/std_experimental_allocator.html), but they don't seem to be linked in when compiling in betterC mode.
 +/
 T* allocate(T)(size_t n = 1) @nogc nothrow
 @trusted // because malloc and friends can be trusted (there's also the cast)
@@ -62,11 +61,11 @@ T* allocate(T)(size_t n = 1) @nogc nothrow
 }
 
 /++
-Frees previously [allocate](#allocate)d memory block.
+Frees previously [allocate]d memory block.
 
 Params:
-    ptr = Pointer to previously [allocate](#allocate)d memory block (or null, in which case nothing happens).
-    n = Must match the parameter used to [allocate](#allocate) the given block.
+    ptr = Pointer to previously [allocate]d memory block (or null, in which case nothing happens).
+    n = Must match the parameter used to [allocate] the given block.
 +/
 void deallocate(T)(T* ptr, size_t n = 1) @nogc nothrow @system {
     version (D_BetterC) {} else {
@@ -85,7 +84,7 @@ void deallocate(T)(T* ptr, size_t n = 1) @nogc nothrow @system {
 }
 
 
-/// Free-function `opCmp`, useful to compare primitive scalar types in generic code.
+/// Free-function version of `opCmp`, useful to compare primitive scalar types in generic code.
 pragma(inline) int opCmp(T)(T lhs, T rhs) if (__traits(isScalar, T)) {
     if      (lhs < rhs) return -1;
     else if (lhs > rhs) return  1;

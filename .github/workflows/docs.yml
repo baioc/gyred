@@ -16,10 +16,10 @@ jobs:
       - name: Install D compiler 🔧
         uses: dlang-community/setup-dlang@v1
         with:
-          compiler: ldc-latest
+          compiler: dmd-latest
 
       - name: Build docs 📑
-        run: dub build --build=docs
+        run: dub run adrdox@2.5.2 -- . -i -o docs --header-link GyreD=https://github.com/baioc/gyred/
 
       - name: Deploy to GitHub Pages 🚀
         uses: JamesIves/github-pages-deploy-action@v4

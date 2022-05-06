@@ -64,11 +64,6 @@ struct Rational(Z) if (__traits(isPOD, Z)) {
         return this.denominator == 1 && this.numerator == rhs;
     }
 
-    /// Casts this rational to a floating-point type for comparison.
-    bool opEquals(R)(R rhs) const scope if (isFloatingPoint!R) {
-        return this.opCast!R == rhs;
-    }
-
     size_t toHash() const {
         return (this.numerator.hashOf << (hash_t.sizeof * 8U / 2U)) | this.denominator.hashOf;
     }
@@ -86,17 +81,12 @@ struct Rational(Z) if (__traits(isPOD, Z)) {
         return this.numerator.opCmp(rhs * this.denominator);
     }
 
-    /// Casts this rational to a floating-point type for comparison.
-    int opCmp(R)(R rhs) const scope if (isFloatingPoint!R) {
-        return this.opCast!R().opCmp(rhs);
-    }
-
     /// Unary negation.
     Rational opUnary(string op : "-")() const {
         return Rational(-this.numerator, this.denominator);
     }
 
-    /// Arithmetic operations on rationals and (after conversion) integers.
+    /// Arithmetic operations on rationals and/or integers.
     Rational opBinary(string op : "+")(const(Rational) rhs) const {
         auto commonMultiple = lcm(this.denominator, rhs.denominator);
         auto lhsMultiple = commonMultiple / this.denominator;
@@ -172,11 +162,21 @@ struct Rational(Z) if (__traits(isPOD, Z)) {
         return Rational(lhs) / this;
     }
 
-    /// Casts this rational to a scalar type, usually with loss of precision.
+    /// Casts rational to a scalar (may lose precision).
     N opCast(N)() const {
         N num = cast(N)(this.numerator);
         N den = cast(N)(this.denominator);
         return num / den;
+    }
+
+    /// Casts and compares rational with floating-point type.
+    bool opEquals(R)(R rhs) const scope if (isFloatingPoint!R) {
+        return this.opCast!R == rhs;
+    }
+
+    /// ditto
+    int opCmp(R)(R rhs) const scope if (isFloatingPoint!R) {
+        return this.opCast!R().opCmp(rhs);
     }
 }
 

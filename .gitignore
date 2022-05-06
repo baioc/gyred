@@ -8,7 +8,10 @@
 dub.selections.json
 docs.json
 __dummy.html
+skeleton.html
 docs/
+
+perf.data*
 
 /gyred
 gyred.so
@@ -17,5 +20,3 @@ gyred.dll
 gyred.a
 gyred.lib
 gyred-test-*
-
-perf.data*
