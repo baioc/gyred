@@ -37,7 +37,7 @@ struct HashablePointer(T) if (!isPointer!T) {
     static assert((HashablePointer!T).sizeof == (T*).sizeof);
 
  pragma(inline):
-    this(return scope inout(T)* ptr) inout {
+    this(inout(T)* ptr) inout {
         this.ptr = ptr;
     }
 
@@ -151,7 +151,7 @@ if (!is(T == class) && !(is(T == interface)))
 
      public pragma(inline):
         ///
-        @property bool isInitialized() const scope {
+        @property bool isInitialized() const {
             static assert(__traits(compiles, { static T t; }),
                 "Cannot automatically initialize `" ~ fullyQualifiedName!T ~
                 "` because `" ~ fullyQualifiedName!T ~
@@ -160,7 +160,7 @@ if (!is(T == class) && !(is(T == interface)))
         }
 
         ///
-        void ensureInitialized() scope
+        void ensureInitialized()
         out (; this.isInitialized)
         {
             if (!this.isInitialized) initialize();

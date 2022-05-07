@@ -10,7 +10,6 @@
 	"dflags": [
 		"-preview=fieldwise",
 		"-preview=inclusiveincontracts",
-		"-dip25",
 		"-dip1000"
 	],
 

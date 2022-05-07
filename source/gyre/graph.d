@@ -1,5 +1,5 @@
 /++
-"Low-level" structuring of the IR, including descriptions of its primitives.
+Low-level API and description of the IR.
 
 When expressed in Gyre, programs become sets of nodes and edges: a directed [Graph].
 It is very important that these graphs have a low memory footprint and enable the efficient implementation of program transformations.
@@ -23,12 +23,13 @@ $(H3 Poison)
 
 In Gyre, every operation may have some conditions imposed on its inputs in order to produce correct behavior / a sane value.
 When the result of a data-only operation isn't well-defined (e.g. integer division by zero), it produces a "poison".
-Poison values originate from [LLVM](https://llvm.org/docs/LangRef.html#poison-values) and indicate invalid program behavior.
-Furthermore, these values are poisonous because most operations with poison operands also produce poison (conditionals/selections being the exception, since poisoned inputs may not affect their result in all cases).
+Poison values originate from [LLVM](https://llvm.org/docs/LangRef.html#poison-values) and indicate invalid program behavior, as if every instance of a poison value came from the result of `0/0`.
+Furthermore, these values are "poisonous" because any operation with a result which depends on a poison operand will also produce poison.
+Note that in some cases a result doesn't actually depend on the value of (all of) its operands (e.g. `x * 0` is always `0`).
 
 This is not unlike C's infamous "Undefined Behavior", because a Gyre compiler may (while respecting program semantics) assume that poison values are never used, which in turn may help with some optimizations (e.g. [loop-invariant code motion](https://en.wikipedia.org/wiki/Loop-invariant_code_motion)).
 Another option is to issue warnings or errors when such erroneous behavior is detected.
-Therefore, this library's default is to ignore any detected undefined behavior / poison value usage.
+In this specific implementation, we don't do aggressive optimizations based on undefined behavior / poison value usage.
 +/
 module gyre.graph;
 
@@ -65,13 +66,13 @@ enum EdgeKind : ubyte {
 }
 
 // this enum is better kept with at most 2 bits of information for pointer tagging
-static assert(EdgeKind.min >= 0 && EdgeKind.max < 4, "EdgeKind should have at most 2 useful bits");
+static assert(EdgeKind.min >= 0 && EdgeKind.max < 4, "EdgeKind should have at most 2 bits of information");
 
 private mixin template StaticEdgeFactories() {
     private import std.traits : EnumMembers;
     static foreach (kind; EnumMembers!EdgeKind) {
         mixin(
-            "static typeof(this) " ~ __traits(identifier, EnumMembers!EdgeKind[kind]) ~ "() @nogc nothrow pure @safe {
+            "static typeof(this) " ~ __traits(identifier, EnumMembers!EdgeKind[kind]) ~ "() @nogc nothrow pure {
                 return typeof(this)(EdgeKind." ~ __traits(identifier, EnumMembers!EdgeKind[kind]) ~ ");
             }"
         );
@@ -84,39 +85,25 @@ An outgoing edge slot.
 Connects to either zero or exactly one [InEdge].
 +/
 struct OutEdge {
-    // XXX: taggedPointer's generated accessors are not scope, so we need to make
-    // @trusted custom accessors, see https://issues.dlang.org/show_bug.cgi?id=23095
     mixin(taggedPointer!(
-        InEdge*, "_target",
+        InEdge*, "target",
         EdgeKind, "_kind", 2
     ));
 
- @nogc nothrow pure @safe:
-    /// Either points to another edge slot, or is null.
-    @property inout(InEdge)* target() inout return scope @trusted {
-        return this._target;
-    }
-
-    /// ditto
-    @property void target(return scope InEdge* target) scope @trusted {
-        this._target = target;
-    }
-
-    /// This edge's kind, fixed on construction.
-    @property EdgeKind kind() const scope @trusted {
+ @nogc nothrow pure:
+    @property EdgeKind kind() const {
         return this._kind;
-    }
-
-    /// ditto
-    @property void kind(EdgeKind kind) scope @trusted {
-        this._kind = kind;
     }
 
     @disable this();
 
-    ///
-    this(EdgeKind kind, return scope InEdge* target = null) {
-        this.kind = kind;
+    /++
+    Params:
+      kind = This edge's kind, fixed on construction.
+      target = Either points to an InEdge slot, or is null.
+    +/
+    this(EdgeKind kind, InEdge* target = null) {
+        this._kind = kind;
         this.target = target;
         assert(
             target == null || target.kind == this.kind,
@@ -144,39 +131,25 @@ An incoming edge slot.
 Can receive any number of [OutEdge]s.
 +/
 struct InEdge {
-    // XXX: taggedPointer's generated accessors are not scope, so we need to make
-    // @trusted custom accessors, see https://issues.dlang.org/show_bug.cgi?id=23095
     mixin(taggedPointer!(
-        INode*, "_owner",
+        INode*, "owner",
         EdgeKind, "_kind", 2
     ));
 
- @nogc nothrow pure @safe:
-    /// Points back to the node which owns this edge.
-    @property inout(INode)* owner() inout return scope @trusted {
-        return this._owner;
-    }
-
-    /// ditto
-    @property void owner(return scope INode* owner) scope @trusted {
-        this._owner = owner;
-    }
-
-    /// This edge's kind, fixed on construction.
-    @property EdgeKind kind() const scope @trusted {
+ @nogc nothrow pure:
+    @property EdgeKind kind() const {
         return this._kind;
-    }
-
-    /// ditto
-    @property void kind(EdgeKind kind) scope @trusted {
-        this._kind = kind;
     }
 
     @disable this();
 
-    ///
-    this(EdgeKind kind, return scope INode* owner = null) {
-        this.kind = kind;
+    /++
+    Params:
+      kind = This edge's kind, fixed on construction.
+      owner = Points back to the node which owns this edge.
+    +/
+    this(EdgeKind kind, INode* owner = null) {
+        this._kind = kind;
         this.owner = owner;
     }
 
@@ -192,6 +165,9 @@ struct InEdge {
     assert(A.target.owner is B.owner);
 }
 
+static assert(OutEdge.sizeof <= (InEdge*).sizeof, "OutEdge shouldn't be bigger than a pointer");
+static assert(InEdge.sizeof <= (INode*).sizeof, "InEdge shouldn't be bigger than a pointer");
+
 
 /++
 Common interface shared by all Gyre nodes; safely used ONLY as a referece type.
@@ -205,7 +181,6 @@ $(SMALL_TABLE
 )
 +/
 struct INode {
- pragma(inline) @nogc nothrow @safe:
     private immutable(VTable)* vptr = &vtbl;
 
     /++
@@ -214,7 +189,7 @@ struct INode {
     NOTE: This is the value which gets returned when `toHash` is called on a node (e.g. by hash tables).
         It is cached for performance reasons, as computing the structural hash of a node within an arbitrary graph can be costly.
     +/
-    @property hash_t hash() const scope pure { return this._hash; }
+    @property hash_t hash() const @nogc nothrow pure { return this._hash; }
     private hash_t _hash;
 
     /++
@@ -228,12 +203,13 @@ struct INode {
 
     private static immutable(VTable) vtbl = VTable.init;
     private immutable struct VTable {
-     @nogc nothrow @safe:
-        hash_t function(scope const(INode)*) computeHash = null;
-        bool function(scope const(INode)*, scope const(INode)*) opEquals = null;
+     @nogc nothrow:
+        hash_t function(const(INode)*) computeHash = null;
+        bool function(const(INode)*, const(INode)*) opEquals = null;
     }
 
-    size_t toHash() const scope pure {
+ pragma(inline) @nogc nothrow:
+    size_t toHash() const pure {
         return this.hash;
     }
 
@@ -242,9 +218,7 @@ struct INode {
 
     The new hash is obtained as the return value of the `computeHash` virtual method.
     +/
-    void updateHash() scope
-    @trusted // because we're taking the address of a scope input
-    {
+    void updateHash() {
         this._hash = this.vptr.computeHash(&this);
     }
 
@@ -256,9 +230,7 @@ struct INode {
 
     Returns: True if and only if one node can be entirely substituted by the other in a Gyre program.
     +/
-    bool opEquals(scope ref const(INode) other) const scope
-    @trusted // because we're taking the address of scope inputs
-    {
+    bool opEquals(ref const(INode) other) const {
         const(INode)* lhs = &this, rhs = &other;
         if (lhs == rhs) return true;
         if (lhs.vptr != rhs.vptr) return false;
@@ -277,30 +249,30 @@ private mixin template NodeInheritance() {
         "common INode prefix must be at a zero offset for safe struct inheritance"
     );
 
-    public pragma(inline) @nogc nothrow pure @safe {
-        inout(INode)* asNode() inout return {
+    public pragma(inline) @nogc nothrow pure {
+        inout(INode)* asNode() inout {
             return &this._node;
         }
 
-        static inout(This)* ofNode(return scope inout(INode)* node)
-        @trusted // cast is safe because of vptr check + common prefix
+        static inout(This)* ofNode(inout(INode)* node)
+        @trusted // we return null when the cast wouldn't be safe, so it's ok
         {
             if (node == null || node.vptr != &vtbl) return null;
             return cast(inout(This)*)(node);
         }
 
-        size_t toHash() const scope {
+        size_t toHash() const {
             return this.hash;
         }
     }
 
     private static immutable(INode.VTable) vtbl = {
-        computeHash: (scope const(INode)* node) @nogc nothrow @safe {
+        computeHash: (const(INode)* node) {
             auto self = This.ofNode(node);
             assert(self != null);
             return (*self).computeHash();
         },
-        opEquals: (scope const(INode)* lhs, scope const(INode)* rhs) @nogc nothrow @safe {
+        opEquals: (const(INode)* lhs, const(INode)* rhs) {
             auto self = This.ofNode(lhs), other = This.ofNode(rhs);
             assert(self != null && other != null);
             return *self == *other;
@@ -316,22 +288,22 @@ version (unittest) private {
         mixin NodeInheritance;
         int value;
 
-     @nogc nothrow @safe:
-        this(int value) scope { this.value = value; }
+     @nogc nothrow:
+        this(int value) { this.value = value; }
 
-        hash_t computeHash() const scope {
+        hash_t computeHash() const {
             debug usingCustomHash = true;
             return this.value;
         }
 
-        bool opEquals(scope ref const(typeof(this)) rhs) const scope {
+        bool opEquals(ref const(typeof(this)) rhs) const {
             debug usingCustomEquals = true;
             return this.value == rhs.value;
         }
     }
 }
 
-@nogc nothrow @safe unittest {
+@nogc nothrow unittest {
     // subtype inherits INode's attributes
     auto test = UnittestNode(1);
     assert(is(typeof(test.observers) == typeof(INode.observers)));
@@ -409,12 +381,12 @@ struct JoinNode {
         }
     }
 
- @nogc nothrow @safe: // TODO:
-    hash_t computeHash() const scope {
+ @nogc nothrow: // TODO:
+    hash_t computeHash() const {
         return 0;
     }
 
-    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
+    bool opEquals(ref const(typeof(this)) rhs) const {
         return this is rhs;
     }
 }
@@ -444,12 +416,12 @@ struct InstantiationNode {
             assert(cont.kind == EdgeKind.data);
     }
 
- @nogc nothrow @safe: // TODO:
-    hash_t computeHash() const scope {
+ @nogc nothrow: // TODO:
+    hash_t computeHash() const {
         return 0;
     }
 
-    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
+    bool opEquals(ref const(typeof(this)) rhs) const {
         return this is rhs;
     }
 }
@@ -462,10 +434,12 @@ They can be seen as a (a) `goto`, (b) function application, (c) return statement
 
 Gyre jumps differ from classic function calls because there is no implicit expectation of a "return"; this is [CPS](https://en.wikipedia.org/wiki/Continuation-passing_style).
 If a caller expects return values (or even to take control back at all), it needs to set up a "return continuation" and pass that in as an argument as well, hoping that the subprocedure it is calling will (1) eventually receive messages on all of its other channels, triggering the join pattern; (2) execute the join's body to completion; and (3) have that body jump into the provided continuation as a way to come back (perhaps with a return value) to the calling code.
+This is not unlike what we (implicitly) assume of normal functions: their return depends on (1) whether it doesn't go into starvation while waiting for other threads; (2) whether it terminates; and (3) whether it actually has a `return` statement (it could call a C-like `exit` procedure instead, or use raw assembly to continue the program elsewhere, etc).
 
-Jumps synchronize with each other when a join pattern triggers.
-Imagine a set of concurrent processes, each carrying a continuation corresponding to a different channel of some join pattern; once they've all jumped into their respective continuations, the join pattern triggers and its body executes.
-Then, every event in those processes which happens before the jump, also happens before all events in the triggered join pattern body.
+Jumps synchronize with each other when they cause a multiple-channel join pattern to trigger.
+Imagine a set of concurrent processes, each carrying a continuation corresponding to a different channel of some join pattern; once they've all jumped into their respective continuations, the join triggers and its body executes.
+Then, every event in those processes which happens before the jump, also happens before all events in the triggered join pattern's body.
+Note that this does not apply to single-channel join patterns, since inlining may cause their body to be reordered with respect to the calling code.
 
 See_Also: [JoinNode]
 +/
@@ -487,12 +461,12 @@ struct JumpNode {
             assert(arg.kind != EdgeKind.control);
     }
 
- @nogc nothrow @safe: // TODO:
-    hash_t computeHash() const scope {
+ @nogc nothrow: // TODO:
+    hash_t computeHash() const {
         return 0;
     }
 
-    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
+    bool opEquals(ref const(typeof(this)) rhs) const {
         return this is rhs;
     }
 }
@@ -530,12 +504,12 @@ struct BranchNode {
             assert(branch.kind == EdgeKind.control);
     }
 
- @nogc nothrow @safe: // TODO:
-    hash_t computeHash() const scope {
+ @nogc nothrow: // TODO:
+    hash_t computeHash() const {
         return 0;
     }
 
-    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
+    bool opEquals(ref const(typeof(this)) rhs) const {
         return this is rhs;
     }
 }
@@ -569,12 +543,12 @@ struct ForkNode {
             assert(thread.kind == EdgeKind.control);
     }
 
- @nogc nothrow @safe: // TODO:
-    hash_t computeHash() const scope {
+ @nogc nothrow: // TODO:
+    hash_t computeHash() const {
         return 0;
     }
 
-    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
+    bool opEquals(ref const(typeof(this)) rhs) const {
         return this is rhs;
     }
 }
@@ -610,12 +584,12 @@ struct MultiplexerNode {
             assert(option.kind == EdgeKind.data);
     }
 
- @nogc nothrow @safe: // TODO:
-    hash_t computeHash() const scope {
+ @nogc nothrow: // TODO:
+    hash_t computeHash() const {
         return 0;
     }
 
-    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
+    bool opEquals(ref const(typeof(this)) rhs) const {
         return this is rhs;
     }
 }
@@ -632,12 +606,12 @@ struct ConstantNode {
     InEdge value;
     invariant (value.kind == EdgeKind.data);
 
- @nogc nothrow @safe: // TODO:
-    hash_t computeHash() const scope {
+ @nogc nothrow: // TODO:
+    hash_t computeHash() const {
         return 0;
     }
 
-    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
+    bool opEquals(ref const(typeof(this)) rhs) const {
         return this is rhs;
     }
 }
@@ -659,12 +633,12 @@ struct UndefinedNode {
     InEdge value;
     invariant (value.kind == EdgeKind.data);
 
- @nogc nothrow @safe: // TODO:
-    hash_t computeHash() const scope {
+ @nogc nothrow: // TODO:
+    hash_t computeHash() const {
         return 0;
     }
 
-    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
+    bool opEquals(ref const(typeof(this)) rhs) const {
         return this is rhs;
     }
 }
@@ -681,12 +655,12 @@ struct NotNode {
     InEdge output;
     invariant (output.kind == EdgeKind.data);
 
- @nogc nothrow @safe: // TODO:
-    hash_t computeHash() const scope {
+ @nogc nothrow: // TODO:
+    hash_t computeHash() const {
         return 0;
     }
 
-    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
+    bool opEquals(ref const(typeof(this)) rhs) const {
         return this is rhs;
     }
 }
@@ -707,12 +681,12 @@ struct AndNode {
     InEdge output;
     invariant (output.kind == EdgeKind.data);
 
- @nogc nothrow @safe: // TODO:
-    hash_t computeHash() const scope {
+ @nogc nothrow: // TODO:
+    hash_t computeHash() const {
         return 0;
     }
 
-    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
+    bool opEquals(ref const(typeof(this)) rhs) const {
         return this is rhs;
     }
 }
@@ -733,12 +707,12 @@ struct OrNode {
     InEdge output;
     invariant (output.kind == EdgeKind.data);
 
- @nogc nothrow @safe: // TODO:
-    hash_t computeHash() const scope {
+ @nogc nothrow: // TODO:
+    hash_t computeHash() const {
         return 0;
     }
 
-    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
+    bool opEquals(ref const(typeof(this)) rhs) const {
         return this is rhs;
     }
 }
@@ -759,12 +733,12 @@ struct XorNode {
     InEdge output;
     invariant (output.kind == EdgeKind.data);
 
- @nogc nothrow @safe: // TODO:
-    hash_t computeHash() const scope {
+ @nogc nothrow: // TODO:
+    hash_t computeHash() const {
         return 0;
     }
 
-    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
+    bool opEquals(ref const(typeof(this)) rhs) const {
         return this is rhs;
     }
 }
@@ -789,12 +763,12 @@ struct LeftShiftNode {
     InEdge output;
     invariant (output.kind == EdgeKind.data);
 
- @nogc nothrow @safe: // TODO:
-    hash_t computeHash() const scope {
+ @nogc nothrow: // TODO:
+    hash_t computeHash() const {
         return 0;
     }
 
-    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
+    bool opEquals(ref const(typeof(this)) rhs) const {
         return this is rhs;
     }
 }
@@ -821,12 +795,12 @@ struct UnsignedRightShiftNode {
     InEdge output;
     invariant (output.kind == EdgeKind.data);
 
- @nogc nothrow @safe: // TODO:
-    hash_t computeHash() const scope {
+ @nogc nothrow: // TODO:
+    hash_t computeHash() const {
         return 0;
     }
 
-    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
+    bool opEquals(ref const(typeof(this)) rhs) const {
         return this is rhs;
     }
 }
@@ -853,12 +827,12 @@ struct SignedRightShiftNode {
     InEdge output;
     invariant (output.kind == EdgeKind.data);
 
- @nogc nothrow @safe: // TODO:
-    hash_t computeHash() const scope {
+ @nogc nothrow: // TODO:
+    hash_t computeHash() const {
         return 0;
     }
 
-    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
+    bool opEquals(ref const(typeof(this)) rhs) const {
         return this is rhs;
     }
 }
@@ -879,12 +853,12 @@ struct AdditionNode {
     InEdge result;
     invariant (result.kind == EdgeKind.data);
 
- @nogc nothrow @safe: // TODO:
-    hash_t computeHash() const scope {
+ @nogc nothrow: // TODO:
+    hash_t computeHash() const {
         return 0;
     }
 
-    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
+    bool opEquals(ref const(typeof(this)) rhs) const {
         return this is rhs;
     }
 }
@@ -905,12 +879,12 @@ struct SubtractionNode {
     InEdge result;
     invariant (result.kind == EdgeKind.data);
 
- @nogc nothrow @safe: // TODO:
-    hash_t computeHash() const scope {
+ @nogc nothrow: // TODO:
+    hash_t computeHash() const {
         return 0;
     }
 
-    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
+    bool opEquals(ref const(typeof(this)) rhs) const {
         return this is rhs;
     }
 }
@@ -935,12 +909,12 @@ struct MultiplicationNode {
     InEdge result;
     invariant (result.kind == EdgeKind.data);
 
- @nogc nothrow @safe: // TODO:
-    hash_t computeHash() const scope {
+ @nogc nothrow: // TODO:
+    hash_t computeHash() const {
         return 0;
     }
 
-    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
+    bool opEquals(ref const(typeof(this)) rhs) const {
         return this is rhs;
     }
 }
@@ -967,12 +941,12 @@ struct UnsignedDivisionNode {
     InEdge quotient;
     invariant (quotient.kind == EdgeKind.data);
 
- @nogc nothrow @safe: // TODO:
-    hash_t computeHash() const scope {
+ @nogc nothrow: // TODO:
+    hash_t computeHash() const {
         return 0;
     }
 
-    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
+    bool opEquals(ref const(typeof(this)) rhs) const {
         return this is rhs;
     }
 }
@@ -1000,12 +974,12 @@ struct SignedDivisionNode {
     InEdge quotient;
     invariant (quotient.kind == EdgeKind.data);
 
- @nogc nothrow @safe: // TODO:
-    hash_t computeHash() const scope {
+ @nogc nothrow: // TODO:
+    hash_t computeHash() const {
         return 0;
     }
 
-    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
+    bool opEquals(ref const(typeof(this)) rhs) const {
         return this is rhs;
     }
 }
@@ -1032,12 +1006,12 @@ struct UnsignedRemainderNode {
     InEdge remainder;
     invariant (remainder.kind == EdgeKind.data);
 
- @nogc nothrow @safe: // TODO:
-    hash_t computeHash() const scope {
+ @nogc nothrow: // TODO:
+    hash_t computeHash() const {
         return 0;
     }
 
-    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
+    bool opEquals(ref const(typeof(this)) rhs) const {
         return this is rhs;
     }
 }
@@ -1065,12 +1039,12 @@ struct SignedRemainderNode {
     InEdge remainder;
     invariant (remainder.kind == EdgeKind.data);
 
- @nogc nothrow @safe: // TODO:
-    hash_t computeHash() const scope {
+ @nogc nothrow: // TODO:
+    hash_t computeHash() const {
         return 0;
     }
 
-    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
+    bool opEquals(ref const(typeof(this)) rhs) const {
         return this is rhs;
     }
 }
@@ -1091,12 +1065,12 @@ struct EqualNode {
     InEdge output;
     invariant (output.kind == EdgeKind.data);
 
- @nogc nothrow @safe: // TODO:
-    hash_t computeHash() const scope {
+ @nogc nothrow: // TODO:
+    hash_t computeHash() const {
         return 0;
     }
 
-    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
+    bool opEquals(ref const(typeof(this)) rhs) const {
         return this is rhs;
     }
 }
@@ -1117,12 +1091,12 @@ struct UnsignedLessThanNode {
     InEdge output;
     invariant (output.kind == EdgeKind.data);
 
- @nogc nothrow @safe: // TODO:
-    hash_t computeHash() const scope {
+ @nogc nothrow: // TODO:
+    hash_t computeHash() const {
         return 0;
     }
 
-    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
+    bool opEquals(ref const(typeof(this)) rhs) const {
         return this is rhs;
     }
 }
@@ -1143,12 +1117,12 @@ struct SignedLessThanNode {
     InEdge output;
     invariant (output.kind == EdgeKind.data);
 
- @nogc nothrow @safe: // TODO:
-    hash_t computeHash() const scope {
+ @nogc nothrow: // TODO:
+    hash_t computeHash() const {
         return 0;
     }
 
-    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
+    bool opEquals(ref const(typeof(this)) rhs) const {
         return this is rhs;
     }
 }
@@ -1169,12 +1143,12 @@ struct UnsignedGreaterOrEqualNode {
     InEdge output;
     invariant (output.kind == EdgeKind.data);
 
- @nogc nothrow @safe: // TODO:
-    hash_t computeHash() const scope {
+ @nogc nothrow: // TODO:
+    hash_t computeHash() const {
         return 0;
     }
 
-    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
+    bool opEquals(ref const(typeof(this)) rhs) const {
         return this is rhs;
     }
 }
@@ -1195,12 +1169,12 @@ struct SignedGreaterOrEqualNode {
     InEdge output;
     invariant (output.kind == EdgeKind.data);
 
- @nogc nothrow @safe: // TODO:
-    hash_t computeHash() const scope {
+ @nogc nothrow: // TODO:
+    hash_t computeHash() const {
         return 0;
     }
 
-    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
+    bool opEquals(ref const(typeof(this)) rhs) const {
         return this is rhs;
     }
 }
@@ -1217,12 +1191,12 @@ struct TruncationNode {
     InEdge output;
     invariant (output.kind == EdgeKind.data);
 
- @nogc nothrow @safe: // TODO:
-    hash_t computeHash() const scope {
+ @nogc nothrow: // TODO:
+    hash_t computeHash() const {
         return 0;
     }
 
-    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
+    bool opEquals(ref const(typeof(this)) rhs) const {
         return this is rhs;
     }
 }
@@ -1239,12 +1213,12 @@ struct UnsignedExtensionNode {
     InEdge output;
     invariant (output.kind == EdgeKind.data);
 
- @nogc nothrow @safe: // TODO:
-    hash_t computeHash() const scope {
+ @nogc nothrow: // TODO:
+    hash_t computeHash() const {
         return 0;
     }
 
-    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
+    bool opEquals(ref const(typeof(this)) rhs) const {
         return this is rhs;
     }
 }
@@ -1261,12 +1235,12 @@ struct SignedExtensionNode {
     InEdge output;
     invariant (output.kind == EdgeKind.data);
 
- @nogc nothrow @safe: // TODO:
-    hash_t computeHash() const scope {
+ @nogc nothrow: // TODO:
+    hash_t computeHash() const {
         return 0;
     }
 
-    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
+    bool opEquals(ref const(typeof(this)) rhs) const {
         return this is rhs;
     }
 }

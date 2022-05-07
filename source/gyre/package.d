@@ -8,7 +8,7 @@ Explicit concurrency comes with the addition of a [standard memory consistency m
 Several other features are "mashed up" in Gyre's design, coming from an extensive survey on compilers, portable IRs and [UNCOL](https://www.osdata.com/topic/language/uncol.htm).
 
 
-[Click here](gyre.graph.html#details) for more information on the IR's structure.
+[Click here](gyre.graph.html#details) for more information on the IR's structure (albeit mixed with implementation details).
 
 Design_Principles:
 $(LIST
@@ -20,5 +20,3 @@ $(LIST
 )
 +/
 module gyre;
-
-public import gyre.graph;

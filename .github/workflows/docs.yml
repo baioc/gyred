@@ -19,7 +19,7 @@ jobs:
           compiler: dmd-latest
 
       - name: Build docs 📑
-        run: dub run adrdox@2.5.2 -- . -i -o docs --header-link GyreD=https://github.com/baioc/gyred/
+        run: dub run adrdox@2.5.2 -- . -i -o docs --header-link 'GyreD (source)'='https://github.com/baioc/gyred/'
 
       - name: Deploy to GitHub Pages 🚀
         uses: JamesIves/github-pages-deploy-action@v4
