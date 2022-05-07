@@ -324,7 +324,7 @@ version (unittest) private {
             return this.value;
         }
 
-        bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+        bool opEquals(scope ref const(typeof(this)) rhs) const scope {
             debug usingCustomEquals = true;
             return this.value == rhs.value;
         }
@@ -414,7 +414,7 @@ struct JoinNode {
         return 0;
     }
 
-    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
         return this is rhs;
     }
 }
@@ -449,7 +449,7 @@ struct InstantiationNode {
         return 0;
     }
 
-    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
         return this is rhs;
     }
 }
@@ -492,7 +492,7 @@ struct JumpNode {
         return 0;
     }
 
-    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
         return this is rhs;
     }
 }
@@ -535,7 +535,7 @@ struct BranchNode {
         return 0;
     }
 
-    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
         return this is rhs;
     }
 }
@@ -574,7 +574,7 @@ struct ForkNode {
         return 0;
     }
 
-    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
         return this is rhs;
     }
 }
@@ -615,7 +615,7 @@ struct MultiplexerNode {
         return 0;
     }
 
-    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
         return this is rhs;
     }
 }
@@ -637,7 +637,7 @@ struct ConstantNode {
         return 0;
     }
 
-    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
         return this is rhs;
     }
 }
@@ -664,7 +664,7 @@ struct UndefinedNode {
         return 0;
     }
 
-    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
         return this is rhs;
     }
 }
@@ -686,7 +686,7 @@ struct NotNode {
         return 0;
     }
 
-    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
         return this is rhs;
     }
 }
@@ -712,7 +712,7 @@ struct AndNode {
         return 0;
     }
 
-    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
         return this is rhs;
     }
 }
@@ -738,7 +738,7 @@ struct OrNode {
         return 0;
     }
 
-    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
         return this is rhs;
     }
 }
@@ -764,7 +764,7 @@ struct XorNode {
         return 0;
     }
 
-    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
         return this is rhs;
     }
 }
@@ -794,7 +794,7 @@ struct LeftShiftNode {
         return 0;
     }
 
-    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
         return this is rhs;
     }
 }
@@ -826,7 +826,7 @@ struct UnsignedRightShiftNode {
         return 0;
     }
 
-    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
         return this is rhs;
     }
 }
@@ -858,7 +858,7 @@ struct SignedRightShiftNode {
         return 0;
     }
 
-    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
         return this is rhs;
     }
 }
@@ -884,7 +884,7 @@ struct AdditionNode {
         return 0;
     }
 
-    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
         return this is rhs;
     }
 }
@@ -910,7 +910,7 @@ struct SubtractionNode {
         return 0;
     }
 
-    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
         return this is rhs;
     }
 }
@@ -940,7 +940,7 @@ struct MultiplicationNode {
         return 0;
     }
 
-    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
         return this is rhs;
     }
 }
@@ -972,7 +972,7 @@ struct UnsignedDivisionNode {
         return 0;
     }
 
-    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
         return this is rhs;
     }
 }
@@ -1005,7 +1005,7 @@ struct SignedDivisionNode {
         return 0;
     }
 
-    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
         return this is rhs;
     }
 }
@@ -1037,7 +1037,7 @@ struct UnsignedRemainderNode {
         return 0;
     }
 
-    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
         return this is rhs;
     }
 }
@@ -1070,7 +1070,7 @@ struct SignedRemainderNode {
         return 0;
     }
 
-    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
         return this is rhs;
     }
 }
@@ -1096,7 +1096,7 @@ struct EqualNode {
         return 0;
     }
 
-    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
         return this is rhs;
     }
 }
@@ -1122,7 +1122,7 @@ struct UnsignedLessThanNode {
         return 0;
     }
 
-    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
         return this is rhs;
     }
 }
@@ -1148,7 +1148,7 @@ struct SignedLessThanNode {
         return 0;
     }
 
-    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
         return this is rhs;
     }
 }
@@ -1174,7 +1174,7 @@ struct UnsignedGreaterOrEqualNode {
         return 0;
     }
 
-    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
         return this is rhs;
     }
 }
@@ -1200,7 +1200,7 @@ struct SignedGreaterOrEqualNode {
         return 0;
     }
 
-    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
         return this is rhs;
     }
 }
@@ -1222,7 +1222,7 @@ struct TruncationNode {
         return 0;
     }
 
-    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
         return this is rhs;
     }
 }
@@ -1244,7 +1244,7 @@ struct UnsignedExtensionNode {
         return 0;
     }
 
-    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
         return this is rhs;
     }
 }
@@ -1266,7 +1266,7 @@ struct SignedExtensionNode {
         return 0;
     }
 
-    bool opEquals()(scope auto ref const(typeof(this)) rhs) const scope {
+    bool opEquals(scope ref const(typeof(this)) rhs) const scope {
         return this is rhs;
     }
 }
