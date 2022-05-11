@@ -57,7 +57,7 @@ T* allocate(T)(size_t n = 1) @nogc nothrow
         }
     }
 
-    return cast(T*)(ptr);
+    return cast(T*) ptr;
 }
 
 /++

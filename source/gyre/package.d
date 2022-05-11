@@ -5,12 +5,14 @@ Gyre is not particularly innovative, aiming instead to consolidate features from
 It's a graph-based IR, heavily influenced by [Click's sea of nodes](https://www.oracle.com/technetwork/java/javase/tech/c2-ir95-150110.pdf).
 We take a more functional approach to SSA form by mixing [MLIR-style extended basic blocks](https://mlir.llvm.org/docs/Rationale/Rationale/#block-arguments-vs-phi-nodes) and [Thorin-style CPS-on-a-graph](https://anydsl.github.io/Thorin.html).
 Explicit concurrency comes with the addition of a [standard memory consistency model](https://five-embeddev.com/riscv-isa-manual/latest/a.html#atomics) and a message-passing mechanism from the [join calculus](https://www.microsoft.com/en-us/research/publication/join-calculus-language-distributed-mobile-programming/).
-Several other features are "mashed up" in Gyre's design, coming from an extensive survey on compilers, portable IRs and [UNCOL](https://www.osdata.com/topic/language/uncol.htm).
+Several other features are "mashed up" in Gyre's design, coming from an extensive survey on compilers, portable IRs and the old concept of [UNCOL](https://www.osdata.com/topic/language/uncol.htm) as a solution to the compiler construction problem.
 
 
-[Click here](gyre.graph.html#details) for more information on the IR's structure (albeit mixed with implementation details).
+[gyre.graph|Click here] for more information on the IR's structure (albeit mixed with implementation details).
+
 
 Design_Principles:
+
 $(LIST
     * Expressivity: The IR must be able to represent, up to some level of detail, the essential properties of any program. Software which is not portable is also of interest, even if only to indicate where and how it uses machine-specific constructs and assumptions, or when compiling it to a compatible architecture.
     * Efficiency: The IR's wire format should be fast to decode and validate. At the same time, the IR itself must not introduce unreasonable costs to transformations, nor impose unnecessary restrictions to program structure.

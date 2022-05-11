@@ -6,6 +6,9 @@
 	"targetType": "executable",
 	"mainSourceFile": "source/app.d",
 
+	"toolchainRequirements": {
+		"frontend": ">=2.097"
+	},
 	"buildRequirements": ["allowWarnings"],
 	"dflags": [
 		"-preview=fieldwise",

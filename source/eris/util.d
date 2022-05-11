@@ -8,20 +8,21 @@ import eris.core : allocate, deallocate;
 
 
 /// Free-function `empty`, which does the expected thing whenever `arg.length` works.
-pragma(inline) bool empty(T)(ref const(T) arg) if (is(typeof(arg.length) : size_t)) {
-    static if (__traits(hasMember, T, "empty")) return arg.empty;
-    else                                        return arg.length == 0;
+pragma(inline) bool empty(T)(ref const(T) arg)
+if (is(typeof(arg.length) : size_t) && !__traits(hasMember, T, "empty"))
+{
+    return arg.length == 0;
 }
 
 ///
 @nogc nothrow pure @safe unittest {
     struct S { size_t length; }
 
-    S s = { length: 0 };
-    assert(s.empty);
+    S a = { length: 0 };
+    assert(a.empty);
 
-    s.length = 1;
-    assert(!s.empty);
+    S b  = { length: 1 };
+    assert(!b.empty);
 }
 
 
@@ -86,7 +87,7 @@ nothrow pure @safe unittest {
     assert(ptr.baz == x.baz);
     assert(ptr.bar(ptr) == x.bar(&x)); // implicit conversion
 
-    // however, equality checks may forward to the pointed-to element
+    // equality checks may forward to the pointed-to element
     HashablePointer!S sameRef = ptr;
     assert(sameRef == ptr);
     assert(*sameRef != *ptr); // see S.opEquals, above
@@ -142,13 +143,6 @@ if (!is(T == class) && !(is(T == interface)))
             this.store._refCount = 1;
         }
 
-        void move(ref T source) nothrow {
-            import std.algorithm.mutation : moveEmplace;
-            this.allocateStore();
-            moveEmplace(source, this.store.payload);
-            this.store._refCount = 1;
-        }
-
      public pragma(inline):
         ///
         @property bool isInitialized() const {
@@ -160,9 +154,7 @@ if (!is(T == class) && !(is(T == interface)))
         }
 
         ///
-        void ensureInitialized()
-        out (; this.isInitialized)
-        {
+        void ensureInitialized() out (; this.isInitialized) {
             if (!this.isInitialized) initialize();
         }
     }
@@ -170,16 +162,9 @@ if (!is(T == class) && !(is(T == interface)))
     // public API mostly just managed the internal store
     private RefCountedStore _refCounted;
 
-    this(A...)(auto ref A args)
-    if (A.length > 0)
-    out (; refCountedStore.isInitialized)
-    {
+    this(A...)(auto ref A args) if (A.length > 0) {
         import core.lifetime : forward;
         this._refCounted.initialize(forward!args);
-    }
-
-    this(T val) {
-        this._refCounted.move(val);
     }
 
     this(this) {
@@ -191,7 +176,8 @@ if (!is(T == class) && !(is(T == interface)))
     ~this() nothrow @trusted {
         if (!this._refCounted.isInitialized) return;
         assert(this._refCounted.store._refCount > 0);
-        if (--this._refCounted.store._refCount) return;
+        this._refCounted.store._refCount -= 1;
+        if (this._refCounted.store._refCount > 0) return;
         .destroy(this._refCounted.store.payload);
         this._refCounted.deallocateStore();
     }
@@ -201,13 +187,7 @@ if (!is(T == class) && !(is(T == interface)))
         swap(this._refCounted.store, rhs._refCounted.store);
     }
 
-    void opAssign(T rhs) {
-        import std.algorithm.mutation : move;
-        this._refCounted.ensureInitialized();
-        move(rhs, this._refCounted.store.payload);
-    }
-
-    /// Accesses the refcounted store (usually to check if - or ensure that - it is initialized).
+    /// Accesses the refcounted store, usually to check if (or ensure that) it is initialized.
     @property ref inout(RefCountedStore) refCountedStore() inout {
         return this._refCounted;
     }
@@ -235,21 +215,20 @@ if (!is(T == class) && !(is(T == interface)))
     static uint nDestroyed = 0;
     struct Resource {
         string name;
+        this(string name) { this.name = name; }
         @disable this(this);
         ~this() { debug ++nDestroyed; }
     }
 
     {
-        RefCountedTrusted!Resource rc;
-
-        assert(!rc.refCountedStore.isInitialized);
-        rc.refCountedStore.ensureInitialized();
-        assert(rc.refCountedStore.isInitialized);
-        () @trusted { rc.refCountedPayload.name = "thing"; }();
+        auto rc1 = RefCountedTrusted!Resource("thing");
+        assert(rc1.refCountedStore.isInitialized);
+        rc1.refCountedStore.ensureInitialized();
 
         {
-            auto rc2 = rc;
-            auto rc3 = rc2;
+            auto rc2 = rc1;
+            RefCountedTrusted!Resource rc3;
+            rc3 = rc2;
             () @trusted { assert(rc3.refCountedPayload.name == "thing"); }();
         }
 
@@ -257,6 +236,6 @@ if (!is(T == class) && !(is(T == interface)))
         debug assert(nDestroyed == 0);
     }
 
-    // now the last reference goes out of scope and the resource is destroyed
+    // now the last reference is removed and the resource is destroyed
     debug assert(nDestroyed == 1);
 }

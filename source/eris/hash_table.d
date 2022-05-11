@@ -17,13 +17,13 @@ import eris.util : RefCountedTrusted;
 
 
 private {
-    /// Hash table bucket.
+    // Hash table bucket.
     struct Bucket(Key) {
         Key key;
 
         static if (Key.sizeof >= 2) {
-            bool isOccupied = false; /// Whether this bucket is filled.
-            bool wasDeleted = false; /// Marks this (filled) bucket for deletion.
+            bool isOccupied = false; // Whether this bucket is filled.
+            bool wasDeleted = false; // Marks this (filled) bucket for deletion.
         } else {
             private import std.bitmanip : bitfields;
             mixin(bitfields!(
@@ -36,29 +36,18 @@ private {
         }
     }
 
+    // static settings
     enum maxLoadFactor = Rational!size_t(3, 4);
-    static assert(
-        maxLoadFactor > 0.0 && maxLoadFactor < 1.0,
-        "invalid max load factor " ~ maxLoadFactor.stringof ~
-        ": must be greater than zero and less than one"
-    );
-
     enum size_t minAllocatedSize = 8;
-    static assert(
-        minAllocatedSize * maxLoadFactor > 0,
-        "min allocation size " ~ minAllocatedSize.stringof ~
-        " and max load factor " ~ maxLoadFactor.stringof ~
-        " are incompatible: their product must be greater than zero"
-    );
 
-    /// Returns the index where the given key is or would be placed.
+    // Returns the index where the given key is or would be placed.
     size_t probeFor(K)(const(Bucket!(K)[]) buckets, ref const(K) key)
     in (buckets.length > 0, "can't probe an empty table")
     in (buckets.length.isPowerOf2, "table size is not a power of two")
     {
         // number of buckets must be a power of 2 so that we may swap modulos for bitmasks
-        const n = buckets.length;
-        const size_t mask = n - 1U;
+        const size_t n = buckets.length;
+        const size_t mask = n - 1;
 
         // step 1: start at index hash(key) % n, check for a hit or free slot
         const hash_t hash = key.hashOf;
@@ -68,22 +57,31 @@ private {
             return index;
 
         // step 2: collision detected, use the upper hash bits to jump elsewhere
-        index = (index + (hash >> (hash_t.sizeof * 8U / 2U))) & mask;
+        enum shift = hash_t.sizeof * 8 / 2;
+        index = (index + (hash >> shift)) & mask;
 
         // step 3: sequentially probe buckets, looking for deleted ones along the way.
         // this procedure is correct as long as probing is deterministic (i.e.
         // insert(k) -> ... -> lookup(k) find the same bucket), and it terminates
         // because at least one bucket must be free and we eventually try them all.
-        //
-        // we increment by j, where j grows by 1 every iteration, to implement a
-        // quadratic probe sequence over the triangular numbers; since we modulo by
-        // a power of two, every probed bucket is different (for a proof of this,
-        // see http://www.chilton-computing.org.uk/acl/literature/reports/p012.htm )
-        static assert(maxLoadFactor < 1.0); // ensures free buckets
+
+        // a valid max load factor ensures that at least one bucket is free
+        static assert(
+            maxLoadFactor > 0.0 && maxLoadFactor < 1.0,
+            "invalid max load factor " ~ maxLoadFactor.stringof ~
+            ": must be greater than zero and less than one"
+        );
+
         enum notFound = size_t.max; // impossible index because it's always > n
         assert(notFound > n);
         size_t recycled = notFound;
-        for (size_t j = 1;; ++j) {
+
+        // we increment by j, where j grows by 1 every iteration, to implement a
+        // quadratic probe sequence over the triangular numbers; since we modulo by
+        // a power of two, we'll take n steps to probe all n buckets. for a proof of this,
+        // see http://www.chilton-computing.org.uk/acl/literature/reports/p012.htm
+        for (size_t j = 1; true; ++j) {
+            assert(j <= n, "we're looping more than we should be");
             bucket = &buckets[index];
             if (!bucket.isOccupied) {
                 // if we had previously found a deleted bucket, reuse it
@@ -120,7 +118,7 @@ struct UnsafeHashMap(Key, Value) {
     // we only need to allocate a value array if its size is non-zero
     static if (Value.sizeof > 0) Value* values = null;
 
-    pragma(inline, true) {
+    pragma(inline) {
         @property size_t allocated() const {
             return this.buckets.length;
         }
@@ -159,8 +157,8 @@ struct UnsafeHashMap(Key, Value) {
             import std.string : format;
 
             auto result = appender!string;
-            const n = this.length;
-            result.reserve(3U + n*8U + n*(Key.sizeof + Value.sizeof));
+            const size_t n = this.length;
+            result.reserve(3 + n*8 + n*(Key.sizeof + Value.sizeof)); // ok even if overflows
             result ~= "#{";
 
             bool first = true;
@@ -224,6 +222,7 @@ struct UnsafeHashMap(Key, Value) {
     See_Also: [length]
     +/
     @property size_t capacity() const {
+        assert(this.allocated * maxLoadFactor.numerator >= this.allocated); // overflow check
         return cast(size_t)(this.allocated * maxLoadFactor);
     }
 
@@ -245,7 +244,7 @@ struct UnsafeHashMap(Key, Value) {
     See_Also: [require], [get]
     +/
     inout(Value) opIndex()(auto ref const(Key) key) inout
-    out (value; key in this || value == Value.init)
+    out (value; key in this || value is Value.init)
     {
         inout(Key)* keyp;
         inout(Value)* valp;
@@ -270,7 +269,7 @@ struct UnsafeHashMap(Key, Value) {
     }
 }
 
-/// This type optimizes storage when value types are zero-sized (e.g. for [UnsafeHashSet]).
+/// This type optimizes storage when value types are zero-sized (e.g. for [UnsafeHashSet]):
 @nogc nothrow pure @safe unittest {
     alias NonZero = long;
     alias Zero = void[0];
@@ -288,6 +287,7 @@ struct UnsafeHashMap(Key, Value) {
     table['a'] = 1; // updates
     assert(table.length == 1);
 
+    assert('a' in table);
     assert(table.remove('a') == true);
     assert('a' !in table);
     assert(table.remove('a') == false);
@@ -322,7 +322,7 @@ struct UnsafeHashMap(Key, Value) {
         // check if they match B's
         foreach (c; b) {
             if (!c.isalnum) continue;
-            const freq = letters.update(c, () => -1L, (ref long f) => f - 1);
+            const freq = letters.update(c, () => -1L, (long f) => f - 1);
             if (freq < 0) return false;
             else if (freq == 0) letters.remove(c);
         }
@@ -333,7 +333,7 @@ struct UnsafeHashMap(Key, Value) {
     assert( !isAnagram("aabaa", "bbabb")                            );
 }
 
-/// [clear]s and frees the table's internal storage.
+/// [clear|Clear]s and frees the table's internal storage.
 void dispose(K, V)(ref UnsafeHashMap!(K,V) self) nothrow @system
 out (; self.capacity == 0)
 {
@@ -363,8 +363,11 @@ out (; self.length == 0)
     if (capacity == 0) return 0;
 
     // adjust allocation size based on max load factor and round to power of two
+    const requestedCapacity = capacity;
     capacity = cast(size_t)(capacity / maxLoadFactor);
-    if (capacity < minAllocatedSize) {
+    if (capacity < requestedCapacity) { // overflow check
+        return ENOMEM;
+    } else if (capacity < minAllocatedSize) {
         capacity = minAllocatedSize;
         static assert(
             minAllocatedSize.isPowerOf2,
@@ -376,16 +379,18 @@ out (; self.length == 0)
         if (capacity == 0) return ENOMEM;
     }
     assert(capacity >= minAllocatedSize && capacity.isPowerOf2);
+    if (capacity * maxLoadFactor.numerator < capacity) // overflow check
+        return ENOMEM;
 
     // allocate bucket (and value) array
-    Bucket!(K)* buffer = allocate!(Bucket!K)(capacity);
+    auto buffer = allocate!(Bucket!K)(capacity);
     if (buffer == null) return ENOMEM;
-    self.buckets = () @trusted { return buffer[0 .. capacity]; }();
+    () @trusted { self.buckets = buffer[0 .. capacity]; }();
     static if (V.sizeof > 0) {
         self.values = allocate!V(capacity);
         if (self.values == null) {
-            self.buckets = null;
             () @trusted { buffer.deallocate(capacity); }();
+            self.buckets = null;
             return ENOMEM;
         }
     }
@@ -462,11 +467,12 @@ err_t rehash(K, V)(ref UnsafeHashMap!(K,V) self) {
     enum targetLoadFactor = Rational!size_t(1, 2);
     enum allocationAdjustment = maxLoadFactor / targetLoadFactor;
     static assert(allocationAdjustment >= 1.0);
-    const newCapacityAdjusted = cast(size_t)(self.length * allocationAdjustment);
-    return self.rehash(newCapacityAdjusted);
+    auto newCapacity = cast(size_t)(self.length * allocationAdjustment);
+    newCapacity = newCapacity < self.length ? self.length : newCapacity; // overflow check
+    return self.rehash(newCapacity);
 }
 
-private pragma(inline, true) bool _get(K, V)(
+private pragma(inline) bool _get(K, V)(
     ref inout(UnsafeHashMap!(K,V)) self,
     auto ref const(K) find,
     out inout(Bucket!K)* bucket,
@@ -480,7 +486,7 @@ private pragma(inline, true) bool _get(K, V)(
         Bucket!(K).key.offsetof == 0,
         "bucket layout must ensure safe cast to key"
     );
-    bucket = cast(inout(Bucket!K)*)(key);
+    bucket = cast(inout(Bucket!K)*) key;
     const size_t k = bucket - self.buckets.ptr;
     value = self.valueAt(k);
     return true;
@@ -546,9 +552,7 @@ out (; key !in self)
     return true;
 }
 
-/++
-[remove]s all elements from the hash table, without changing its capacity.
-+/
+/// [remove|Remove]s all elements from the hash table, without changing its capacity.
 void clear(K, V)(ref UnsafeHashMap!(K,V) self) nothrow
 out (; self.length == 0)
 {
@@ -593,11 +597,20 @@ if (is(ReturnType!Create == V)
 {
     // check whether a load factor increase needs to trigger a rehash
     if (self.occupied + 1 > self.capacity) {
-        // let's make sure rehash growth consistenly reduces load factor
-        static assert(minAllocatedSize * 2 > minAllocatedSize);
-        size_t newCapacity = self.allocated >= minAllocatedSize
-                                ? self.allocated * 2
-                                : minAllocatedSize;
+        size_t newCapacity = self.capacity * 2;
+        if (newCapacity == 0) {
+            newCapacity = cast(size_t)(minAllocatedSize * maxLoadFactor);
+            static assert(
+                minAllocatedSize * maxLoadFactor > 0,
+                "min allocation size " ~ minAllocatedSize.stringof ~
+                " and max load factor " ~ maxLoadFactor.stringof ~
+                " are incompatible: their product must be greater than zero"
+            );
+        } else if (newCapacity < self.capacity) { // overflow check
+            error = ENOMEM;
+            return V.init;
+        }
+        assert(newCapacity > self.capacity);
         error = self.rehash(newCapacity);
         if (error) return V.init;
     }
@@ -727,7 +740,7 @@ private mixin template UnsafeRangeBoilerplate(K, V) {
 Can be used to iterate over this table's entries (but iteration order is unspecified ).
 
 NOTE: Mutating a table silently invalidates any ranges over it.
-    Also, ranges must NEVER outlive their backing tables if they are unsafe (this is ok only for the refcounted versions).
+    Also, ranges must NEVER outlive their backing tables if they are unsafe (this is OK only for the refcounted versions).
 +/
 auto byKey(K, V)(ref const(UnsafeHashMap!(K,V)) self) {
     struct ByKey {
@@ -795,21 +808,14 @@ Params:
 Returns: A shallow copy of the given hash table, or an empty table in case of failure (OOM).
 +/
 UnsafeHashMap!(K,V) dup(K, V)(ref const(UnsafeHashMap!(K,V)) self, out err_t error) nothrow
-out (copy) {
-    if (!error) {
-        assert(copy.length == self.length);
-        foreach (entry; self.byKeyValue)
-            assert(entry.key in copy && copy[entry.key] == entry.value);
-    } else {
-        assert(copy.length == 0);
-    }
-} do {
+out (copy; (!error && copy.length == self.length) || (error && copy.length == 0))
+{
     UnsafeHashMap!(K,V) copy;
     error = copy.initialize(self.length);
     if (error) return copy;
     foreach (entry; self.byKeyValue) {
         error = (copy[entry.key] = entry.value);
-        assert(!error, "memory already reserved, so insertion won't fail");
+        assert(!error, "memory already reserved, so insertion can't fail");
     }
     return copy;
 }
@@ -904,7 +910,7 @@ struct HashMap(Key, Value) {
     // as for (2), we manually review the hash table API to only ever expose functionality
     // which does not leak references to the hash table's internal storage
     // and then mark as @trusted any operation which could rehash (that's safe now)
-    pragma(inline, true) @safe {
+    pragma(inline) @safe {
         @property bool isInitialized() const {
             return this.rc.refCountedStore.isInitialized;
         }
@@ -919,11 +925,11 @@ struct HashMap(Key, Value) {
         }
     }
 
+ public pragma(inline):
     void opAssign(HashMap other) {
         this.rc = other.rc;
     }
 
- public pragma(inline):
     version (D_BetterC) {} else {
         auto toString() const {
             if (!this.isInitialized) return "#{}";

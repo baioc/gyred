@@ -10,7 +10,7 @@ import eris.core : opCmp, hash_t;
 /++
 [Reduced-form](https://en.wikipedia.org/wiki/Irreducible_fraction) rational number.
 
-NOTE: The current implementation doesn't even try to deal with overflows.
+NOTE: The implementation does NOT attempt to handle overflows. Use a custom type for that.
 +/
 struct Rational(Z) if (__traits(isPOD, Z)) {
     private Z _numerator = 0;
@@ -37,7 +37,7 @@ struct Rational(Z) if (__traits(isPOD, Z)) {
     }
 
     /// Constructs a Rational from given numerator and (non-zero) denominator.
-    this(inout(Z) numerator, inout(Z) denominator = 1) inout nothrow
+    this(inout(Z) numerator, inout(Z) denominator = 1) inout
     in (denominator != 0, "denominator must not be zero")
     {
         const bool invert = denominator < 0;
@@ -65,7 +65,8 @@ struct Rational(Z) if (__traits(isPOD, Z)) {
     }
 
     size_t toHash() const {
-        return (this.numerator.hashOf << (hash_t.sizeof * 8U / 2U)) | this.denominator.hashOf;
+        enum shift = hash_t.sizeof * 8 / 2;
+        return (this.numerator.hashOf << shift) | this.denominator.hashOf;
     }
 
     /// Compares two rationals based on their reduced form.
@@ -164,8 +165,8 @@ struct Rational(Z) if (__traits(isPOD, Z)) {
 
     /// Casts rational to a scalar (may lose precision).
     N opCast(N)() const {
-        N num = cast(N)(this.numerator);
-        N den = cast(N)(this.denominator);
+        N num = cast(N) this.numerator;
+        N den = cast(N) this.denominator;
         return num / den;
     }
 
@@ -191,17 +192,17 @@ struct Rational(Z) if (__traits(isPOD, Z)) {
     // but remember that they are always kept in reduced form
     assert(Ratio(6, 4) == Ratio(3, 2));
     auto r2 = -(r * 2);
-    assert(r2.numerator == -3);
-    assert(r2.denominator == 2);
+    assert(r2.numerator == -3); // numerator may be negative
+    assert(r2.denominator == 2); // but denominator is always positive
 
     // they can be compared with floating-point and integral numbers
     assert(r == 0.75 && 0.75 == r);
-    assert(r != 1);
+    assert(r != 1 && 1 != r);
     assert(r < 1 && 1 > r);
     assert(r2 <= -1.5 && -1.5 >= r2);
     assert(r > r2);
 
-    // general arithmetic (and casts) work as expected
+    // arithmetic and casts work as expected (modulo overflows)
     assert(Ratio(-3, 5) + Ratio(2, 3) == Ratio(1, 15));
     assert(Ratio(-3, 14) - Ratio(5, 7) == Ratio(-13, 14));
     assert(Ratio(3, 7) * Ratio(7, 3) == 1 && 1 == Ratio(3, 7) * Ratio(7, 3));
@@ -209,9 +210,11 @@ struct Rational(Z) if (__traits(isPOD, Z)) {
     assert(cast(int)(2 * (1 + Ratio(42) - 1) / 2) == 42);
 }
 
+// also works with non-POD arithmetic types
 pure @safe unittest {
     import std.bigint;
-    BigInt three = 3, four = 4;
+    BigInt three = 3;
+    BigInt four = 4;
     assert(Rational!BigInt(three, four).toString == "3/4");
 }
 
