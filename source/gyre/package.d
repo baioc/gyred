@@ -5,7 +5,7 @@ Gyre is not particularly innovative, aiming instead to consolidate features from
 It's a graph-based IR, heavily influenced by [Click's sea of nodes](https://www.oracle.com/technetwork/java/javase/tech/c2-ir95-150110.pdf).
 We take a more functional approach to SSA form by mixing [MLIR-style extended basic blocks](https://mlir.llvm.org/docs/Rationale/Rationale/#block-arguments-vs-phi-nodes) and [Thorin-style CPS-on-a-graph](https://anydsl.github.io/Thorin.html).
 Explicit concurrency comes with the addition of a [standard memory consistency model](https://five-embeddev.com/riscv-isa-manual/latest/a.html#atomics) and a message-passing mechanism from the [join calculus](https://www.microsoft.com/en-us/research/publication/join-calculus-language-distributed-mobile-programming/).
-Several other features are "mashed up" in Gyre's design, coming from an extensive survey on compilers, portable IRs and the old concept of [UNCOL](https://www.osdata.com/topic/language/uncol.htm) as a solution to the compiler construction problem.
+Several other features are "mashed up" in Gyre's design, coming from an extensive survey on compilers, portable IRs and the [UNCOL](https://www.osdata.com/topic/language/uncol.htm) solution to the [compiler construction problem](https://doi.org/10.1145/368892.368915).
 
 
 [gyre.graph|Click here] for more information on the IR's structure (albeit mixed with implementation details).

@@ -2,9 +2,14 @@
 This module provides hash tables with deterministic memory usage (not reliant on the GC), as a betterC alternative to the built-in AAs.
 
 Includes both unsafe (explicitly managed) and safe (refcounted) hash-based data types.
+
+
+Performance is roughly equivalent to AAs, but can be made a bit better with preallocation.
+![upserts](https://user-images.githubusercontent.com/27034173/168399480-abe5e5bf-c99e-493f-9c9a-6f603884f6a8.png)
 +/
 module eris.hash_table;
 
+import core.lifetime : forward;
 import core.stdc.errno : ENOMEM, EINVAL;
 import std.algorithm.mutation : moveEmplace, swap;
 import std.math.traits : isPowerOf2;
@@ -41,7 +46,7 @@ private {
     enum size_t minAllocatedSize = 8;
 
     // Returns the index where the given key is or would be placed.
-    size_t probeFor(K)(const(Bucket!(K)[]) buckets, ref const(K) key)
+    size_t probeFor(Key)(const(Bucket!(Key)[]) buckets, ref const(Key) key)
     in (buckets.length > 0, "can't probe an empty table")
     in (buckets.length.isPowerOf2, "table size is not a power of two")
     {
@@ -112,11 +117,18 @@ struct UnsafeHashMap(Key, Value) {
     alias Bucket = .Bucket!Key;
 
     Bucket[] buckets = null;
+
     size_t occupied = 0;
+    invariant (occupied <= buckets.length);
+
     size_t used = 0;
+    invariant (used <= occupied);
 
     // we only need to allocate a value array if its size is non-zero
-    static if (Value.sizeof > 0) Value* values = null;
+    static if (Value.sizeof > 0) {
+        Value* values = null;
+        invariant ((buckets.ptr == null) == (values == null));
+    }
 
     pragma(inline) {
         @property size_t allocated() const {
@@ -124,7 +136,7 @@ struct UnsafeHashMap(Key, Value) {
         }
 
         inout(Value)* valueAt(size_t index) inout
-        @trusted // indexes raw pointer `values`
+        @trusted // indexes raw pointer
         in (index < this.allocated)
         {
             static if (Value.sizeof > 0) {
@@ -133,19 +145,6 @@ struct UnsafeHashMap(Key, Value) {
             } else {
                 return null;
             }
-        }
-    }
-
-    // since we're doing closed hashing, for every set of slots we have:
-    // used <= occupied <= allocate (where allocations are performed in bulk)
-    invariant {
-        assert(used <= occupied);
-        assert(occupied <= allocated);
-        assert((buckets.ptr == null && allocated == 0)
-            || (buckets.ptr != null && allocated != 0));
-        static if (Value.sizeof > 0) {
-            assert((buckets.ptr == null && values == null)
-                || (buckets.ptr != null && values != null));
         }
     }
 
@@ -184,10 +183,10 @@ struct UnsafeHashMap(Key, Value) {
         // entry order does not matter in a hash table, so we accumulate with XOR
         hash_t tableHash = 0;
         foreach (entry; this.byKeyValue) {
-            // for each entry, we use a noncommutative operation, scaled by a Fibonacci number
+            // for each entry, we use a noncommutative operation
             static if (__traits(compiles, () @safe => entry.value.hashOf)) {
-                enum size_t scale = 2654435771UL; // approx. 2^32 / phi
-                tableHash ^= (entry.key.hashOf - entry.value.hashOf) * scale;
+                enum size_t scale = 2654435771LU; // approx. 2^32 / phi
+                tableHash ^= (entry.key.hashOf - entry.value.hashOf) * scale; // ok if overflows
             }
             // if hashing values is unsafe, we want to depend only on the key's hash
             else {
@@ -198,11 +197,15 @@ struct UnsafeHashMap(Key, Value) {
     }
 
     /// Structural equality comparison.
-    bool opEquals(ref const(UnsafeHashMap) other) const {
+    bool opEquals()(auto ref const(UnsafeHashMap) other) const {
         if (this is other) return true;
         if (other.length != this.length) return false;
         foreach (entry; this.byKeyValue) {
-            if (entry.key !in other || entry.value != other[entry.key]) return false;
+            const(Key)* keyp;
+            const(Value)* valp;
+            const found = other.get(entry.key, keyp, valp);
+            if (!found) return false;
+            static if (Value.sizeof > 0) if (entry.value != *valp) return false;
         }
         return true;
     }
@@ -223,7 +226,7 @@ struct UnsafeHashMap(Key, Value) {
     +/
     @property size_t capacity() const {
         assert(this.allocated * maxLoadFactor.numerator >= this.allocated); // overflow check
-        return cast(size_t)(this.allocated * maxLoadFactor);
+        return this.allocated * maxLoadFactor.numerator / maxLoadFactor.denominator;
     }
 
     /++
@@ -239,20 +242,15 @@ struct UnsafeHashMap(Key, Value) {
     }
 
     /++
-    Returns the value associated with a given key, or its `.init`
+    Returns the value associated with a given key, or its `.init` in case it's not in the table.
 
     See_Also: [require], [get]
     +/
-    inout(Value) opIndex()(auto ref const(Key) key) inout
-    out (value; key in this || value is Value.init)
-    {
+    static if (Value.sizeof > 0) Value opIndex()(auto ref const(Key) key) inout {
         inout(Key)* keyp;
         inout(Value)* valp;
-        const found = this.get!(Key, Value)(key, keyp, valp);
-        static if (Value.sizeof > 0)
-            return found ? *valp : Value.init;
-        else
-            return Value.init;
+        const found = this.get(key, keyp, valp);
+        return found ? () @trusted { return *(cast(Value*)valp); }() : Value.init;
     }
 
     /++
@@ -267,6 +265,445 @@ struct UnsafeHashMap(Key, Value) {
         this.update(key, () => value, (ref Value old) => value, error);
         return error;
     }
+
+    private err_t initialize(size_t capacity) nothrow
+    in (this.buckets.ptr == null)
+    out (; this.length == 0)
+    {
+        if (capacity == 0) return 0;
+
+        // adjust allocation size based on max load factor and round to power of two
+        if (capacity * maxLoadFactor.denominator <= capacity) return ENOMEM; // overflow check
+        capacity = capacity * maxLoadFactor.denominator / maxLoadFactor.numerator;
+        if (capacity < minAllocatedSize) {
+            capacity = minAllocatedSize;
+            static assert(
+                minAllocatedSize.isPowerOf2,
+                "min allocated size must be a power of 2"
+            );
+        } else if (!capacity.isPowerOf2) {
+            import std.math.algebraic : nextPow2;
+            capacity = nextPow2(capacity);
+            if (capacity * maxLoadFactor.numerator <= capacity) return ENOMEM; // overflow check
+        }
+        assert(capacity >= minAllocatedSize && capacity.isPowerOf2);
+
+        // allocate bucket (and value) array
+        this.buckets = allocate!Bucket(capacity);
+        if (this.buckets == null) return ENOMEM;
+        static if (Value.sizeof > 0) {
+            this.values = () @trusted { return allocate!Value(this.buckets.length).ptr; }();
+            if (this.values == null) {
+                () @trusted { this.buckets.deallocate(); }();
+                this.buckets = null;
+                return ENOMEM;
+            }
+        }
+
+        // initialize bookkeeping state
+        foreach (ref bucket; this.buckets) {
+            bucket.isOccupied = false;
+            bucket.wasDeleted = false;
+        }
+        this.occupied = 0;
+        this.used = 0;
+
+        return 0;
+    }
+
+    /// [clear|Clear]s and frees the table's internal storage.
+    void dispose() nothrow @system
+    out (; this.capacity == 0)
+    {
+        this.clear();
+        static if (Value.sizeof > 0) deallocate(this.values[0 .. this.allocated]);
+        this.buckets.deallocate();
+        this = UnsafeHashMap.init;
+    }
+
+    /++
+    Rehashes the table.
+
+    Manual rehashes may make future lookups more efficient.
+    This is also the only way to reduce a hash table's memory footprint.
+    Nothing happens to the table in case of failure.
+
+    Params:
+        newCapacity = Min number of preallocated entries, must be enough to fit current entries.
+
+    Returns:
+        Zero on success, non-zero on failure (on OOM, overflow or an invalid capacity).
+    +/
+    err_t rehash(size_t newCapacity) nothrow @system
+    in (newCapacity >= this.length, "table capacity must be enough to fit its current entries")
+    out (error; error || this.capacity >= newCapacity)
+    {
+        if (newCapacity < this.length) return EINVAL;
+
+        // edge case: rehash empty table to zero capacity
+        if (newCapacity == 0 && this.length == 0) {
+            this.dispose();
+            const error = this.initialize(0);
+            assert(!error, "zero capacity doesn't allocate and thus can't fail");
+            return 0;
+        }
+
+        // otherwise, pretend that we're initializing a new table
+        UnsafeHashMap newTable;
+        const error = newTable.initialize(newCapacity);
+        if (error) return error;
+
+        // relocate every in-use entry to a newly-computed bucket
+        assert(newTable.allocated >= this.used);
+        size_t filled = 0;
+        foreach (size_t i, ref oldBucket; this.buckets) {
+            if (!oldBucket.isOccupied || oldBucket.wasDeleted) continue;
+            const k = newTable.buckets.probeFor(oldBucket.key);
+            auto newBucket = &newTable.buckets[k];
+            newBucket.isOccupied = true;
+            newBucket.wasDeleted = false;
+            moveEmplace(oldBucket.key, newBucket.key);
+            static if (Value.sizeof > 0) moveEmplace(*this.valueAt(i), *newTable.valueAt(k));
+            filled++;
+        }
+        assert(filled == this.used);
+        newTable.occupied = filled;
+        newTable.used = filled;
+
+        // finally, free the old table and replace it with the new one
+        this.dispose();
+        this = newTable;
+        return 0;
+    }
+
+    /// ditto
+    err_t rehash() {
+        enum targetLoadFactor = Rational!size_t(1, 2);
+        enum allocationAdjustment = maxLoadFactor / targetLoadFactor;
+        static assert(allocationAdjustment >= 1.0);
+        auto newCapacity = cast(size_t)(this.length * allocationAdjustment);
+        newCapacity = newCapacity < this.length ? this.length : newCapacity; // overflow check
+        return this.rehash(newCapacity);
+    }
+
+    private pragma(inline) bool getEntry()(
+        auto ref const(Key) needle,
+        out inout(Bucket)* bucket,
+        out inout(Value)* value
+    ) inout
+    @trusted // due to cast from Key* to Bucket*
+    {
+        auto key = needle in this;
+        if (key == null) return false;
+        static assert(
+            Bucket.key.offsetof == 0,
+            "bucket layout must ensure safe cast to key"
+        );
+        bucket = cast(inout(Bucket)*)key;
+        const size_t k = bucket - this.buckets.ptr;
+        value = this.valueAt(k);
+        return true;
+    }
+
+    /++
+    Looks up an entry in the table's internal storage.
+
+    Yields pointers to the hash table's internal storage, which may be invalidated by any [rehash]es.
+
+    Params:
+        needle = Key which designates the entry being looked up.
+        keyp = Set to entry key's address (or `null` when not found).
+        valp = Set to entry value's address (or `null` when it is a zero-sized type).
+
+    Returns: Whether or not the entry was found in the table.
+    +/
+    bool get()(auto ref const(Key) needle, out inout(Key)* keyp, out inout(Value)* valp) inout {
+        inout(Bucket)* bucket;
+        const found = this.getEntry(needle, bucket, valp);
+        if (!found) return false;
+        keyp = &bucket.key;
+        return true;
+    }
+
+    /++
+    Removes a key's entry from the table.
+
+    This procedure will also call `destroy` on both key and value.
+
+    Returns: Whether or not the key had an entry to begin with.
+    +/
+    bool remove()(auto ref const(Key) key) nothrow {
+        Bucket* bucket;
+        Value* valp;
+        const found = this.getEntry(key, bucket, valp);
+        if (!found) return false;
+        // on deletion, we simply mark the bucket and decrease entry count
+        destroy!false(bucket.key);
+        static if (Value.sizeof > 0) destroy!false(*valp);
+        bucket.wasDeleted = true;
+        this.used--;
+        return true;
+    }
+
+    /// [remove|Remove]s all elements from the hash table, without changing its capacity.
+    void clear() nothrow
+    out (; this.length == 0)
+    {
+        size_t toBeCleared = this.length;
+        for (size_t k = 0; toBeCleared > 0 && k < this.buckets.length; ++k) {
+            auto bucket = &this.buckets[k];
+            if (!bucket.isOccupied || bucket.wasDeleted) continue;
+            destroy!false(bucket.key);
+            static if (Value.sizeof > 0) destroy!false(*this.valueAt(k));
+            bucket.isOccupied = false;
+            bucket.wasDeleted = false;
+            --toBeCleared;
+        }
+        this.occupied = 0;
+        this.used = 0;
+    }
+
+    /++
+    Looks up a key's entry in the table, then either updates it or creates a new one (may [rehash]).
+
+    Params:
+        key = Key being looked up and stored in the table.
+        create = Called to construct a new value if the key isn't in the table.
+        update = Called to update the value of an entry, if it was found.
+        error = Set to zero on success, non-zero otherwise.
+
+    Returns: The entry's final value (or its `.init` in case of failure).
+    +/
+    pragma(inline) Value update(Create, Update)(
+        Key key,
+        scope auto ref const(Create) create,
+        scope auto ref const(Update) update,
+        out err_t error
+    ) nothrow
+    if (is(ReturnType!Create == Value)
+        && Parameters!Create.length == 0
+        && is(ReturnType!Update == Value)
+        && Parameters!Update.length == 1
+        && is(Parameters!Update[0] == Value))
+    {
+        // check whether a load factor increase needs to trigger a rehash
+        if (this.occupied + 1 > this.capacity) {
+            size_t newCapacity = this.capacity * 2;
+            if (newCapacity < this.capacity) { // overflow check
+                error = ENOMEM;
+                return Value.init;
+            } else if (newCapacity == 0) {
+                newCapacity = cast(size_t)(minAllocatedSize * maxLoadFactor);
+                static assert(
+                    minAllocatedSize * maxLoadFactor > 0,
+                    "min allocation size " ~ minAllocatedSize.stringof ~
+                    " and max load factor " ~ maxLoadFactor.stringof ~
+                    " are incompatible: their product must be greater than zero"
+                );
+            }
+            assert(newCapacity > this.capacity);
+            error = this.rehash(newCapacity);
+            if (error) return Value.init;
+        }
+
+        // find the key's designated bucket
+        const k = this.buckets.probeFor(key);
+        auto bucket = &this.buckets[k];
+        const hadEntry = bucket.isOccupied && !bucket.wasDeleted;
+
+        // increase load factor only if we're not reusing some freed bucket
+        if (!bucket.isOccupied) this.occupied++;
+        bucket.isOccupied = true;
+        bucket.wasDeleted = false;
+
+        // check whether we need to create a value or update the old one
+        if (!hadEntry) {
+            this.used++;
+            moveEmplace(key, bucket.key);
+            Value newValue = create();
+            static if (Value.sizeof > 0) {
+                moveEmplace(newValue, *this.valueAt(k));
+                return *this.valueAt(k);
+            } else {
+                return newValue;
+            }
+        } else /* hadEntry */ {
+            swap(key, bucket.key);
+            static if (Value.sizeof > 0) {
+                Value newValue = update(*this.valueAt(k));
+                swap(newValue, *this.valueAt(k));
+                return *this.valueAt(k);
+            } else {
+                Value oldValue = Value.init;
+                return update(oldValue);
+            }
+        }
+    }
+
+    /// ditto
+    Value update(Create, Update)(
+        Key key,
+        scope auto ref const(Create) create,
+        scope auto ref const(Update) update
+    )
+    if (is(ReturnType!Create == Value)
+        && Parameters!Create.length == 0
+        && is(ReturnType!Update == Value)
+        && Parameters!Update.length == 1
+        && is(Parameters!Update[0] == Value))
+    {
+        err_t ignored;
+        return this.update(key, create, update, ignored);
+    }
+
+    /++
+    Looks up a key's entry, inserting one if not found (may [rehash]).
+
+    Params:
+        key = Key being looked up and stored in the table.
+        create = Called to construct a new value if the key isn't in the table.
+        error = Set to zero on success, non-zero otherwise.
+
+    Returns: The entry's final value (or its `.init` in case of failure).
+    +/
+    Value require(Create)(
+        Key key,
+        scope auto ref const(Create) create,
+        out err_t error
+    )
+    if (is(ReturnType!Create == Value) && Parameters!Create.length == 0)
+    {
+        return this.update(key, create, x => x, error);
+    }
+
+    /// ditto
+    Value require(Create)(Key key, auto ref const(Create) create)
+    if (is(ReturnType!Create == Value) && Parameters!Create.length == 0)
+    {
+        err_t ignored;
+        return this.require(key, create, ignored);
+    }
+
+    private mixin template UnsafeRangeBoilerplate() {
+        private const(UnsafeHashMap)* table;
+        private size_t index;
+
+        private this(const(UnsafeHashMap)* t) {
+            this.table = t;
+            this.updateIndexFrom(0);
+        }
+
+        private void updateIndexFrom(size_t i) {
+            for (; i < this.table.buckets.length; ++i) {
+                const bucket = &this.table.buckets[i];
+                if (bucket.isOccupied && !bucket.wasDeleted) break;
+            }
+            this.index = i;
+        }
+
+        invariant {
+            if (this.index < this.table.buckets.length) {
+                auto bucket = &this.table.buckets[this.index];
+                assert(
+                    bucket.isOccupied && !bucket.wasDeleted,
+                    "tried using an invalidated hash table range"
+                );
+            }
+        }
+
+        public bool empty() const {
+            return this.index >= this.table.buckets.length;
+        }
+
+        public void popFront() in (!this.empty) {
+            this.updateIndexFrom(this.index + 1);
+        }
+    }
+
+    /++
+    Can be used to iterate over this table's entries (but iteration order is unspecified).
+
+    NOTE: Mutating a table silently invalidates any ranges over it.
+        Also, ranges must NEVER outlive their backing tables if they are unsafe (this is OK only for the refcounted versions).
+    +/
+    auto byKey() const {
+        struct ByKey {
+            mixin UnsafeRangeBoilerplate;
+            public Key front() const @trusted /* due to cast */ in (!this.empty) {
+                return cast(Key)this.table.buckets[this.index].key;
+            }
+        }
+        return ByKey(&this);
+    }
+
+    /// ditto
+    static if (Value.sizeof > 0) auto byValue() const {
+        struct ByValue {
+            mixin UnsafeRangeBoilerplate;
+            public Value front() const @trusted /* due to cast */ in (!this.empty) {
+                return cast(Value)*this.table.valueAt(this.index);
+            }
+        }
+        return ByValue(&this);
+    }
+
+    /// ditto
+    auto byKeyValue() const {
+        struct ByKeyValue {
+            mixin UnsafeRangeBoilerplate;
+            public KeyValue front() const @trusted /* due to cast */ in (!this.empty) {
+                auto bucket = &this.table.buckets[this.index];
+                static if (Value.sizeof > 0)
+                    return KeyValue(cast(Key)bucket.key, cast(Value)*this.table.valueAt(this.index));
+                else
+                    return KeyValue(cast(Key)bucket.key);
+            }
+            struct KeyValue {
+                Key key;
+                static if (Value.sizeof > 0) Value value;
+                else                         enum value = Value.init;
+            }
+        }
+        return ByKeyValue(&this);
+    }
+
+    /++
+    Creates an independent copy of a hash table.
+
+    Elements are copied by simple assignment, which may translate into a shallow copy.
+
+    Params:
+        error = Set to zero on success, non-zero otherwise.
+
+    Returns: A shallow copy of the given hash table, or an empty table in case of failure (OOM).
+    +/
+    UnsafeHashMap dup(out err_t error) const nothrow
+    out (copy; (!error && copy.length == this.length) || (error && copy.length == 0))
+    {
+        UnsafeHashMap copy;
+        error = copy.initialize(this.length);
+        if (error) return copy;
+        foreach (entry; this.byKeyValue) {
+            error = (copy[entry.key] = entry.value);
+            assert(!error, "memory already reserved, so insertion can't fail");
+        }
+        return copy;
+    }
+
+    /// ditto
+    UnsafeHashMap dup() const {
+        err_t ignored;
+        return this.dup(ignored);
+    }
+
+    /++
+    Adds an element to the hash set; may [rehash].
+
+    Returns: Zero on success, non-zero on failure (e.g. OOM or overflow).
+    +/
+    static if (Value.sizeof == 0) pragma(inline) err_t add(Key element) {
+        return (this[element] = Value.init);
+    }
 }
 
 /// This type optimizes storage when value types are zero-sized (e.g. for [UnsafeHashSet]):
@@ -274,6 +711,17 @@ struct UnsafeHashMap(Key, Value) {
     alias NonZero = long;
     alias Zero = void[0];
     static assert(UnsafeHashMap!(char, Zero).sizeof < UnsafeHashMap!(char, NonZero).sizeof);
+}
+
+/// Consider using `scope(exit)` to ensure hash table memory doesn't leak.
+@nogc nothrow unittest {
+    UnsafeHashMap!(char, long) outer;
+    {
+        UnsafeHashMap!(char, long) inner;
+        scope(exit) inner.dispose();
+        outer = inner; // but be careful with byref-like copies
+    }
+    // outer.dispose(); // would have caused a double free: `dispose` is unsafe!
 }
 
 /// Basic usage:
@@ -306,7 +754,7 @@ struct UnsafeHashMap(Key, Value) {
     assert(table.capacity == cap);
 }
 
-/// Sligthly more advanced example with `require` and `update`:
+/// Sligthly more advanced example:
 @nogc nothrow @safe unittest {
     import core.stdc.ctype : isalnum;
     import eris.util : empty;
@@ -316,7 +764,7 @@ struct UnsafeHashMap(Key, Value) {
         HashMap!(char, long) letters;
         foreach (c; a) {
             if (!c.isalnum) continue;
-            const freq = letters.require(c, () => 0L);
+            const freq = letters.get(c, () => 0L);
             letters[c] = freq + 1;
         }
         // check if they match B's
@@ -333,457 +781,6 @@ struct UnsafeHashMap(Key, Value) {
     assert( !isAnagram("aabaa", "bbabb")                            );
 }
 
-/// [clear|Clear]s and frees the table's internal storage.
-void dispose(K, V)(ref UnsafeHashMap!(K,V) self) nothrow @system
-out (; self.capacity == 0)
-{
-    self.clear();
-    assert(self.allocated == self.buckets.length);
-    static if (V.sizeof > 0) self.values.deallocate(self.allocated);
-    self.buckets.ptr.deallocate(self.allocated);
-    self = UnsafeHashMap!(K,V).init;
-}
-
-/// Consider using `scope(exit)` to ensure hash table memory doesn't leak.
-@nogc nothrow unittest {
-    UnsafeHashMap!(char, long) outer;
-    {
-        UnsafeHashMap!(char, long) inner;
-        scope(exit) inner.dispose();
-        outer = inner; // but be careful with byref-like copies
-    }
-    // outer.dispose(); // would have caused a double free: `dispose` is unsafe!
-}
-
-/// Initializes a hash table.
-private err_t initialize(K, V)(out UnsafeHashMap!(K,V) self, size_t capacity) nothrow
-in (self.buckets.ptr == null)
-out (; self.length == 0)
-{
-    if (capacity == 0) return 0;
-
-    // adjust allocation size based on max load factor and round to power of two
-    const requestedCapacity = capacity;
-    capacity = cast(size_t)(capacity / maxLoadFactor);
-    if (capacity < requestedCapacity) { // overflow check
-        return ENOMEM;
-    } else if (capacity < minAllocatedSize) {
-        capacity = minAllocatedSize;
-        static assert(
-            minAllocatedSize.isPowerOf2,
-            "min allocated size must be a power of 2"
-        );
-    } else if (!capacity.isPowerOf2) {
-        import std.math.algebraic : nextPow2;
-        capacity = nextPow2(capacity);
-        if (capacity == 0) return ENOMEM;
-    }
-    assert(capacity >= minAllocatedSize && capacity.isPowerOf2);
-    if (capacity * maxLoadFactor.numerator < capacity) // overflow check
-        return ENOMEM;
-
-    // allocate bucket (and value) array
-    auto buffer = allocate!(Bucket!K)(capacity);
-    if (buffer == null) return ENOMEM;
-    () @trusted { self.buckets = buffer[0 .. capacity]; }();
-    static if (V.sizeof > 0) {
-        self.values = allocate!V(capacity);
-        if (self.values == null) {
-            () @trusted { buffer.deallocate(capacity); }();
-            self.buckets = null;
-            return ENOMEM;
-        }
-    }
-
-    // initialize buckets' state
-    foreach (ref bucket; self.buckets) {
-        bucket.isOccupied = false;
-        bucket.wasDeleted = false;
-    }
-    self.occupied = 0;
-    self.used = 0;
-
-    return 0;
-}
-
-/++
-Rehashes the table.
-
-Manual rehashes may make future lookups more efficient.
-This is also the only way to reduce a hash table's memory footprint.
-Nothing happens to the table in case of failure.
-
-Params:
-    self = Hash table.
-    newCapacity = Min number of pre-allocated entries, must be enough to fit current entries.
-
-Returns:
-    Zero on success, non-zero on failure (on OOM, overflow or an invalid capacity).
-+/
-err_t rehash(K, V)(ref UnsafeHashMap!(K,V) self, size_t newCapacity) nothrow @system
-in (newCapacity >= self.length, "table capacity must be enough to fit its current entries")
-out (error; error || self.capacity >= newCapacity)
-{
-    if (newCapacity < self.length) return EINVAL;
-
-    // edge case: rehash empty table to zero capacity
-    if (newCapacity == 0 && self.length == 0) {
-        self.dispose();
-        const error = self.initialize(0);
-        assert(!error, "zero capacity doesn't allocate and thus can't fail");
-        return 0;
-    }
-
-    // otherwise, pretend that we're initializing a new table
-    UnsafeHashMap!(K,V) newTable;
-    const error = newTable.initialize(newCapacity);
-    if (error) return error;
-
-    // relocate every in-use entry to a newly-computed bucket
-    assert(newTable.allocated >= self.used);
-    size_t filled = 0;
-    foreach (size_t i, ref oldBucket; self.buckets) {
-        if (!oldBucket.isOccupied || oldBucket.wasDeleted) continue;
-        const k = newTable.buckets.probeFor(oldBucket.key);
-        auto newBucket = &newTable.buckets[k];
-        newBucket.isOccupied = true;
-        newBucket.wasDeleted = false;
-        moveEmplace(oldBucket.key, newBucket.key);
-        static if (V.sizeof > 0) moveEmplace(*self.valueAt(i), *newTable.valueAt(k));
-        filled++;
-    }
-    assert(filled == self.used);
-    newTable.occupied = filled;
-    newTable.used = filled;
-
-    // finally, free the old table and replace it with the new one
-    self.dispose();
-    self = newTable;
-    return 0;
-}
-
-/// ditto
-err_t rehash(K, V)(ref UnsafeHashMap!(K,V) self) {
-    enum targetLoadFactor = Rational!size_t(1, 2);
-    enum allocationAdjustment = maxLoadFactor / targetLoadFactor;
-    static assert(allocationAdjustment >= 1.0);
-    auto newCapacity = cast(size_t)(self.length * allocationAdjustment);
-    newCapacity = newCapacity < self.length ? self.length : newCapacity; // overflow check
-    return self.rehash(newCapacity);
-}
-
-private pragma(inline) bool _get(K, V)(
-    ref inout(UnsafeHashMap!(K,V)) self,
-    auto ref const(K) find,
-    out inout(Bucket!K)* bucket,
-    out inout(V)* value,
-)
-@trusted // due to cast from Key* to Bucket*
-{
-    auto key = find in self;
-    if (key == null) return false;
-    static assert(
-        Bucket!(K).key.offsetof == 0,
-        "bucket layout must ensure safe cast to key"
-    );
-    bucket = cast(inout(Bucket!K)*) key;
-    const size_t k = bucket - self.buckets.ptr;
-    value = self.valueAt(k);
-    return true;
-}
-
-/++
-Looks up an entry in the table's internal storage.
-
-Yields pointers to the hash table's internal storage, which may be invalidated by any [rehash]es.
-
-Params:
-    self = Backing hash table.
-    find = Key which designates the entry being looked up.
-    keyp = Set to entry key's address (or `null` when not found).
-    valp = Set to entry value's address (or `null` when it is a zero-sized type).
-
-Returns: Whether or not the entry was found in the table.
-+/
-bool get(K, V)(
-    ref inout(UnsafeHashMap!(K,V)) self,
-    auto ref const(K) find,
-    out inout(K)* keyp,
-    out inout(V)* valp
-)
-out (found; (found && *keyp in self) || (!found && keyp == null))
-{
-    inout(Bucket!K)* bucket;
-    const found = self._get!(K,V)(find, bucket, valp);
-    if (!found) return false;
-    keyp = &bucket.key;
-    return true;
-}
-
-/// ditto
-bool get(K, V)(
-    ref inout(UnsafeHashMap!(K,V)) self,
-    auto ref const(K) find,
-    out inout(K)* keyp
-) {
-    inout(V)* valp;
-    return self.get(find, keyp, valp);
-}
-
-/++
-Removes a key's entry from the table.
-
-This procedure will also call `destroy` on both key and value.
-
-Returns: Whether or not the key had an entry to begin with.
-+/
-bool remove(K, V)(ref UnsafeHashMap!(K,V) self, auto ref const(K) key) nothrow
-out (; key !in self)
-{
-    Bucket!(K)* bucket;
-    V* valp;
-    const found = self._get(key, bucket, valp);
-    if (!found) return false;
-    // on deletion, we simply mark the bucket and decrease entry count
-    destroy!false(bucket.key);
-    static if (V.sizeof > 0) destroy!false(*valp);
-    bucket.wasDeleted = true;
-    self.used--;
-    return true;
-}
-
-/// [remove|Remove]s all elements from the hash table, without changing its capacity.
-void clear(K, V)(ref UnsafeHashMap!(K,V) self) nothrow
-out (; self.length == 0)
-{
-    size_t toBeCleared = self.length;
-    foreach (size_t k, ref bucket; self.buckets) {
-        if (!bucket.isOccupied || bucket.wasDeleted) continue;
-        destroy!false(bucket.key);
-        static if (V.sizeof > 0) destroy!false(*self.valueAt(k));
-        bucket.isOccupied = false;
-        bucket.wasDeleted = false;
-        --toBeCleared;
-        if (toBeCleared == 0) break;
-    }
-    self.occupied = 0;
-    self.used = 0;
-}
-
-/++
-Looks up a key's entry in the table, then either updates it or creates a new one (may [rehash]).
-
-Params:
-    self = Hash table.
-    key = Key being looked up and stored in the table.
-    create = Called to construct a new value if the key isn't in the table.
-    update = Called to update the value of an entry, if it was found.
-    error = Set to zero on success, non-zero otherwise.
-
-Returns: The entry's final value (or its `.init` in case of failure).
-+/
-pragma(inline) V update(K, V, Create, Update)(
-    ref UnsafeHashMap!(K,V) self,
-    K key,
-    scope auto ref const(Create) create,
-    scope auto ref const(Update) update,
-    out err_t error
-) nothrow
-if (is(ReturnType!Create == V)
-    && Parameters!Create.length == 0
-    && is(ReturnType!Update == V)
-    && Parameters!Update.length == 1
-    && is(Parameters!Update[0] == V))
-{
-    // check whether a load factor increase needs to trigger a rehash
-    if (self.occupied + 1 > self.capacity) {
-        size_t newCapacity = self.capacity * 2;
-        if (newCapacity == 0) {
-            newCapacity = cast(size_t)(minAllocatedSize * maxLoadFactor);
-            static assert(
-                minAllocatedSize * maxLoadFactor > 0,
-                "min allocation size " ~ minAllocatedSize.stringof ~
-                " and max load factor " ~ maxLoadFactor.stringof ~
-                " are incompatible: their product must be greater than zero"
-            );
-        } else if (newCapacity < self.capacity) { // overflow check
-            error = ENOMEM;
-            return V.init;
-        }
-        assert(newCapacity > self.capacity);
-        error = self.rehash(newCapacity);
-        if (error) return V.init;
-    }
-
-    // find the key's designated bucket (after rehash)
-    const k = self.buckets.probeFor(key);
-    auto bucket = &self.buckets[k];
-    const hadEntry = bucket.isOccupied && !bucket.wasDeleted;
-
-    // increase load factor only if we're not reusing some freed bucket
-    if (!bucket.isOccupied) self.occupied++;
-    bucket.isOccupied = true;
-    bucket.wasDeleted = false;
-
-    // check whether we need to create a value or update the old one
-    if (!hadEntry) {
-        self.used++;
-        moveEmplace(key, bucket.key);
-        V newValue = create();
-        static if (V.sizeof > 0) {
-            moveEmplace(newValue, *self.valueAt(k));
-            return *self.valueAt(k);
-        } else {
-            return newValue;
-        }
-    } else /* hadEntry */ {
-        swap(key, bucket.key);
-        static if (V.sizeof > 0) {
-            V newValue = update(*self.valueAt(k));
-            swap(newValue, *self.valueAt(k));
-            return *self.valueAt(k);
-        } else {
-            V oldValue = V.init;
-            return update(oldValue);
-        }
-    }
-}
-
-/// ditto
-V update(K, V, Create, Update)(
-    ref UnsafeHashMap!(K,V) self,
-    K key,
-    scope auto ref const(Create) create,
-    scope auto ref const(Update) update
-)
-if (is(ReturnType!Create == V)
-    && Parameters!Create.length == 0
-    && is(ReturnType!Update == V)
-    && Parameters!Update.length == 1
-    && is(Parameters!Update[0] == V))
-{
-    err_t ignored;
-    return self.update(key, create, update, ignored);
-}
-
-/++
-Looks up a key's entry, inserting one if not found (may [rehash]).
-
-Params:
-    self = Hash table.
-    key = Key being looked up and stored in the table.
-    create = Called to construct a new value if the key isn't in the table.
-    error = Set to zero on success, non-zero otherwise.
-
-Returns: The entry's final value (or its `.init` in case of failure).
-+/
-V require(K, V, Create)(
-    ref UnsafeHashMap!(K,V) self,
-    K key,
-    scope auto ref const(Create) create,
-    out err_t error
-)
-if (is(ReturnType!Create == V) && Parameters!Create.length == 0)
-{
-    return self.update(key, create, (ref V x) => x, error);
-}
-
-/// ditto
-V require(K, V, Create)(
-    ref UnsafeHashMap!(K,V) self,
-    K key,
-    auto ref const(Create) create
-)
-if (is(ReturnType!Create == V) && Parameters!Create.length == 0)
-{
-    err_t ignored;
-    return self.require(key, create, ignored);
-}
-
-private mixin template UnsafeRangeBoilerplate(K, V) {
-    private const(UnsafeHashMap!(K,V))* table;
-    private size_t index;
-
-    private this(const(UnsafeHashMap!(K,V))* t) {
-        this.table = t;
-        this.updateIndexFrom(0);
-    }
-
-    private void updateIndexFrom(size_t i) {
-        for (; i < this.table.buckets.length; ++i) {
-            const bucket = &this.table.buckets[i];
-            if (bucket.isOccupied && !bucket.wasDeleted) break;
-        }
-        this.index = i;
-    }
-
-    invariant {
-        if (this.index < this.table.buckets.length) {
-            auto bucket = &this.table.buckets[this.index];
-            assert(
-                bucket.isOccupied && !bucket.wasDeleted,
-                "tried using an invalidated hash table range"
-            );
-        }
-    }
-
-    public bool empty() const {
-        return this.index >= this.table.buckets.length;
-    }
-
-    public void popFront() in (!this.empty) {
-        this.updateIndexFrom(this.index + 1);
-    }
-}
-
-/++
-Can be used to iterate over this table's entries (but iteration order is unspecified ).
-
-NOTE: Mutating a table silently invalidates any ranges over it.
-    Also, ranges must NEVER outlive their backing tables if they are unsafe (this is OK only for the refcounted versions).
-+/
-auto byKey(K, V)(ref const(UnsafeHashMap!(K,V)) self) {
-    struct ByKey {
-        mixin UnsafeRangeBoilerplate!(K,V);
-        public ref const(K) front() const in (!this.empty) {
-            return this.table.buckets[this.index].key;
-        }
-    }
-    return ByKey(&self);
-}
-
-/// ditto
-auto byValue(K, V)(ref const(UnsafeHashMap!(K,V)) self) if (V.sizeof > 0) {
-    struct ByValue {
-        mixin UnsafeRangeBoilerplate!(K,V);
-        public ref const(V) front() const in (!this.empty) {
-            return this.table.values[this.index];
-        }
-    }
-    return ByValue(&self);
-}
-
-/// ditto
-auto byKeyValue(K, V)(ref const(UnsafeHashMap!(K,V)) self) {
-    struct ByKeyValue {
-        mixin UnsafeRangeBoilerplate!(K,V);
-        public const(KeyValue) front() const in (!this.empty) {
-            auto bucket = &this.table.buckets[this.index];
-            static if (V.sizeof > 0)
-                return KeyValue(bucket.key, this.table.values[this.index]);
-            else
-                return KeyValue(bucket.key);
-        }
-        struct KeyValue {
-            const(K) key;
-            static if (V.sizeof > 0) const(V) value;
-            else                     enum value = V.init;
-        }
-    }
-    return ByKeyValue(&self);
-}
-
-///
 @nogc nothrow pure @safe unittest {
     static assert(
         !__traits(compiles, // assuming -dip1000
@@ -796,34 +793,11 @@ auto byKeyValue(K, V)(ref const(UnsafeHashMap!(K,V)) self) {
     );
 }
 
-/++
-Creates an independent copy of a hash table.
-
-Elements are copied by simple assignment, which may translate into a shallow copy.
-
-Params:
-    self = Hash table to be copied.
-    error = Set to zero on success, non-zero otherwise.
-
-Returns: A shallow copy of the given hash table, or an empty table in case of failure (OOM).
-+/
-UnsafeHashMap!(K,V) dup(K, V)(ref const(UnsafeHashMap!(K,V)) self, out err_t error) nothrow
-out (copy; (!error && copy.length == self.length) || (error && copy.length == 0))
-{
-    UnsafeHashMap!(K,V) copy;
-    error = copy.initialize(self.length);
-    if (error) return copy;
-    foreach (entry; self.byKeyValue) {
-        error = (copy[entry.key] = entry.value);
-        assert(!error, "memory already reserved, so insertion can't fail");
-    }
-    return copy;
-}
-
-/// ditto
-UnsafeHashMap!(K,V) dup(K, V)(ref const(UnsafeHashMap!(K,V)) self) {
-    err_t ignored;
-    return self.dup(ignored);
+@nogc nothrow @safe unittest {
+    HashMap!(int, int) a, b;
+    a[0] = 1;
+    b[1] = 0;
+    assert(a.toHash() != b.toHash());
 }
 
 
@@ -864,15 +838,6 @@ nothrow @safe unittest {
     b.add(-1);
     assert(a != b);
     assert(b !in stringified); // but be careful with mutability
-}
-
-/++
-Adds an element to the hash set; may [rehash].
-
-Returns: Zero on success, non-zero on failure (e.g. OOM or overflow).
-+/
-pragma(inline) err_t add(K, V)(ref UnsafeHashMap!(K, V) self, K element) if (V.sizeof == 0) {
-    return (self[element] = V.init);
 }
 
 
@@ -942,7 +907,7 @@ struct HashMap(Key, Value) {
         return this.impl.toHash();
     }
 
-    auto opEquals(ref const(HashMap) other) const {
+    auto opEquals()(auto ref const(HashMap) other) const {
         if (!this.isInitialized && !other.isInitialized) return true; // both null
         if (!this.isInitialized || !other.isInitialized) return false; // one null
         return this.impl == other.impl; // both non-null
@@ -958,81 +923,69 @@ struct HashMap(Key, Value) {
         return this.impl.capacity;
     }
 
-    // changed to safely return a bool instead of internal pointer to key
+    /// Changed to safely return a `bool` instead of an internal pointer.
     bool opBinaryRight(string op : "in")(auto ref const(Key) key) const {
         if (!this.isInitialized) return false;
         return (key in this.impl) != null;
     }
 
-    inout(Value) opIndex()(auto ref const(Key) key) inout {
-        if (!this.isInitialized) return Value.init;
-        return this.impl[key];
+    static if (Value.sizeof > 0) auto opIndex()(auto ref const(Key) key) const {
+        return this.get(key, () => Value.init);
     }
 
     auto opIndexAssign(Value value, Key key) @trusted {
         this.ensureInitialized();
         return (this.impl[key] = value);
     }
-}
 
-///
-@nogc nothrow @safe unittest {
-    HashMap!(char, long) outer;
-    outer['o'] = 0; // outer -> { 'o': 0 }
-
-    {
-        HashMap!(char, long) inner;
-        inner['i'] = 1; // inner -> { 'i': 1 }
-        outer = inner;
-        // with the previous assignment, { 'o': 0 } was deallocated
-    }
-
-    // as inner goes out of scope, it decreases the ref count of { 'i': 1 }
-    // but since outer still holds a reference to it, it wasn't deallocated
-    assert(outer['i'] == 1); // outer -> { 'i': 1 }
-    assert('o' !in outer);
-}
-
-pragma(inline) {
     // removed: dispose
 
-    auto rehash(K, V)(ref HashMap!(K,V) self, size_t newCapacity) @trusted {
-        self.ensureInitialized();
-        return self.impl.rehash(newCapacity);
+    auto rehash(size_t newCapacity) @trusted {
+        this.ensureInitialized();
+        return this.impl.rehash(newCapacity);
     }
 
-    auto rehash(K, V)(ref HashMap!(K,V) self) @trusted {
-        self.ensureInitialized();
-        return self.impl.rehash();
+    auto rehash() @trusted {
+        this.ensureInitialized();
+        return this.impl.rehash();
     }
 
-    // removed: get
-
-    auto remove(K, V)(ref HashMap!(K,V) self, auto ref const(K) key) {
-        self.ensureInitialized();
-        return self.impl.remove(key);
+    /// The safe version matches AA's [get](https://dlang.org/spec/hash-map.html#properties).
+    Value get(Default)(auto ref const(Key) key, scope auto ref const(Default) defaultValue) inout
+    if (is(ReturnType!Default == Value) && Parameters!Default.length == 0)
+    {
+        if (!this.isInitialized) return defaultValue();
+        inout(Key)* keyp;
+        inout(Value)* valp;
+        const found = this.impl.get(key, keyp, valp);
+        return found ? () @trusted { return *(cast(Value*)valp); }() : defaultValue();
     }
 
-    auto clear(K, V)(ref HashMap!(K,V) self) {
-        self.ensureInitialized();
-        return self.impl.clear();
+    auto remove()(auto ref const(Key) key) {
+        this.ensureInitialized();
+        return this.impl.remove(key);
     }
 
-    auto update(K, V, Args...)(ref HashMap!(K,V) self, K find, Args args) @trusted {
-        self.ensureInitialized();
-        return self.impl.update(find, args);
+    auto clear() {
+        this.ensureInitialized();
+        return this.impl.clear();
     }
 
-    auto require(K, V, Args...)(ref HashMap!(K,V) self, K find, Args args) @trusted {
-        self.ensureInitialized();
-        return self.impl.require(find, args);
+    auto update(Args...)(Key needle, auto ref Args args) @trusted {
+        this.ensureInitialized();
+        return this.impl.update(needle, forward!args);
     }
 
-    private mixin template RangeBoilerplate(K, V) {
-        private const(HashMap!(K,V)) table;
+    auto require(Args...)(Key needle, auto ref Args args) @trusted {
+        this.ensureInitialized();
+        return this.impl.require(needle, forward!args);
+    }
+
+    private mixin template RangeBoilerplate() {
+        private const(HashMap) table;
         private size_t index;
 
-        private this(ref const(HashMap!(K,V)) t) {
+        private this(ref const(HashMap) t) {
             this.table = t;
             this.updateIndexFrom(0);
         }
@@ -1069,61 +1022,79 @@ pragma(inline) {
         }
     }
 
-    auto byKey(K, V)(ref const(HashMap!(K,V)) self) {
+    auto byKey() const {
         struct ByKey {
-            mixin RangeBoilerplate!(K,V);
-            public const(K) front() const in (!this.empty) {
-                return this.table.impl.buckets[this.index].key;
+            mixin RangeBoilerplate;
+            public Key front() const @trusted /* due to cast */ in (!this.empty) {
+                return cast(Key)this.table.impl.buckets[this.index].key;
             }
         }
-        return ByKey(self);
+        return ByKey(this);
     }
 
-    auto byValue(K, V)(ref const(HashMap!(K,V)) self) if (V.sizeof > 0) {
+    static if (Value.sizeof > 0) auto byValue() const {
         struct ByValue {
-            mixin RangeBoilerplate!(K,V);
-            public const(V) front() const in (!this.empty) {
-                return *this.table.impl.valueAt(this.index);
+            mixin RangeBoilerplate;
+            public Value front() const @trusted /* due to cast */ in (!this.empty) {
+                return cast(Value)*this.table.impl.valueAt(this.index);
             }
         }
-        return ByValue(self);
+        return ByValue(this);
     }
 
-    auto byKeyValue(K, V)(ref const(HashMap!(K,V)) self) {
+    auto byKeyValue() const {
         struct ByKeyValue {
-            mixin RangeBoilerplate!(K,V);
-            public const(KeyValue) front() const in (!this.empty) {
+            mixin RangeBoilerplate;
+            public KeyValue front() const @trusted /* due to cast */ in (!this.empty) {
                 auto bucket = &this.table.impl.buckets[this.index];
-                static if (V.sizeof > 0)
-                    return KeyValue(bucket.key, *this.table.impl.valueAt(this.index));
+                static if (Value.sizeof > 0)
+                    return KeyValue(cast(Key)bucket.key, cast(Value)*this.table.impl.valueAt(this.index));
                 else
-                    return KeyValue(bucket.key);
+                    return KeyValue(cast(Key)bucket.key);
             }
             struct KeyValue {
-                const(K) key;
-                static if (V.sizeof > 0) const(V) value;
-                else                     enum value = V.init;
+                Key key;
+                static if (Value.sizeof > 0) Value value;
+                else                         enum value = Value.init;
             }
         }
-        return ByKeyValue(self);
+        return ByKeyValue(this);
     }
 
-    HashMap!(K,V) dup(K, V)(ref const(HashMap!(K,V)) self, out err_t error) @trusted {
-        if (!self.isInitialized) return HashMap!(K,V).init;
-        HashMap!(K,V) copy;
+    HashMap dup(out err_t error) const @trusted {
+        if (!this.isInitialized) return HashMap.init;
+        HashMap copy;
         copy.ensureInitialized();
-        copy.impl = self.impl.dup(error);
+        copy.impl = this.impl.dup(error);
         return copy;
     }
 
-    HashMap!(K,V) dup(K, V)(ref const(HashMap!(K,V)) self) {
+    HashMap dup() const {
         err_t ignored;
-        return self.dup(ignored);
+        return this.dup(ignored);
     }
 
-    auto add(K, V)(ref HashMap!(K, V) self, K element) @trusted if (V.sizeof == 0) {
-        return (self[element] = V.init);
+    static if (Value.sizeof == 0) auto add(Key element) @trusted  {
+        return (this[element] = Value.init);
     }
+}
+
+///
+@nogc nothrow @safe unittest {
+    HashMap!(char, long) outer;
+    outer['o'] = 0; // outer -> { 'o': 0 }
+
+    {
+        HashMap!(char, long) inner;
+        inner['i'] = 1; // inner -> { 'i': 1 }
+        outer = inner;
+        // with the previous assignment, { 'o': 0 } was deallocated
+    }
+
+    // as inner goes out of scope, it decreases the ref count of { 'i': 1 }
+    // but since outer still holds a reference to it, it wasn't deallocated
+    assert(outer['i'] == 1); // outer -> { 'i': 1 }
+    assert('o' !in outer);
 }
 
 /// Safe version of [UnsafeHashSet].

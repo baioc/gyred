@@ -17,14 +17,6 @@ struct Rational(Z) if (__traits(isPOD, Z)) {
     private Z _denominator = 1;
     invariant (_denominator > 0, "denominator must always be positive");
 
-    version (D_BetterC) {} else {
-        string toString() const {
-            import std.conv : to;
-            import std.string : format;
-            return "%s/%s".format(this.numerator.to!string, this.denominator.to!string);
-        }
-    }
-
  pragma(inline):
     /// Reduced-form numerator.
     @property Z numerator() const {
@@ -53,6 +45,14 @@ struct Rational(Z) if (__traits(isPOD, Z)) {
         this = Rational(numerator);
     }
 
+    version (D_BetterC) {} else {
+        string toString() const {
+            import std.conv : to;
+            import std.string : format;
+            return "%s/%s".format(this.numerator.to!string, this.denominator.to!string);
+        }
+    }
+
     /// Compares two rationals based on their reduced form.
     bool opEquals(const(Rational) rhs) const {
         return this.numerator == rhs.numerator
@@ -79,7 +79,7 @@ struct Rational(Z) if (__traits(isPOD, Z)) {
 
     /// ditto
     int opCmp(Z rhs) const {
-        return this.numerator.opCmp(rhs * this.denominator);
+        return this.opCmp(Rational(rhs));
     }
 
     /// Unary negation.
@@ -100,10 +100,7 @@ struct Rational(Z) if (__traits(isPOD, Z)) {
 
     /// ditto
     Rational opBinary(string op : "+")(Z rhs) const {
-        return Rational(
-            this.numerator + (rhs * this.denominator),
-            this.denominator
-        );
+        return this + Rational(rhs);
     }
 
     /// ditto
@@ -136,7 +133,7 @@ struct Rational(Z) if (__traits(isPOD, Z)) {
 
     /// ditto
     Rational opBinary(string op : "*")(Z rhs) const {
-        return Rational(this.numerator * rhs, this.denominator);
+        return this * Rational(rhs);
     }
 
     /// ditto
@@ -155,7 +152,7 @@ struct Rational(Z) if (__traits(isPOD, Z)) {
     Rational opBinary(string op : "/")(Z rhs) const
     in (rhs != 0, "can't divide by zero")
     {
-        return Rational(this.numerator, this.denominator * rhs);
+        return this / Rational(rhs);
     }
 
     /// ditto
@@ -165,8 +162,8 @@ struct Rational(Z) if (__traits(isPOD, Z)) {
 
     /// Casts rational to a scalar (may lose precision).
     N opCast(N)() const {
-        N num = cast(N) this.numerator;
-        N den = cast(N) this.denominator;
+        N num = cast(N)this.numerator;
+        N den = cast(N)this.denominator;
         return num / den;
     }
 

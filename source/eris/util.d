@@ -125,7 +125,7 @@ if (!is(T == class) && !(is(T == interface)))
         void allocateStore()
         out (; this.store != null, "memory allocator failed when we assumed it never would")
         {
-            this.store = allocate!Impl();
+            this.store = allocate!Impl;
         }
 
         void deallocateStore()

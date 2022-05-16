@@ -1,54 +1,60 @@
 import core.stdc.stdlib : atoi, rand, srand;
-import core.stdc.stdio : printf;
+import core.stdc.stdio : printf, fprintf, stderr;
 import core.stdc.time : clock, clock_t, CLOCKS_PER_SEC;
+
+import eris.hash_table;
 
 
 version (D_BetterC) {
-    extern (C) int main(int argc, const(char)** argv) {
-        int n = argc > 1 ? atoi(argv[1]) : 0;
-        int reserve = argc > 2 ? atoi(argv[2]) : 0;
-        insertionBenchmark(n, reserve);
+    extern(C) int main(int argc, const(char)** argv) {
+        int size = argc > 1 ? atoi(argv[1]) : -1;
+        int replications = argc > 2 ? atoi(argv[2]) : -1;
+        microBenchmark(size, replications);
         return 0;
     }
 } else {
     int main(string[] args) {
-        import std.algorithm : map;
-        import std.array : array;
-        import std.string : toStringz;
-        auto argc = args.length;
-        auto argv = args.map!(s => s.toStringz).array;
-        int n = argc > 1 ? atoi(argv[1]) : 0;
-        int reserve = argc > 2 ? atoi(argv[2]) : 0;
-        insertionBenchmark(n, reserve);
+        import std.conv : to;
+        int size = args.length > 1 ? to!int(args[1]) : -1;
+        int replications = args.length > 2 ? to!int(args[2]) : -1;
+        microBenchmark(size, replications);
         return 0;
     }
 }
 
 
-void insertionBenchmark(int n, int reserve) {
+void microBenchmark(int n, int replications = 1) {
     n = n > 0 ? n : 10_000_000;
-    reserve = reserve >= 0 && reserve <= n ? reserve : 0;
+    replications = replications > 0 ? replications : 1;
 
     version (D_BetterC) {
-        import eris.hash_table;
-        printf("With custom hash table\n");
-        HashMap!(ulong, int) dict;
+        fprintf(stderr, "# With custom hash table ...     ");
+        alias Dict = HashMap!(ulong, int);
     } else {
-        printf("Using D's built-in AAs\n");
-        int[ulong] dict;
+        fprintf(stderr, "# Using D's built-in AAs ...     ");
+        alias Dict = int[ulong];
     }
 
-    srand(2166136261U);
+    srand(42);
 
-    const clock_t begin = clock();
-    for (int i = 0; i < n; ++i) {
-        const ulong key = rand();
-        const int value = i;
-        dict[key] = value;
+    double averageMs = 0.0;
+    foreach (experiment; 0 .. replications) {
+        fprintf(stderr, "\b\b\b\b%3.0f%%", experiment * 100.0 / replications);
+        const clock_t begin = clock();
+
+        Dict dict;
+        foreach (i; 0 .. n) {
+            const ulong key = rand();
+            const int value = i;
+            dict[key] = value;
+        }
+
+        const clock_t end = clock();
+        averageMs += (end - begin) * 1e3 / CLOCKS_PER_SEC;
     }
-    const clock_t end = clock();
+    averageMs /= replications;
+    fprintf(stderr, "\b\b\b\b100%%\n");
 
-    const float elapsedNs = end * 1e9 / CLOCKS_PER_SEC - begin * 1e9 / CLOCKS_PER_SEC;
-    printf("Total: %.3f ms\n", elapsedNs / 1e6);
-    printf("Per element: %.0f ns\n", elapsedNs / n);
+    fprintf(stderr, "Average (across %d runs) time per element (ns): ", replications);
+    printf("%.3f\n", averageMs * 1e6 / n);
 }

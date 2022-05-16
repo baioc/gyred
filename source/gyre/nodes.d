@@ -41,10 +41,12 @@ If we assume that `<<` can overflow (i.e. `x` has a non-zero MSB which is being 
 +/
 module gyre.nodes;
 
+import core.stdc.errno : EINVAL, ENOMEM;
+import std.algorithm.mutation : moveEmplace;
 import std.bitmanip : taggedPointer;
 import std.traits : EnumMembers;
 
-import eris.core : hash_t;
+import eris.core : hash_t, err_t, allocate, deallocate;
 import eris.hash_table;
 
 
@@ -79,8 +81,13 @@ enum EdgeKind : ubyte {
 private mixin template StaticEdgeFactories() {
     static foreach (kind; EnumMembers!EdgeKind) {
         mixin(
-            "static typeof(this) " ~ __traits(identifier, EnumMembers!EdgeKind[kind]) ~ "() @nogc nothrow pure {
-                return typeof(this)(EdgeKind." ~ __traits(identifier, EnumMembers!EdgeKind[kind]) ~ ");
+            "@nogc nothrow pure
+            static typeof(this) " ~ __traits(identifier, EnumMembers!EdgeKind[kind]) ~ "(Args...)(auto ref Args args) {
+                import core.lifetime : forward;
+                return typeof(this)(
+                    EdgeKind." ~ __traits(identifier, EnumMembers!EdgeKind[kind]) ~ ",
+                    forward!args
+                );
             }"
         );
     }
@@ -97,32 +104,46 @@ struct OutEdge {
         EdgeKind, "_kind", 2
     ));
 
- @nogc nothrow pure:
-    @property EdgeKind kind() const {
+ pragma(inline) @nogc nothrow:
+    @property EdgeKind kind() const pure {
         return this._kind;
     }
-
-    @disable this();
 
     /++
     Params:
         kind = This edge's kind, fixed on construction.
-        target = Either points to another edge slot, or is `null`.
+        target = Must point to a matching in-edge slot.
     +/
-    this(EdgeKind kind, InEdge* target = null) {
+    this(EdgeKind kind, InEdge* target = null) pure
+    in (target == null || target.kind == kind, "connecting edge slots must have matching kinds")
+    {
         this._kind = kind;
         this.target = target;
-        assert(
-            target == null || target.kind == this.kind,
-            "connecting edge slots must have matching kinds"
-        );
+    }
+    @disable this();
+    mixin StaticEdgeFactories;
+
+    /++
+    Semantic equality check.
+
+    An out-edge slot is only equivalent to another if they point to equal [InEdge] slots.
+    +/
+    bool opEquals(const(OutEdge) other) const {
+        if (this.kind != other.kind) return false;
+        if (this.target == other.target) return true;
+        if (this.target == null || other.target == null) return false;
+        return *this.target == *other.target;
     }
 
-    mixin StaticEdgeFactories;
+    hash_t toHash() const {
+        if (this.target == null) return this.kind.hashOf;
+        assert(this.target.kind == this.kind);
+        return this.target.toHash();
+    }
 }
 
-/// Example usage:
-@nogc nothrow pure unittest {
+///
+@nogc nothrow unittest {
     auto def = InEdge.data;
     auto use1 = OutEdge.data;
     auto use2 = OutEdge.data;
@@ -132,7 +153,7 @@ struct OutEdge {
     assert(use1 == use2);
 }
 
-/// Edge slots better be no bigger than a raw pointer:
+/// Out-edges are essentially pointers:
 @nogc nothrow pure unittest {
     static assert(OutEdge.sizeof <= (InEdge*).sizeof);
 }
@@ -141,6 +162,11 @@ struct OutEdge {
 An incoming edge slot.
 
 Can receive any number of [OutEdge]s.
+
+
+When we describe our [structural sharing strategy](gyre.nodes.Node.html#details), one may be tempted to associate the notion of an SSA name to a Gyre node.
+This would be perfectly valid if every node could produce at most one value, but this is not the case.
+Therefore, most structural node comparisons actually translate into a series of in-edge slot semantic equality checks.
 +/
 struct InEdge {
     mixin(taggedPointer!(
@@ -148,38 +174,59 @@ struct InEdge {
         EdgeKind, "_kind", 2
     ));
 
- @nogc nothrow pure:
-    @property EdgeKind kind() const {
+    ID id;
+    alias ID = ushort;
+
+ pragma(inline) @nogc nothrow:
+    @property EdgeKind kind() const pure {
         return this._kind;
     }
-
-    @disable this();
 
     /++
     Params:
         kind = This edge's kind, fixed on construction.
-        owner = Points back to the node which owns this edge.
+        owner = Must point to the node which owns this edge slot.
+        id = Uniquely identifies this in-edge slot within its owner node (internal usage only).
     +/
-    this(EdgeKind kind, Node* owner = null) {
+    this(EdgeKind kind, Node* owner = null, size_t id = 0) pure
+    in (id <= ID.max, "can't have an internal id greater than " ~ ID.max.stringof)
+    {
         this._kind = kind;
         this.owner = owner;
+        this.id = cast(ID)id;
+    }
+    @disable this();
+    mixin StaticEdgeFactories;
+
+    /++
+    Semantic equality check.
+
+    An in-edge slot is only equivalent to another if they represent equal values.
+    We approximate this by checking that the slots' owner nodes are equal AND the slots are in a corresponding position in their respective owner (i.e. they stand for the same thing inside that node).
+    +/
+    bool opEquals(ref const(InEdge) other) const
+    {
+        if (this.kind != other.kind) return false;
+        if (this.id != other.id) return false;
+        if (this.owner == null && other.owner == null) return true;
+        if (this.owner == null || other.owner == null) return false;
+        return *this.owner == *other.owner;
     }
 
-    mixin StaticEdgeFactories;
+    hash_t toHash() const {
+        hash_t hash = this.kind.hashOf ^ this.id.hashOf;
+        if (this.owner != null) hash ^= this.owner.toHash();
+        return hash;
+    }
 }
 
-/// Example usage:
+///
 @nogc nothrow pure unittest {
     auto A = OutEdge.control;
     auto B = InEdge.control;
-    // in this example, control flows out from A and into B
+    // control is flowing out from A and into B
     A.target = &B;
     assert(A.target.owner is B.owner);
-}
-
-/// Edge slots better be no bigger than a raw pointer:
-@nogc nothrow pure unittest {
-    static assert(InEdge.sizeof <= (Node*).sizeof);
 }
 
 
@@ -196,25 +243,24 @@ We'll try to make all uses of a specific value point to the same edge slot.
 
 This is essentially [GVN](https://en.wikipedia.org/wiki/Value_numbering).
 Doing this perfectly in all cases has a prohibitive canonicalization cost, so we approximate it on a per-node basis: whenever we're about to add a new node to the graph, we'll check if it is redundant, in which case its uses can be rewired into the existing graph.
-This check requires a way to compare two nodes for "semantic equality", i.e., whether swapping one node for the other preserves program semantics.
+This check requires a way to compare two nodes (and [InEdge]s) for "semantic equality", i.e., whether swapping one for the other preserves program semantics.
 
-In data-only operations, this reduces to structural equality: a node produces the same value as another when they perform the same operation and their inputs are equal (notice the recursion here).
+In data-only operations, this usually reduces to structural equality: a node produces the same value (in a corresponding [InEdge] slot) as another when they perform the same operation and their inputs are equal (notice the recursion here).
 Structural comparisons are relatively expensive operations (especially since the graph could be cyclic), so we want to leverage hashing to do as few comparisons as possible.
 Therefore, a node's hash value better reflect its semantic structure: having equal hashes is a necessary (but insufficient) condition for two nodes to be equal.
-Now, computing a node's hash value becomes an expensive operation.
+Now, computing a node's hash value becomes an expensive operation as well.
 Fortunately, hash values can be cached once a node's structure has stabilized.
-This leads us to a common interface for node [hash consing](https://en.wikipedia.org/wiki/Hash_consing):
 
 $(SMALL_TABLE
     Name        | Type              | Description
     ------------|-------------------|------------
     `hash`      | `hash_t`          | A node's cached hash value. This is what gets returned when `toHash` is called on a generic [Node], so it should be updated (see [updateHash]) whenever a node's semantic structure stabilizes.
-    `observers` | `HashSet!(Node*)` | Set of in-neighbors. Through its [OutEdge]s, we can easily find a node's out-neighbors. However, in case a node is substituted (e.g. transformed by a [peephole optimization](https://en.wikipedia.org/wiki/Peephole_optimization)), we need to rewire all of its in-edges. In order to make this fast, each node needs to keep track of its in-neighbor set (this is an optimization, so this member should not influence a node's semantic structure).
     `asNode`    | `ref T -> Node*`  | Method which upcasts (and this always works) a concrete node `ref` to a generic `Node*`.
     `ofNode`    | `Node* -> T*`     | Static method which tries to downcast a generic `Node*` to a pointer to a concrete type, returning `null` when the cast would have resulted in an invalid reference (so this is technically type-safe).
 )
 +/
-package struct Node {
+struct Node {
+ package:
     struct VTable {
      @nogc nothrow:
         bool function(const(Node)*, const(Node)*) opEquals = null;
@@ -223,14 +269,13 @@ package struct Node {
 
     struct CommonPrefix {
         immutable(VTable)* vptr;
-        HashSet!(Node*) observers;
         hash_t hash;
     }
 
     CommonPrefix _node;
     alias _node this;
 
- pragma(inline) @nogc nothrow:
+ public pragma(inline) @nogc nothrow:
     /++
     Updates a node's cached hash value.
 
@@ -246,7 +291,7 @@ package struct Node {
     Since this could be an expensive operation, early exits are checked before any virtual call.
     Thus, type-specific equality functions will only be called on non-aliased same-kind nodes whose cached hash values are equal.
 
-    Returns: True if and only if one node can be entirely substituted by the other in a Gyre program.
+    Returns: True if and only if one node can be substituted by the other, while still maintaining program semantics (after an adequate rewiring of the substituted node's in-neighbors).
     +/
     bool opEquals(ref const(Node) other) const {
         const(Node)* lhs = &this;
@@ -259,14 +304,14 @@ package struct Node {
 
     /// Returns this node's (assumedly [updateHash|up to date]) cached hash value.
     hash_t toHash() const pure {
-        return this.hash;
+        return this.hash ^ this.vptr.hashOf;
     }
 }
 
 static assert(
     Node.sizeof == Node.CommonPrefix.sizeof && Node.alignof == Node.CommonPrefix.alignof &&
     is(typeof(Node._node) == Node.CommonPrefix) && Node._node.offsetof == 0,
-    "`Node` and `Node.CommonPrefix` need to be binary-interchangeable"
+    "`Node` and `Node.CommonPrefix` must be binary-interchangeable"
 );
 
 private mixin template NodeInheritance() {
@@ -274,6 +319,7 @@ private mixin template NodeInheritance() {
 
     package Node.CommonPrefix _node = { vptr: &vtbl };
     alias _node this;
+    invariant (this.vptr == &vtbl);
 
     package static immutable(Node.VTable) vtbl = {
         opEquals: (const(Node)* lhs, const(Node)* rhs) {
@@ -293,27 +339,28 @@ private mixin template NodeInheritance() {
                 __traits(hasMember, This, "toHash"),
                 "all nodes must explicitly define a `toHash` function"
             );
-            return (*self).toHash();
+            return self.toHash();
         },
     };
 
- pragma(inline) @nogc nothrow:
-    void updateHash() {
-        this._node.hash = this.toHash();
-    }
+    public pragma(inline) @nogc nothrow {
+        void updateHash() {
+            this._node.hash = this.toHash();
+        }
 
-    static assert(
-        This._node.offsetof == 0,
-        "common node prefix must be at a zero offset for safe polymorphism"
-    );
+        static assert(
+            This._node.offsetof == 0,
+            "common node prefix must be at a zero offset for safe polymorphism"
+        );
 
-    inout(Node)* asNode() inout pure {
-        return cast(inout(Node)*) &this._node;
-    }
+        inout(Node)* asNode() inout pure {
+            return cast(inout(Node)*)&this._node;
+        }
 
-    static inout(This)* ofNode(inout(Node)* node) pure {
-        if (node == null || node.vptr != &vtbl) return null;
-        return cast(inout(This)*) node;
+        static inout(This)* ofNode(inout(Node)* node) pure {
+            if (node == null || node.vptr != &vtbl) return null;
+            return cast(inout(This)*)node;
+        }
     }
 }
 
@@ -328,7 +375,7 @@ version (unittest) private { // for some reason, this needs to be in global scop
      @nogc nothrow:
         this(int value) { this.value = value; }
 
-        bool opEquals(ref const(typeof(this)) rhs) const {
+        bool opEquals(ref const(UnittestNode) rhs) const {
             debug usingCustomEquals = true;
             return this.value == rhs.value;
         }
@@ -343,11 +390,9 @@ version (unittest) private { // for some reason, this needs to be in global scop
 @nogc nothrow unittest {
     import eris.util : HashablePointer;
 
-    // subtype inherits Node's attributes
+    // subtype inherits Node's properties and methods
     auto test = UnittestNode(1);
-    assert(is(typeof(test.observers) == typeof(Node.observers)));
-
-    // it also inheris its methods (e.g. updateHash)
+    assert(is(typeof(test.hash) == typeof(Node.hash)));
     debug usingCustomHash = false;
     test.updateHash();
     debug assert(usingCustomHash);
@@ -356,7 +401,7 @@ version (unittest) private { // for some reason, this needs to be in global scop
     debug usingCustomEquals = false;
     auto test2 = UnittestNode(1);
     assert(test == test2);
-    auto other = UnittestNode(-1);
+    auto other = UnittestNode(0);
     assert(test != other);
     debug assert(usingCustomEquals);
 
@@ -371,9 +416,6 @@ version (unittest) private { // for some reason, this needs to be in global scop
     polymorphic.add(node2);
     assert(polymorphic.length == 1); // since test and test2 are equal
     assert(*node != *other.asNode); // these are still different, tho
-
-    // storing a generic node in a subtyped variable does not work
-    static assert(!__traits(compiles, other = *node));
 }
 
 
@@ -387,6 +429,8 @@ Join nodes are used to define the (external) interface and (internal) contents o
 They interact with the outside world through zero or more parameters.
 As a join node begins to execute, control flows into its body, where all of its parameters are made available.
 Therefore, a join node behaves like the entry block of a CFG, but with a collection of SSA phis (one for each parameter); so it can be used as an [extended basic block](https://mlir.llvm.org/docs/Rationale/Rationale/#block-arguments-vs-phi-nodes).
+RULE: Gyre graphs can be cyclic, but only if every cycle goes through a join node.
+This is similar to having a DFG with SSA phis, in which data-flow can still be considered causal as long as every cycle goes through phi nodes, indicating a "temporal" control-flow dependency.
 
 Since join nodes define subprocedures, one may want to know where such a definitions begins and ends.
 A join node's scope begins with all of its parameters and control flow edges.
@@ -409,35 +453,120 @@ struct JoinNode {
 
     /// This join node's definition (a `data` slot), used to instantiate and invoke it.
     InEdge definition;
-    invariant (definition.kind == EdgeKind.data);
 
     /// Control flow edge into the join node's body.
     OutEdge control;
-    invariant (control.kind == EdgeKind.control);
 
-    /// Non-empty collection of channels, each containing zero or more of this node's parameters.
-    Parameters[] channels;
-    alias Parameters = InEdge[]; /// ditto
-    invariant {
-        assert(channels.length > 0);
+    /// Non-empty collection of channels, each containing zero or more of this node's parameters (either data or memory edges).
+    InEdge[][] channels;
+
+ @nogc nothrow:
+    /++
+    Initializes a join node, must be later [dispose]d.
+
+    Params:
+        self = Address of node being initialized.
+        channels = Defines this join node's interface.
+
+    Returns:
+        Zero on success, non-zero on failure (null node, OOM or invalid edge kinds).
+    +/
+    static err_t initialize(JoinNode* self, EdgeKind[][] channels)
+    in (self != null && channels.length >= 1)
+    {
+        if (self == null) return EINVAL;
+        if (channels.length == 0) return EINVAL;
         foreach (parameters; channels) {
-            foreach (param; parameters) {
-                with (EdgeKind) final switch (param.kind) {
+            foreach (paramKind; parameters) {
+                with (EdgeKind) final switch (paramKind) {
                     case data, memory: break;
-                    case control, type: assert(false);
+                    case control, type: return EINVAL;
                 }
             }
         }
+        *self = JoinNode.init;
+
+        self.vptr = &JoinNode.vtbl;
+        self.definition = InEdge.data(self.asNode, 0);
+        self.control = OutEdge.control;
+
+        self.channels = allocate!(InEdge[])(channels.length);
+        if (self.channels == null) return ENOMEM;
+
+        InEdge.ID id = 0;
+        foreach (i, parameters; channels) {
+            self.channels[i] = allocate!InEdge(parameters.length);
+
+            // on failure, undo all previous allocations
+            if (parameters.length > 0 && self.channels[i] == null) {
+                foreach_reverse (previous; 0 .. i) self.channels[previous].deallocate();
+                self.channels.deallocate();
+                return ENOMEM;
+            }
+
+            foreach (j, paramKind; parameters) {
+                self.channels[i][j] = InEdge(paramKind, self.asNode, 1 + id);
+                id++;
+            }
+        }
+
+        return 0;
     }
 
- @nogc nothrow: // TODO
-    bool opEquals(ref const(typeof(this)) rhs) const {
-        return this is rhs;
+    /// ditto
+    static err_t initialize(JoinNode* self, EdgeKind[] parameters ...) {
+        EdgeKind[][1] channels = [parameters];
+        return JoinNode.initialize(self, channels);
+    }
+
+    /// Frees all resources allocated by this node and sets it to an uninitialized state.
+    static void dispose(JoinNode* self) {
+        foreach_reverse (ref parameters; self.channels) {
+            parameters.deallocate();
+        }
+        self.channels.deallocate();
+        *self = JoinNode.init;
+    }
+
+    /++
+    Semantic equality check.
+
+    Every join node has its own identity, so no two are equal.
+    NOTE: We use join nodes as cycle breakers when doing structural comparison (since that's a cheap way to avoid infinite recursion), therefore the cycle rule MUST be maintained by container graphs.
+    +/
+    bool opEquals(ref const(JoinNode) rhs) const {
+        return this.asNode == rhs.asNode; // self-ptr
     }
 
     hash_t toHash() const {
-        return 0;
+        return this.asNode.hashOf;
     }
+
+    /// Adjusts in-edge slots after a move.
+    void opPostMove(ref const(JoinNode) old) pure {
+        this.definition.owner = this.asNode;
+        foreach (parameters; this.channels) {
+            foreach (ref param; parameters) {
+                param.owner = this.asNode;
+            }
+        }
+    }
+}
+
+nothrow unittest {
+    // initialize one guy
+    JoinNode tmp = void;
+    with (EdgeKind) JoinNode.initialize(&tmp, data, memory, data, data);
+    // move it
+    JoinNode join = void;
+    moveEmplace(tmp, join);
+    // check if everything's fine
+    assert(join == join);
+    assert(join.definition.owner == join.asNode);
+    assert(join.channels.length == 1);
+    assert(join.channels[0].length == 4);
+    // free it
+    JoinNode.dispose(&join);
 }
 
 /++
@@ -455,24 +584,76 @@ struct InstantiationNode {
 
     /// Points to the definition of the join node being instantiated.
     OutEdge definition;
-    invariant (definition.kind == EdgeKind.data);
 
     /// Non-empty collection of live continuations, each corresponding to a channel in the join pattern.
     InEdge[] continuations;
-    invariant {
-        assert(continuations.length > 0);
-        foreach (cont; continuations)
-            assert(cont.kind == EdgeKind.data);
+
+ @nogc nothrow:
+    /++
+    Initializes an instantiation node.
+
+    Params:
+        self = Address of node being initialized.
+        n = Number of continuations to instantiate (always statically known).
+
+    Returns:
+        Zero on success, non-zero on failure (null node, OOM or zero continuations).
+    +/
+    static err_t initialize(InstantiationNode* self, uint n = 1)
+    in (self != null && n >= 1)
+    {
+        if (self == null) return EINVAL;
+        if (n == 0) return EINVAL;
+        *self = InstantiationNode.init;
+
+        self.vptr = &InstantiationNode.vtbl;
+        self.definition = OutEdge.data;
+        self.continuations = allocate!InEdge(n);
+        if (self.continuations == null) return ENOMEM;
+        foreach (i, ref cont; self.continuations) {
+            cont = InEdge.data(self.asNode, i);
+        }
+
+        return 0;
     }
 
- @nogc nothrow: // TODO
-    bool opEquals(ref const(typeof(this)) rhs) const {
-        return this is rhs;
+    /// Frees all resources allocated by this node and sets it to an uninitialized state.
+    static void dispose(InstantiationNode* self) {
+        self.continuations.deallocate();
+        *self = InstantiationNode.init;
+    }
+
+    /++
+    Semantic equality check.
+
+    Every instantiation node has its own identity, so no two are equal.
+    If this weren't the case, there would be no way to instantiate a join pattern twice and use the two instances independently.
+    +/
+    bool opEquals(ref const(InstantiationNode) rhs) const {
+        return this.asNode == rhs.asNode; // self-ptr
     }
 
     hash_t toHash() const {
-        return 0;
+        return this.asNode.hashOf;
     }
+
+    /// Adjusts in-edge slots after a move.
+    void opPostMove(ref const(InstantiationNode) old) pure {
+        foreach (ref cont; this.continuations) cont.owner = this.asNode;
+    }
+}
+
+@nogc nothrow unittest {
+    InstantiationNode tmp = void;
+    InstantiationNode.initialize(&tmp);
+    //
+    InstantiationNode inst = void;
+    moveEmplace(tmp, inst);
+    //
+    assert(inst == inst);
+    assert(inst.continuations.length == 1);
+    //
+    InstantiationNode.dispose(&inst);
 }
 
 /++
@@ -498,31 +679,91 @@ struct JumpNode {
 
     /// Incoming control flow which is about to be yielded to the target continuation.
     InEdge control;
-    invariant (control.kind == EdgeKind.control);
 
     /// A data dependency on some live continuation.
     OutEdge continuation;
-    invariant (control.kind == EdgeKind.data);
 
-    /// Arguments to be sent into the continuation and later be used inside a join pattern's body.
+    /// Arguments to be sent into the continuation and later used inside a join pattern's body.
     OutEdge[] arguments;
-    invariant {
-        foreach (arg; arguments) {
-            with (EdgeKind) final switch (arg.kind) {
+
+ @nogc nothrow:
+    /++
+    Initializes a jump node.
+
+    Params:
+        self = Address of node being initialized.
+        args = Argument kinds.
+
+    Returns:
+        Zero on success, non-zero on failure (null node, OOM or invalid edge kinds).
+    +/
+    static err_t initialize(JumpNode* self, EdgeKind[] args ...)
+    in (self != null)
+    {
+        if (self == null) return EINVAL;
+        foreach (argKind; args) {
+            with (EdgeKind) final switch (argKind) {
                 case data, memory: break;
-                case control, type: assert(false);
+                case control, type: return EINVAL;
             }
         }
+        *self = JumpNode.init;
+
+        self.vptr = &JumpNode.vtbl;
+        self.control = InEdge.control(self.asNode);
+        self.continuation = OutEdge.data;
+        self.arguments = allocate!OutEdge(args.length);
+        if (args.length > 0 && self.arguments == null) return ENOMEM;
+        foreach (i, argKind; args) {
+            self.arguments[i] = OutEdge.data;
+        }
+
+        return 0;
     }
 
- @nogc nothrow: // TODO
-    bool opEquals(ref const(typeof(this)) rhs) const {
-        return this is rhs;
+    /// Frees all resources allocated by this node and sets it to an uninitialized state.
+    static void dispose(JumpNode* self) {
+        self.arguments.deallocate();
+        *self = JumpNode.init;
+    }
+
+    /++
+    Semantic equality check.
+
+    Jump nodes are equal if and only if they jump into the same target continuation and they're sending the same arguments.
+    Notice that, since procedure calls usually take return continuations as parameters, this does not eliminate subexpressions which are only equal in a syntactic sense.
+    For instance, `printf("hi") + printf("hi")` cannot be transformed to `(t = printf("hi")), t + t`, since the continuation of each `printf` call is different.
+    +/
+    bool opEquals(ref const(JumpNode) rhs) const {
+        if (this.continuation != rhs.continuation) return false;
+        if (this.arguments != rhs.arguments) return false;
+        return true;
     }
 
     hash_t toHash() const {
+        hash_t hash = this.continuation.toHash();
+        foreach (arg; this.arguments) hash ^= arg.toHash();
         return 0;
     }
+
+    /// Adjusts in-edge slots after a move.
+    void opPostMove(ref const(JumpNode) old) pure {
+        this.control.owner = this.asNode;
+    }
+}
+
+nothrow unittest {
+    JumpNode tmp = void;
+    with (EdgeKind) JumpNode.initialize(&tmp, data, memory, data, data);
+    //
+    JumpNode jump = void;
+    moveEmplace(tmp, jump);
+    //
+    assert(jump == jump);
+    assert(jump.control.owner == jump.asNode);
+    assert(jump.arguments.length == 4);
+    //
+    JumpNode.dispose(&jump);
 }
 
 /++
@@ -547,24 +788,78 @@ struct ForkNode {
 
     /// Incoming single control flow.
     InEdge control;
-    invariant (control.kind == EdgeKind.control);
 
     /// At least two concurrent control flows resulting from this fork.
     OutEdge[] threads;
-    invariant {
-        assert(threads.length >= 2);
-        foreach (thread; threads)
-            assert(thread.kind == EdgeKind.control);
+
+ @nogc nothrow:
+    /++
+    Initializes a fork node.
+
+    Params:
+        self = Address of node being initialized.
+        n = Number of forked threads.
+
+    Returns:
+        Zero on success, non-zero on failure (null node, OOM or invalid number of threads).
+    +/
+    static err_t initialize(ForkNode* self, uint n)
+    in (self != null && n >= 2)
+    {
+        if (self == null) return EINVAL;
+        if (n < 2) return EINVAL;
+        *self = ForkNode.init;
+
+        self.vptr = &ForkNode.vtbl;
+        self.control = InEdge.control(self.asNode);
+        self.threads = allocate!OutEdge(n);
+        if (self.threads == null) return ENOMEM;
+        foreach (ref thread; self.threads) {
+            thread = OutEdge.control;
+        }
+
+        return 0;
     }
 
- @nogc nothrow: // TODO
-    bool opEquals(ref const(typeof(this)) rhs) const {
-        return this is rhs;
+    /// Frees all resources allocated by this node and sets it to an uninitialized state.
+    static void dispose(ForkNode* self) {
+        self.threads.deallocate();
+        *self = ForkNode.init;
+    }
+
+    /++
+    Semantic equality check.
+
+    Fork nodes are the same if and only if all of their resulting flows behave exactly the same (in which case they are still separate logical threads, but with a shared structure in the IR).
+    +/
+    bool opEquals(ref const(ForkNode) rhs) const {
+        if (this.threads != rhs.threads) return false;
+        return true;
     }
 
     hash_t toHash() const {
-        return 0;
+        hash_t hash = 0;
+        foreach (thread; this.threads) hash ^= thread.toHash();
+        return hash;
     }
+
+    /// Adjusts in-edge slots after a move.
+    void opPostMove(ref const(ForkNode) old) pure {
+        this.control.owner = this.asNode;
+    }
+}
+
+@nogc nothrow unittest {
+    ForkNode tmp = void;
+    ForkNode.initialize(&tmp, 2);
+    //
+    ForkNode fork = void;
+    moveEmplace(tmp, fork);
+    //
+    assert(fork == fork);
+    assert(fork.control.owner == fork.asNode);
+    //
+    ForkNode.dispose(&fork);
 }
 
 /++
@@ -585,34 +880,84 @@ struct ConditionalNode {
 
     /// Data selector used to choose the taken branch.
     OutEdge selector;
-    invariant (selector.kind == EdgeKind.data);
 
     /// Incoming control flow edge.
     InEdge control;
-    invariant (control.kind == EdgeKind.control);
 
     /++
     At least two outgoing control flow edges, only one of which will be taken.
 
     Represented as a sparse mapping to avoid having an exponential number of unused options.
     +/
-    HashMap!(size_t, OutEdge) options;
-    invariant {
-        assert(options.length >= 2);
-        foreach (branch; options.byValue)
-            assert(branch.kind == EdgeKind.control);
+    UnsafeHashMap!(ulong, OutEdge) options;
+
+ @nogc nothrow:
+    /++
+    Initializes a conditional node.
+
+    Params:
+        self = Address of node being initialized.
+        options = Branches to pre-allocate.
+
+    Returns:
+        Zero on success, non-zero on failure (null node, OOM or invalid number of branches).
+    +/
+    static err_t initialize(ConditionalNode* self, ulong[] options = [0, 1] ...)
+    in (self != null && options.length >= 2)
+    {
+        if (self == null) return EINVAL;
+        if (options.length < 2) return EINVAL;
+        *self = ConditionalNode.init;
+
+        self.vptr = &ConditionalNode.vtbl;
+        self.selector = OutEdge.data;
+        self.control = InEdge.control(self.asNode);
+        self.options = UnsafeHashMap!(ulong, OutEdge)();
+        const error = self.options.rehash(options.length);
+        if (error) return ENOMEM;
+
+        return 0;
     }
 
- @nogc nothrow: // TODO
-    bool opEquals(ref const(typeof(this)) rhs) const {
-        return this is rhs;
+    /// Frees all resources allocated by this node and sets it to an uninitialized state.
+    static void dispose(ConditionalNode* self) {
+        self.options.dispose();
+        *self = ConditionalNode.init;
+    }
+
+    /++
+    Semantic equality check.
+
+    Conditional nodes are the same if and only if they use the same value to select the taken branch and every branch in one has a corresponding branch in the other.
+    +/
+    bool opEquals(ref const(ConditionalNode) rhs) const {
+        if (this.selector != rhs.selector) return false;
+        if (this.options != rhs.options) return false;
+        return true;
     }
 
     hash_t toHash() const {
-        return 0;
+        return this.selector.toHash() ^ this.options.toHash();
+    }
+
+    /// Adjusts in-edge slots after a move.
+    void opPostMove(ref const(ConditionalNode) old) pure {
+        this.control.owner = this.asNode;
     }
 }
 
+nothrow unittest {
+    ConditionalNode tmp = void;
+    ConditionalNode.initialize(&tmp);
+    //
+    ConditionalNode cond = void;
+    moveEmplace(tmp, cond);
+    //
+    assert(cond == cond);
+    assert(cond.control.owner == cond.asNode);
+    //
+    ConditionalNode.dispose(&cond);
+}
 
 /++
 Gyre's mechanism for structural abstraction, the macro node.
@@ -642,7 +987,8 @@ struct MacroNode {
     mixin NodeInheritance;
 
     /// Links this macro node to its external definition.
-    uint id;
+    ID id;
+    alias ID = uint; /// ditto
 
     /// Edges (any kind) which point out from this node.
     OutEdge[] outEdges;
@@ -650,14 +996,89 @@ struct MacroNode {
     /// Edges (of any kind) which point into this node.
     InEdge[] inEdges;
 
- @nogc nothrow: // TODO
-    bool opEquals(ref const(typeof(this)) rhs) const {
-        return this is rhs;
+ @nogc nothrow:
+    /++
+    Initializes a macro node, must be later [dispose]d.
+
+    Params:
+        self = Address of node being initialized.
+        id = Macro node identification number.
+        inEdges = Defines this node's interface (in edges only).
+        outEdges = Defines this node's interface (out edges only).
+
+    Returns:
+        Zero on success, non-zero on failure (null node or OOM).
+    +/
+    static err_t initialize(
+        MacroNode* self,
+        MacroNode.ID id,
+        EdgeKind[] inEdges,
+        EdgeKind[] outEdges
+    )
+    in (self != null)
+    {
+        if (self == null) return EINVAL;
+        *self = MacroNode.init;
+
+        self.vptr = &MacroNode.vtbl;
+        self.id = id;
+
+        self.inEdges = allocate!InEdge(inEdges.length);
+        if (inEdges.length > 0 && self.inEdges == null) {
+            self.outEdges.deallocate();
+            return ENOMEM;
+        }
+        foreach (i, kind; inEdges)
+            self.inEdges[i] = InEdge(kind, self.asNode, i);
+
+        self.outEdges = allocate!OutEdge(outEdges.length);
+        if (outEdges.length > 0 && self.outEdges == null) return ENOMEM;
+        foreach (i, kind; outEdges)
+            self.outEdges[i] = OutEdge(kind);
+
+        return 0;
+    }
+
+    /// Frees all resources allocated by this node and sets it to an uninitialized state.
+    static void dispose(MacroNode* self) {
+        self.inEdges.deallocate();
+        self.outEdges.deallocate();
+        *self = MacroNode.init;
+    }
+
+    /++
+    Semantic equality check.
+
+    Since macro nodes can expand into arbitrary subgraphs, we treat each one individually.
+    +/
+    bool opEquals(ref const(MacroNode) rhs) const {
+        return this.id == rhs.id && this.asNode == rhs.asNode; // self-ptr
     }
 
     hash_t toHash() const {
-        return 0;
+        return this.id.hashOf ^ this.asNode.hashOf;
     }
+
+    /// Adjusts in-edge slots after a move.
+    void opPostMove(ref const(MacroNode) old) pure {
+        foreach (ref slot; this.inEdges)
+            slot.owner = this.asNode;
+    }
+}
+
+nothrow unittest {
+    MacroNode tmp = void;
+    with (EdgeKind) MacroNode.initialize(&tmp, 42, [control, type, data], [control, control]);
+    //
+    MacroNode node = void;
+    moveEmplace(tmp, node);
+    //
+    assert(node == node);
+    assert(node.id == 42);
+    assert(node.inEdges.length == 3);
+    assert(node.outEdges.length == 2);
+    //
+    MacroNode.dispose(&node);
 }
 
 
@@ -670,20 +1091,70 @@ struct ConstantNode {
     mixin NodeInheritance;
 
     // FIXME: temporary assumption that all types are i64
-    size_t literal;
+    ulong literal;
 
     /// The constant's (run-time) value.
     InEdge value;
-    invariant (value.kind == EdgeKind.data);
 
- @nogc nothrow: // TODO
-    bool opEquals(ref const(typeof(this)) rhs) const {
-        return this is rhs;
+ @nogc nothrow:
+    /++
+    Initializes a constant node.
+
+    Params:
+        self = Address of node being initialized.
+        literal = This constant's value.
+
+    Returns:
+        Zero on success, non-zero on failure (null node).
+    +/
+    static err_t initialize(ConstantNode* self, ulong literal)
+    in (self != null)
+    {
+        if (self == null) return EINVAL;
+        *self = ConstantNode.init;
+
+        self.vptr = &ConstantNode.vtbl;
+        self.literal = literal;
+        self.value = InEdge.data(self.asNode);
+
+        return 0;
+    }
+
+    /// Frees all resources allocated by this node and sets it to an uninitialized state.
+    static void dispose(ConstantNode* self) {
+        *self = ConstantNode.init;
+    }
+
+    /++
+    Semantic equality check.
+
+    The easy case: constants are equal if and only if their values are equal.
+    +/
+    bool opEquals(ref const(ConstantNode) rhs) const {
+        return this.literal == rhs.literal;
     }
 
     hash_t toHash() const {
-        return 0;
+        return this.literal.hashOf;
     }
+
+    /// Adjusts in-edge slots after a move.
+    void opPostMove(ref const(ConstantNode) old) pure {
+        this.value.owner = this.asNode;
+    }
+}
+
+@nogc nothrow unittest {
+    ConstantNode tmp = void;
+    ConstantNode.initialize(&tmp, 2);
+    //
+    ConstantNode lit = void;
+    moveEmplace(tmp, lit);
+    //
+    assert(lit == lit);
+    assert(lit.value.owner == lit.asNode);
+    //
+    ConstantNode.dispose(&lit);
 }
 
 /++
@@ -702,82 +1173,270 @@ struct UndefinedNode {
 
     /// The resulting value.
     InEdge value;
-    invariant (value.kind == EdgeKind.data);
 
- @nogc nothrow: // TODO
-    bool opEquals(ref const(typeof(this)) rhs) const {
-        return this is rhs;
+ @nogc nothrow:
+    /++
+    Initializes an undefined node.
+
+    Params:
+        self = Address of node being initialized.
+
+    Returns:
+        Zero on success, non-zero on failure (null node).
+    +/
+    static err_t initialize(UndefinedNode* self)
+    in (self != null)
+    {
+        if (self == null) return EINVAL;
+        *self = UndefinedNode.init;
+
+        self.vptr = &UndefinedNode.vtbl;
+        self.value = InEdge.data(self.asNode);
+
+        return 0;
+    }
+
+    /// Frees all resources allocated by this node and sets it to an uninitialized state.
+    static void dispose(UndefinedNode* self) {
+        *self = UndefinedNode.init;
+    }
+
+    /++
+    Semantic equality check.
+
+    Since different undefined nodes can resolve to different values, each has its own identity.
+    +/
+    bool opEquals(ref const(UndefinedNode) rhs) const {
+        return this.asNode == rhs.asNode; // self-ptr
     }
 
     hash_t toHash() const {
-        return 0;
+        return this.asNode.hashOf;
+    }
+
+    /// Adjusts in-edge slots after a move.
+    void opPostMove(ref const(UndefinedNode) old) pure {
+        this.value.owner = this.asNode;
     }
 }
 
+@nogc nothrow unittest {
+    UndefinedNode tmp = void;
+    UndefinedNode.initialize(&tmp);
+    //
+    UndefinedNode undef = void;
+    moveEmplace(tmp, undef);
+    //
+    assert(undef == undef);
+    assert(undef.value.owner == undef.asNode);
+    //
+    UndefinedNode.dispose(&undef);
+}
+
 /// Yields the lowermost bits of its input.
-struct TruncationNode {
+struct TruncationNode { // FIXME: doesn't make sense without type info
     mixin NodeInheritance;
 
     /// Bit pattern being truncated.
     OutEdge input;
-    invariant (input.kind == EdgeKind.data);
 
     /// Lowermost input bits.
     InEdge output;
-    invariant (output.kind == EdgeKind.data);
 
- @nogc nothrow: // TODO
-    bool opEquals(ref const(typeof(this)) rhs) const {
-        return this is rhs;
+ @nogc nothrow:
+    /++
+    Initializes a truncation node.
+
+    Params:
+        self = Address of node being initialized.
+
+    Returns:
+        Zero on success, non-zero on failure (null node).
+    +/
+    static err_t initialize(TruncationNode* self)
+    in (self != null)
+    {
+        if (self == null) return EINVAL;
+        *self = TruncationNode.init;
+
+        self.vptr = &TruncationNode.vtbl;
+        self.input = OutEdge.data;
+        self.output = InEdge.data(self.asNode);
+
+        return 0;
+    }
+
+    /// Frees all resources allocated by this node and sets it to an uninitialized state.
+    static void dispose(TruncationNode* self) {
+        *self = TruncationNode.init;
+    }
+
+    /// Semantic equality <=> structural equality.
+    bool opEquals(ref const(TruncationNode) rhs) const {
+        return this.input == rhs.input;
     }
 
     hash_t toHash() const {
-        return 0;
+        return this.input.toHash();
+    }
+
+    /// Adjusts in-edge slots after a move.
+    void opPostMove(ref const(TruncationNode) old) pure {
+        this.output.owner = this.asNode;
     }
 }
 
-/// Yields a wider version of its input, with added bits set to zero.
-struct UnsignedExtensionNode {
+@nogc nothrow unittest {
+    TruncationNode tmp = void;
+    TruncationNode.initialize(&tmp);
+    //
+    TruncationNode trunc = void;
+    moveEmplace(tmp, trunc);
+    //
+    assert(trunc == trunc);
+    assert(trunc.output.owner == trunc.asNode);
+    //
+    TruncationNode.dispose(&trunc);
+}
+
+/++
+Yields a wider version of its input, with added bits set to zero.
+
+See_Also: [SignedExtensionNode]
++/
+struct UnsignedExtensionNode { // FIXME: doesn't make sense without type info
     mixin NodeInheritance;
 
     /// Bit pattern being extended.
     OutEdge input;
-    invariant (input.kind == EdgeKind.data);
 
     /// Resulting bit pattern.
     InEdge output;
-    invariant (output.kind == EdgeKind.data);
 
- @nogc nothrow: // TODO
-    bool opEquals(ref const(typeof(this)) rhs) const {
-        return this is rhs;
+ @nogc nothrow:
+    /++
+    Initializes an extension node.
+
+    Params:
+        self = Address of node being initialized.
+
+    Returns:
+        Zero on success, non-zero on failure (null node).
+    +/
+    static err_t initialize(UnsignedExtensionNode* self)
+    in (self != null)
+    {
+        if (self == null) return EINVAL;
+        *self = UnsignedExtensionNode.init;
+
+        self.vptr = &UnsignedExtensionNode.vtbl;
+        self.input = OutEdge.data;
+        self.output = InEdge.data(self.asNode);
+
+        return 0;
+    }
+
+    /// Frees all resources allocated by this node and sets it to an uninitialized state.
+    static void dispose(UnsignedExtensionNode* self) {
+        *self = UnsignedExtensionNode.init;
+    }
+
+    /// Semantic equality <=> structural equality.
+    bool opEquals(ref const(UnsignedExtensionNode) rhs) const {
+        return this.input == rhs.input;
     }
 
     hash_t toHash() const {
-        return 0;
+        return this.input.toHash();
+    }
+
+    /// Adjusts in-edge slots after a move.
+    void opPostMove(ref const(UnsignedExtensionNode) old) pure {
+        this.output.owner = this.asNode;
     }
 }
 
-/// Yields a wider version of its input, with added bits equal to the input's sign bit.
-struct SignedExtensionNode {
+@nogc nothrow unittest {
+    UnsignedExtensionNode tmp = void;
+    UnsignedExtensionNode.initialize(&tmp);
+    //
+    UnsignedExtensionNode extu = void;
+    moveEmplace(tmp, extu);
+    //
+    assert(extu == extu);
+    assert(extu.output.owner == extu.asNode);
+    //
+    UnsignedExtensionNode.dispose(&extu);
+}
+
+/++
+Yields a wider version of its input, with added bits equal to the input's sign bit.
+
+See_Also: [UnsignedExtensionNode]
++/
+struct SignedExtensionNode { // FIXME: doesn't make sense without type info
     mixin NodeInheritance;
 
     /// Bit pattern being extended.
     OutEdge input;
-    invariant (input.kind == EdgeKind.data);
 
     /// Resulting bit pattern.
     InEdge output;
-    invariant (output.kind == EdgeKind.data);
 
- @nogc nothrow: // TODO
-    bool opEquals(ref const(typeof(this)) rhs) const {
-        return this is rhs;
+ @nogc nothrow:
+    /++
+    Initializes a extension node.
+
+    Params:
+        self = Address of node being initialized.
+
+    Returns:
+        Zero on success, non-zero on failure (null node).
+    +/
+    static err_t initialize(SignedExtensionNode* self)
+    in (self != null)
+    {
+        if (self == null) return EINVAL;
+        *self = SignedExtensionNode.init;
+
+        self.vptr = &SignedExtensionNode.vtbl;
+        self.input = OutEdge.data;
+        self.output = InEdge.data(self.asNode);
+
+        return 0;
+    }
+
+    /// Frees all resources allocated by this node and sets it to an uninitialized state.
+    static void dispose(SignedExtensionNode* self) {
+        *self = SignedExtensionNode.init;
+    }
+
+    /// Semantic equality <=> structural equality.
+    bool opEquals(ref const(SignedExtensionNode) rhs) const {
+        return this.input == rhs.input;
     }
 
     hash_t toHash() const {
-        return 0;
+        return this.input.toHash();
     }
+
+    /// Adjusts in-edge slots after a move.
+    void opPostMove(ref const(SignedExtensionNode) old) pure {
+        this.output.owner = this.asNode;
+    }
+}
+
+@nogc nothrow unittest {
+    SignedExtensionNode tmp = void;
+    SignedExtensionNode.initialize(&tmp);
+    //
+    SignedExtensionNode exts = void;
+    moveEmplace(tmp, exts);
+    //
+    assert(exts == exts);
+    assert(exts.output.owner == exts.asNode);
+    //
+    SignedExtensionNode.dispose(&exts);
 }
 
 /++
@@ -796,34 +1455,81 @@ See_Also: [ConditionalNode]
 struct MultiplexerNode {
     mixin NodeInheritance;
 
-    /// Resulting value.
-    InEdge output;
-    invariant (output.kind == EdgeKind.data);
-
     /// Data dependency used to choose which of the given inputs will be returned.
     OutEdge selector;
-    invariant (selector.kind == EdgeKind.data);
+
+    /// Resulting value.
+    InEdge output;
 
     /++
     At least two inputs, one of which will be forwarded as output.
 
     Represented as a sparse mapping to avoid having an exponential number of unused input edges.
     +/
-    HashMap!(size_t, OutEdge) inputs;
-    invariant {
-        assert(inputs.length >= 2);
-        foreach (option; inputs.byValue)
-            assert(option.kind == EdgeKind.data);
+    UnsafeHashMap!(ulong, OutEdge) inputs;
+
+ @nogc nothrow:
+    /++
+    Initializes a multiplexer node.
+
+    Params:
+        self = Address of node being initialized.
+        inputs = Input slots to pre-allocate.
+
+    Returns:
+        Zero on success, non-zero on failure (null node, OOM or invalid number of inputs).
+    +/
+    static err_t initialize(MultiplexerNode* self, ulong[] inputs = [0, 1] ...)
+    in (self != null && inputs.length >= 2)
+    {
+        if (self == null) return EINVAL;
+        if (inputs.length < 2) return EINVAL;
+        *self = MultiplexerNode.init;
+
+        self.vptr = &MultiplexerNode.vtbl;
+        self.selector = OutEdge.data;
+        self.output = InEdge.data(self.asNode);
+        self.inputs = UnsafeHashMap!(ulong, OutEdge)();
+        const error = self.inputs.rehash(inputs.length);
+        if (error) return ENOMEM;
+
+        return 0;
     }
 
- @nogc nothrow: // TODO
-    bool opEquals(ref const(typeof(this)) rhs) const {
-        return this is rhs;
+    /// Frees all resources allocated by this node and sets it to an uninitialized state.
+    static void dispose(MultiplexerNode* self) {
+        self.inputs.dispose();
+        *self = MultiplexerNode.init;
+    }
+
+    /// Semantic equality <=> structural equality.
+    bool opEquals(ref const(MultiplexerNode) rhs) const {
+        if (this.selector != rhs.selector) return false;
+        if (this.inputs != rhs.inputs) return false;
+        return true;
     }
 
     hash_t toHash() const {
-        return 0;
+        return this.selector.toHash() ^ this.inputs.toHash();
     }
+
+    /// Adjusts in-edge slots after a move.
+    void opPostMove(ref const(MultiplexerNode) old) pure {
+        this.output.owner = this.asNode;
+    }
+}
+
+nothrow unittest {
+    MultiplexerNode tmp = void;
+    MultiplexerNode.initialize(&tmp, 0, 1, 2, 3);
+    //
+    MultiplexerNode mux = void;
+    moveEmplace(tmp, mux);
+    //
+    assert(mux == mux);
+    assert(mux.output.owner == mux.asNode);
+    //
+    MultiplexerNode.dispose(&mux);
 }
 
 /// Bitwise `AND` operation.
@@ -832,24 +1538,69 @@ struct AndNode {
 
     /// Resulting bit pattern.
     InEdge result;
-    invariant (result.kind == EdgeKind.data);
 
-    /// Set of operands (unordered due to commutativity).
-    HashSet!OutEdge operands;
-    invariant {
-        assert(operands.length >= 2);
-        foreach (operand; operands.byKey)
-            assert(operand.kind == EdgeKind.data);
+    /// Set of operands (order does not matter).
+    UnsafeHashSet!OutEdge operands;
+
+ @nogc nothrow:
+    /++
+    Initializes an AND node.
+
+    Params:
+        self = Address of node being initialized.
+        n = Number of operands to pre-allocate.
+
+    Returns:
+        Zero on success, non-zero on failure (null node, OOM or invalid number of operands).
+    +/
+    static err_t initialize(AndNode* self, uint n = 2)
+    in (self != null && n >= 2)
+    {
+        if (self == null) return EINVAL;
+        if (n < 2) return EINVAL;
+        *self = AndNode.init;
+
+        self.vptr = &AndNode.vtbl;
+        self.result = InEdge.data(self.asNode);
+        self.operands = UnsafeHashSet!(OutEdge)();
+        const error = self.operands.rehash(n);
+        if (error) return ENOMEM;
+
+        return 0;
     }
 
- @nogc nothrow: // TODO
-    bool opEquals(ref const(typeof(this)) rhs) const {
-        return this is rhs;
+    /// Frees all resources allocated by this node and sets it to an uninitialized state.
+    static void dispose(AndNode* self) {
+        self.operands.dispose();
+        *self = AndNode.init;
+    }
+
+    /// Semantic equality <=> structural equality.
+    bool opEquals(ref const(AndNode) rhs) const {
+        return this.operands == rhs.operands;
     }
 
     hash_t toHash() const {
-        return 0;
+        return this.operands.toHash();
     }
+
+    /// Adjusts in-edge slots after a move.
+    void opPostMove(ref const(AndNode) old) pure {
+        this.result.owner = this.asNode;
+    }
+}
+
+@nogc nothrow unittest {
+    AndNode tmp = void;
+    AndNode.initialize(&tmp);
+    //
+    AndNode and = void;
+    moveEmplace(tmp, and);
+    //
+    assert(and == and);
+    assert(and.result.owner == and.asNode);
+    //
+    AndNode.dispose(&and);
 }
 
 /// Bitwise `OR` operation.
@@ -858,24 +1609,69 @@ struct OrNode {
 
     /// Resulting bit pattern.
     InEdge result;
-    invariant (result.kind == EdgeKind.data);
 
-    /// Set of operands (unordered due to commutativity).
-    HashSet!OutEdge operands;
-    invariant {
-        assert(operands.length >= 2);
-        foreach (operand; operands.byKey)
-            assert(operand.kind == EdgeKind.data);
+    /// Set of operands (order does not matter).
+    UnsafeHashSet!OutEdge operands;
+
+ @nogc nothrow:
+    /++
+    Initializes an OR node.
+
+    Params:
+        self = Address of node being initialized.
+        n = Number of operands to pre-allocate.
+
+    Returns:
+        Zero on success, non-zero on failure (null node, OOM or invalid number of operands).
+    +/
+    static err_t initialize(OrNode* self, uint n = 2)
+    in (self != null && n >= 2)
+    {
+        if (self == null) return EINVAL;
+        if (n < 2) return EINVAL;
+        *self = OrNode.init;
+
+        self.vptr = &OrNode.vtbl;
+        self.result = InEdge.data(self.asNode);
+        self.operands = UnsafeHashSet!(OutEdge)();
+        const error = self.operands.rehash(n);
+        if (error) return ENOMEM;
+
+        return 0;
     }
 
- @nogc nothrow: // TODO
-    bool opEquals(ref const(typeof(this)) rhs) const {
-        return this is rhs;
+    /// Frees all resources allocated by this node and sets it to an uninitialized state.
+    static void dispose(OrNode* self) {
+        self.operands.dispose();
+        *self = OrNode.init;
+    }
+
+    /// Semantic equality <=> structural equality.
+    bool opEquals(ref const(OrNode) rhs) const {
+        return this.operands == rhs.operands;
     }
 
     hash_t toHash() const {
-        return 0;
+        return this.operands.toHash();
     }
+
+    /// Adjusts in-edge slots after a move.
+    void opPostMove(ref const(OrNode) old) pure {
+        this.result.owner = this.asNode;
+    }
+}
+
+@nogc nothrow unittest {
+    OrNode tmp = void;
+    OrNode.initialize(&tmp);
+    //
+    OrNode or = void;
+    moveEmplace(tmp, or);
+    //
+    assert(or == or);
+    assert(or.result.owner == or.asNode);
+    //
+    OrNode.dispose(&or);
 }
 
 /++
@@ -888,24 +1684,69 @@ struct XorNode {
 
     /// Resulting bit pattern.
     InEdge result;
-    invariant (result.kind == EdgeKind.data);
 
-    /// Set of operands (unordered due to commutativity).
-    HashSet!OutEdge operands;
-    invariant {
-        assert(operands.length >= 2);
-        foreach (operand; operands.byKey)
-            assert(operand.kind == EdgeKind.data);
+    /// Set of operands (order does not matter).
+    UnsafeHashSet!OutEdge operands;
+
+ @nogc nothrow:
+    /++
+    Initializes a XOR node.
+
+    Params:
+        self = Address of node being initialized.
+        n = Number of operands to pre-allocate.
+
+    Returns:
+        Zero on success, non-zero on failure (null node, OOM or invalid number of operands).
+    +/
+    static err_t initialize(XorNode* self, uint n = 2)
+    in (self != null && n >= 2)
+    {
+        if (self == null) return EINVAL;
+        if (n < 2) return EINVAL;
+        *self = XorNode.init;
+
+        self.vptr = &XorNode.vtbl;
+        self.result = InEdge.data(self.asNode);
+        self.operands = UnsafeHashSet!(OutEdge)();
+        const error = self.operands.rehash(n);
+        if (error) return ENOMEM;
+
+        return 0;
     }
 
- @nogc nothrow: // TODO
-    bool opEquals(ref const(typeof(this)) rhs) const {
-        return this is rhs;
+    /// Frees all resources allocated by this node and sets it to an uninitialized state.
+    static void dispose(XorNode* self) {
+        self.operands.dispose();
+        *self = XorNode.init;
+    }
+
+    /// Semantic equality <=> structural equality.
+    bool opEquals(ref const(XorNode) rhs) const {
+        return this.operands == rhs.operands;
     }
 
     hash_t toHash() const {
-        return 0;
+        return this.operands.toHash();
     }
+
+    /// Adjusts in-edge slots after a move.
+    void opPostMove(ref const(XorNode) old) pure {
+        this.result.owner = this.asNode;
+    }
+}
+
+@nogc nothrow unittest {
+    XorNode tmp = void;
+    XorNode.initialize(&tmp);
+    //
+    XorNode xor = void;
+    moveEmplace(tmp, xor);
+    //
+    assert(xor == xor);
+    assert(xor.result.owner == xor.asNode);
+    //
+    XorNode.dispose(&xor);
 }
 
 /++
@@ -920,24 +1761,70 @@ struct LeftShiftNode {
 
     /// Initial bit pattern being shifted.
     OutEdge input;
-    invariant (input.kind == EdgeKind.data);
 
     /// Number of times the shift is performed.
     OutEdge shift;
-    invariant (shift.kind == EdgeKind.data);
 
     /// Resulting bit pattern.
     InEdge output;
-    invariant (output.kind == EdgeKind.data);
 
- @nogc nothrow: // TODO
-    bool opEquals(ref const(typeof(this)) rhs) const {
-        return this is rhs;
+ @nogc nothrow:
+    /++
+    Initializes a shift node.
+
+    Params:
+        self = Address of node being initialized.
+
+    Returns:
+        Zero on success, non-zero on failure (null node).
+    +/
+    static err_t initialize(LeftShiftNode* self)
+    in (self != null)
+    {
+        if (self == null) return EINVAL;
+        *self = LeftShiftNode.init;
+
+        self.vptr = &LeftShiftNode.vtbl;
+        self.input = OutEdge.data;
+        self.shift = OutEdge.data;
+        self.output = InEdge.data(self.asNode);
+
+        return 0;
+    }
+
+    /// Frees all resources allocated by this node and sets it to an uninitialized state.
+    static void dispose(LeftShiftNode* self) {
+        *self = LeftShiftNode.init;
+    }
+
+    /// Semantic equality <=> structural equality.
+    bool opEquals(ref const(LeftShiftNode) rhs) const {
+        if (this.input != rhs.input) return false;
+        if (this.shift != rhs.shift) return false;
+        return true;
     }
 
     hash_t toHash() const {
-        return 0;
+        return (this.input.toHash() - this.shift.toHash()).hashOf;
     }
+
+    /// Adjusts in-edge slots after a move.
+    void opPostMove(ref const(LeftShiftNode) old) pure {
+        this.output.owner = this.asNode;
+    }
+}
+
+@nogc nothrow unittest {
+    LeftShiftNode tmp = void;
+    LeftShiftNode.initialize(&tmp);
+    //
+    LeftShiftNode shl = void;
+    moveEmplace(tmp, shl);
+    //
+    assert(shl == shl);
+    assert(shl.output.owner == shl.asNode);
+    //
+    LeftShiftNode.dispose(&shl);
 }
 
 /++
@@ -954,24 +1841,70 @@ struct LeftShiftNoOverflowNode {
 
     /// Initial bit pattern being shifted.
     OutEdge input;
-    invariant (input.kind == EdgeKind.data);
 
     /// Number of times the shift is performed.
     OutEdge shift;
-    invariant (shift.kind == EdgeKind.data);
 
     /// Resulting bit pattern.
     InEdge output;
-    invariant (output.kind == EdgeKind.data);
 
- @nogc nothrow: // TODO
-    bool opEquals(ref const(typeof(this)) rhs) const {
-        return this is rhs;
+ @nogc nothrow:
+    /++
+    Initializes a shift node.
+
+    Params:
+        self = Address of node being initialized.
+
+    Returns:
+        Zero on success, non-zero on failure (null node).
+    +/
+    static err_t initialize(LeftShiftNoOverflowNode* self)
+    in (self != null)
+    {
+        if (self == null) return EINVAL;
+        *self = LeftShiftNoOverflowNode.init;
+
+        self.vptr = &LeftShiftNoOverflowNode.vtbl;
+        self.input = OutEdge.data;
+        self.shift = OutEdge.data;
+        self.output = InEdge.data(self.asNode);
+
+        return 0;
+    }
+
+    /// Frees all resources allocated by this node and sets it to an uninitialized state.
+    static void dispose(LeftShiftNoOverflowNode* self) {
+        *self = LeftShiftNoOverflowNode.init;
+    }
+
+    /// Semantic equality <=> structural equality.
+    bool opEquals(ref const(LeftShiftNoOverflowNode) rhs) const {
+        if (this.input != rhs.input) return false;
+        if (this.shift != rhs.shift) return false;
+        return true;
     }
 
     hash_t toHash() const {
-        return 0;
+        return (this.input.toHash() - this.shift.toHash()).hashOf;
     }
+
+    /// Adjusts in-edge slots after a move.
+    void opPostMove(ref const(LeftShiftNoOverflowNode) old) pure {
+        this.output.owner = this.asNode;
+    }
+}
+
+@nogc nothrow unittest {
+    LeftShiftNoOverflowNode tmp = void;
+    LeftShiftNoOverflowNode.initialize(&tmp);
+    //
+    LeftShiftNoOverflowNode shlno = void;
+    moveEmplace(tmp, shlno);
+    //
+    assert(shlno == shlno);
+    assert(shlno.output.owner == shlno.asNode);
+    //
+    LeftShiftNoOverflowNode.dispose(&shlno);
 }
 
 /++
@@ -986,24 +1919,70 @@ struct UnsignedRightShiftNode {
 
     /// Initial bit pattern being shifted.
     OutEdge input;
-    invariant (input.kind == EdgeKind.data);
 
     /// Number of times the shift is performed.
     OutEdge shift;
-    invariant (shift.kind == EdgeKind.data);
 
     /// Resulting bit pattern.
     InEdge output;
-    invariant (output.kind == EdgeKind.data);
 
- @nogc nothrow: // TODO
-    bool opEquals(ref const(typeof(this)) rhs) const {
-        return this is rhs;
+ @nogc nothrow:
+    /++
+    Initializes a shift node.
+
+    Params:
+        self = Address of node being initialized.
+
+    Returns:
+        Zero on success, non-zero on failure (null node).
+    +/
+    static err_t initialize(UnsignedRightShiftNode* self)
+    in (self != null)
+    {
+        if (self == null) return EINVAL;
+        *self = UnsignedRightShiftNode.init;
+
+        self.vptr = &UnsignedRightShiftNode.vtbl;
+        self.input = OutEdge.data;
+        self.shift = OutEdge.data;
+        self.output = InEdge.data(self.asNode);
+
+        return 0;
+    }
+
+    /// Frees all resources allocated by this node and sets it to an uninitialized state.
+    static void dispose(UnsignedRightShiftNode* self) {
+        *self = UnsignedRightShiftNode.init;
+    }
+
+    /// Semantic equality <=> structural equality.
+    bool opEquals(ref const(UnsignedRightShiftNode) rhs) const {
+        if (this.input != rhs.input) return false;
+        if (this.shift != rhs.shift) return false;
+        return true;
     }
 
     hash_t toHash() const {
-        return 0;
+        return (this.input.toHash() - this.shift.toHash()).hashOf;
     }
+
+    /// Adjusts in-edge slots after a move.
+    void opPostMove(ref const(UnsignedRightShiftNode) old) pure {
+        this.output.owner = this.asNode;
+    }
+}
+
+@nogc nothrow unittest {
+    UnsignedRightShiftNode tmp = void;
+    UnsignedRightShiftNode.initialize(&tmp);
+    //
+    UnsignedRightShiftNode shru = void;
+    moveEmplace(tmp, shru);
+    //
+    assert(shru == shru);
+    assert(shru.output.owner == shru.asNode);
+    //
+    UnsignedRightShiftNode.dispose(&shru);
 }
 
 /++
@@ -1018,24 +1997,70 @@ struct SignedRightShiftNode {
 
     /// Initial bit pattern being shifted.
     OutEdge input;
-    invariant (input.kind == EdgeKind.data);
 
     /// Number of times the shift is performed.
     OutEdge shift;
-    invariant (shift.kind == EdgeKind.data);
 
     /// Resulting bit pattern.
     InEdge output;
-    invariant (output.kind == EdgeKind.data);
 
- @nogc nothrow: // TODO
-    bool opEquals(ref const(typeof(this)) rhs) const {
-        return this is rhs;
+ @nogc nothrow:
+    /++
+    Initializes a shift node.
+
+    Params:
+        self = Address of node being initialized.
+
+    Returns:
+        Zero on success, non-zero on failure (null node).
+    +/
+    static err_t initialize(SignedRightShiftNode* self)
+    in (self != null)
+    {
+        if (self == null) return EINVAL;
+        *self = SignedRightShiftNode.init;
+
+        self.vptr = &SignedRightShiftNode.vtbl;
+        self.input = OutEdge.data;
+        self.shift = OutEdge.data;
+        self.output = InEdge.data(self.asNode);
+
+        return 0;
+    }
+
+    /// Frees all resources allocated by this node and sets it to an uninitialized state.
+    static void dispose(SignedRightShiftNode* self) {
+        *self = SignedRightShiftNode.init;
+    }
+
+    /// Semantic equality <=> structural equality.
+    bool opEquals(ref const(SignedRightShiftNode) rhs) const {
+        if (this.input != rhs.input) return false;
+        if (this.shift != rhs.shift) return false;
+        return true;
     }
 
     hash_t toHash() const {
-        return 0;
+        return (this.input.toHash() - this.shift.toHash()).hashOf;
     }
+
+    /// Adjusts in-edge slots after a move.
+    void opPostMove(ref const(SignedRightShiftNode) old) pure {
+        this.output.owner = this.asNode;
+    }
+}
+
+@nogc nothrow unittest {
+    SignedRightShiftNode tmp = void;
+    SignedRightShiftNode.initialize(&tmp);
+    //
+    SignedRightShiftNode shrs = void;
+    moveEmplace(tmp, shrs);
+    //
+    assert(shrs == shrs);
+    assert(shrs.output.owner == shrs.asNode);
+    //
+    SignedRightShiftNode.dispose(&shrs);
 }
 
 /++
@@ -1050,24 +2075,69 @@ struct AdditionNode {
 
     /// Resulting sum.
     InEdge result;
-    invariant (result.kind == EdgeKind.data);
 
-    /// Set of operands (unordered due to commutativity).
-    HashSet!OutEdge operands;
-    invariant {
-        assert(operands.length >= 2);
-        foreach (operand; operands.byKey)
-            assert(operand.kind == EdgeKind.data);
+    /// Set of operands (order does not matter).
+    UnsafeHashSet!OutEdge operands;
+
+ @nogc nothrow:
+    /++
+    Initializes an addition node.
+
+    Params:
+        self = Address of node being initialized.
+        n = Number of operands to pre-allocate.
+
+    Returns:
+        Zero on success, non-zero on failure (null node, OOM or invalid number of operands).
+    +/
+    static err_t initialize(AdditionNode* self, uint n = 2)
+    in (self != null && n >= 2)
+    {
+        if (self == null) return EINVAL;
+        if (n < 2) return EINVAL;
+        *self = AdditionNode.init;
+
+        self.vptr = &AdditionNode.vtbl;
+        self.result = InEdge.data(self.asNode);
+        self.operands = UnsafeHashSet!(OutEdge)();
+        const error = self.operands.rehash(n);
+        if (error) return ENOMEM;
+
+        return 0;
     }
 
- @nogc nothrow: // TODO
-    bool opEquals(ref const(typeof(this)) rhs) const {
-        return this is rhs;
+    /// Frees all resources allocated by this node and sets it to an uninitialized state.
+    static void dispose(AdditionNode* self) {
+        self.operands.dispose();
+        *self = AdditionNode.init;
+    }
+
+    /// Semantic equality <=> structural equality.
+    bool opEquals(ref const(AdditionNode) rhs) const {
+        return this.operands == rhs.operands;
     }
 
     hash_t toHash() const {
-        return 0;
+        return this.operands.toHash();
     }
+
+    /// Adjusts in-edge slots after a move.
+    void opPostMove(ref const(AdditionNode) old) pure {
+        this.result.owner = this.asNode;
+    }
+}
+
+@nogc nothrow unittest {
+    AdditionNode tmp = void;
+    AdditionNode.initialize(&tmp);
+    //
+    AdditionNode add = void;
+    moveEmplace(tmp, add);
+    //
+    assert(add == add);
+    assert(add.result.owner == add.asNode);
+    //
+    AdditionNode.dispose(&add);
 }
 
 /++
@@ -1082,24 +2152,69 @@ struct AdditionNoOverflowSignedNode {
 
     /// Resulting sum.
     InEdge result;
-    invariant (result.kind == EdgeKind.data);
 
-    /// Set of operands (unordered due to commutativity).
-    HashSet!OutEdge operands;
-    invariant {
-        assert(operands.length >= 2);
-        foreach (operand; operands.byKey)
-            assert(operand.kind == EdgeKind.data);
+    /// Set of operands (order does not matter).
+    UnsafeHashSet!OutEdge operands;
+
+ @nogc nothrow:
+    /++
+    Initializes an addition node.
+
+    Params:
+        self = Address of node being initialized.
+        n = Number of operands to pre-allocate.
+
+    Returns:
+        Zero on success, non-zero on failure (null node, OOM or invalid number of operands).
+    +/
+    static err_t initialize(AdditionNoOverflowSignedNode* self, uint n = 2)
+    in (self != null && n >= 2)
+    {
+        if (self == null) return EINVAL;
+        if (n < 2) return EINVAL;
+        *self = AdditionNoOverflowSignedNode.init;
+
+        self.vptr = &AdditionNoOverflowSignedNode.vtbl;
+        self.result = InEdge.data(self.asNode);
+        self.operands = UnsafeHashSet!(OutEdge)();
+        const error = self.operands.rehash(n);
+        if (error) return ENOMEM;
+
+        return 0;
     }
 
- @nogc nothrow: // TODO
-    bool opEquals(ref const(typeof(this)) rhs) const {
-        return this is rhs;
+    /// Frees all resources allocated by this node and sets it to an uninitialized state.
+    static void dispose(AdditionNoOverflowSignedNode* self) {
+        self.operands.dispose();
+        *self = AdditionNoOverflowSignedNode.init;
+    }
+
+    /// Semantic equality <=> structural equality.
+    bool opEquals(ref const(AdditionNoOverflowSignedNode) rhs) const {
+        return this.operands == rhs.operands;
     }
 
     hash_t toHash() const {
-        return 0;
+        return this.operands.toHash();
     }
+
+    /// Adjusts in-edge slots after a move.
+    void opPostMove(ref const(AdditionNoOverflowSignedNode) old) pure {
+        this.result.owner = this.asNode;
+    }
+}
+
+@nogc nothrow unittest {
+    AdditionNoOverflowSignedNode tmp = void;
+    AdditionNoOverflowSignedNode.initialize(&tmp);
+    //
+    AdditionNoOverflowSignedNode addnos = void;
+    moveEmplace(tmp, addnos);
+    //
+    assert(addnos == addnos);
+    assert(addnos.result.owner == addnos.asNode);
+    //
+    AdditionNoOverflowSignedNode.dispose(&addnos);
 }
 
 /++
@@ -1114,24 +2229,70 @@ struct SubtractionNode {
 
     /// Left-hand-side operand.
     OutEdge lhs;
-    invariant (lhs.kind == EdgeKind.data);
 
     /// Right-hand-side operand.
     OutEdge rhs;
-    invariant (rhs.kind == EdgeKind.data);
 
     /// Result of the subtraction.
     InEdge result;
-    invariant (result.kind == EdgeKind.data);
 
- @nogc nothrow: // TODO
-    bool opEquals(ref const(typeof(this)) rhs) const {
-        return this is rhs;
+ @nogc nothrow:
+    /++
+    Initializes a subtraction node.
+
+    Params:
+        self = Address of node being initialized.
+
+    Returns:
+        Zero on success, non-zero on failure (null node).
+    +/
+    static err_t initialize(SubtractionNode* self)
+    in (self != null)
+    {
+        if (self == null) return EINVAL;
+        *self = SubtractionNode.init;
+
+        self.vptr = &SubtractionNode.vtbl;
+        self.lhs = OutEdge.data;
+        self.rhs = OutEdge.data;
+        self.result = InEdge.data(self.asNode);
+
+        return 0;
+    }
+
+    /// Frees all resources allocated by this node and sets it to an uninitialized state.
+    static void dispose(SubtractionNode* self) {
+        *self = SubtractionNode.init;
+    }
+
+    /// Semantic equality <=> structural equality.
+    bool opEquals(ref const(SubtractionNode) other) const {
+        if (this.lhs != other.lhs) return false;
+        if (this.rhs != other.rhs) return false;
+        return true;
     }
 
     hash_t toHash() const {
-        return 0;
+        return (this.lhs.toHash() - this.rhs.toHash()).hashOf;
     }
+
+    /// Adjusts in-edge slots after a move.
+    void opPostMove(ref const(SubtractionNode) old) pure {
+        this.result.owner = this.asNode;
+    }
+}
+
+@nogc nothrow unittest {
+    SubtractionNode tmp = void;
+    SubtractionNode.initialize(&tmp);
+    //
+    SubtractionNode sub = void;
+    moveEmplace(tmp, sub);
+    //
+    assert(sub == sub);
+    assert(sub.result.owner == sub.asNode);
+    //
+    SubtractionNode.dispose(&sub);
 }
 
 /++
@@ -1146,24 +2307,70 @@ struct SubtractionNoOverflowSignedNode {
 
     /// Left-hand-side operand.
     OutEdge lhs;
-    invariant (lhs.kind == EdgeKind.data);
 
     /// Right-hand-side operand.
     OutEdge rhs;
-    invariant (rhs.kind == EdgeKind.data);
 
     /// Result of the subtraction.
     InEdge result;
-    invariant (result.kind == EdgeKind.data);
 
- @nogc nothrow: // TODO
-    bool opEquals(ref const(typeof(this)) rhs) const {
-        return this is rhs;
+ @nogc nothrow:
+    /++
+    Initializes a subtraction node.
+
+    Params:
+        self = Address of node being initialized.
+
+    Returns:
+        Zero on success, non-zero on failure (null node).
+    +/
+    static err_t initialize(SubtractionNoOverflowSignedNode* self)
+    in (self != null)
+    {
+        if (self == null) return EINVAL;
+        *self = SubtractionNoOverflowSignedNode.init;
+
+        self.vptr = &SubtractionNoOverflowSignedNode.vtbl;
+        self.lhs = OutEdge.data;
+        self.rhs = OutEdge.data;
+        self.result = InEdge.data(self.asNode);
+
+        return 0;
+    }
+
+    /// Frees all resources allocated by this node and sets it to an uninitialized state.
+    static void dispose(SubtractionNoOverflowSignedNode* self) {
+        *self = SubtractionNoOverflowSignedNode.init;
+    }
+
+    /// Semantic equality <=> structural equality.
+    bool opEquals(ref const(SubtractionNoOverflowSignedNode) other) const {
+        if (this.lhs != other.lhs) return false;
+        if (this.rhs != other.rhs) return false;
+        return true;
     }
 
     hash_t toHash() const {
-        return 0;
+        return (this.lhs.toHash() - this.rhs.toHash()).hashOf;
     }
+
+    /// Adjusts in-edge slots after a move.
+    void opPostMove(ref const(SubtractionNoOverflowSignedNode) old) pure {
+        this.result.owner = this.asNode;
+    }
+}
+
+@nogc nothrow unittest {
+    SubtractionNoOverflowSignedNode tmp = void;
+    SubtractionNoOverflowSignedNode.initialize(&tmp);
+    //
+    SubtractionNoOverflowSignedNode subnos = void;
+    moveEmplace(tmp, subnos);
+    //
+    assert(subnos == subnos);
+    assert(subnos.result.owner == subnos.asNode);
+    //
+    SubtractionNoOverflowSignedNode.dispose(&subnos);
 }
 
 /++
@@ -1179,24 +2386,69 @@ struct MultiplicationNode {
 
     /// Resulting product.
     InEdge result;
-    invariant (result.kind == EdgeKind.data);
 
-    /// Set of operands (unordered due to commutativity).
-    HashSet!OutEdge operands;
-    invariant {
-        assert(operands.length >= 2);
-        foreach (operand; operands.byKey)
-            assert(operand.kind == EdgeKind.data);
+    /// Set of operands (order does not matter).
+    UnsafeHashSet!OutEdge operands;
+
+ @nogc nothrow:
+    /++
+    Initializes an addition node.
+
+    Params:
+        self = Address of node being initialized.
+        n = Number of operands to pre-allocate.
+
+    Returns:
+        Zero on success, non-zero on failure (null node, OOM or invalid number of operands).
+    +/
+    static err_t initialize(MultiplicationNode* self, uint n = 2)
+    in (self != null && n >= 2)
+    {
+        if (self == null) return EINVAL;
+        if (n < 2) return EINVAL;
+        *self = MultiplicationNode.init;
+
+        self.vptr = &MultiplicationNode.vtbl;
+        self.result = InEdge.data(self.asNode);
+        self.operands = UnsafeHashSet!(OutEdge)();
+        const error = self.operands.rehash(n);
+        if (error) return ENOMEM;
+
+        return 0;
     }
 
- @nogc nothrow: // TODO
-    bool opEquals(ref const(typeof(this)) rhs) const {
-        return this is rhs;
+    /// Frees all resources allocated by this node and sets it to an uninitialized state.
+    static void dispose(MultiplicationNode* self) {
+        self.operands.dispose();
+        *self = MultiplicationNode.init;
+    }
+
+    /// Semantic equality <=> structural equality.
+    bool opEquals(ref const(MultiplicationNode) rhs) const {
+        return this.operands == rhs.operands;
     }
 
     hash_t toHash() const {
-        return 0;
+        return this.operands.toHash();
     }
+
+    /// Adjusts in-edge slots after a move.
+    void opPostMove(ref const(MultiplicationNode) old) pure {
+        this.result.owner = this.asNode;
+    }
+}
+
+@nogc nothrow unittest {
+    MultiplicationNode tmp = void;
+    MultiplicationNode.initialize(&tmp);
+    //
+    MultiplicationNode mul = void;
+    moveEmplace(tmp, mul);
+    //
+    assert(mul == mul);
+    assert(mul.result.owner == mul.asNode);
+    //
+    MultiplicationNode.dispose(&mul);
 }
 
 /++
@@ -1211,24 +2463,69 @@ struct MultiplicationNoOverflowSignedNode {
 
     /// Resulting product.
     InEdge result;
-    invariant (result.kind == EdgeKind.data);
 
-    /// Set of operands (unordered due to commutativity).
-    HashSet!OutEdge operands;
-    invariant {
-        assert(operands.length >= 2);
-        foreach (operand; operands.byKey)
-            assert(operand.kind == EdgeKind.data);
+    /// Set of operands (order does not matter).
+    UnsafeHashSet!OutEdge operands;
+
+ @nogc nothrow:
+    /++
+    Initializes an addition node.
+
+    Params:
+        self = Address of node being initialized.
+        n = Number of operands to pre-allocate.
+
+    Returns:
+        Zero on success, non-zero on failure (null node, OOM or invalid number of operands).
+    +/
+    static err_t initialize(MultiplicationNoOverflowSignedNode* self, uint n = 2)
+    in (self != null && n >= 2)
+    {
+        if (self == null) return EINVAL;
+        if (n < 2) return EINVAL;
+        *self = MultiplicationNoOverflowSignedNode.init;
+
+        self.vptr = &MultiplicationNoOverflowSignedNode.vtbl;
+        self.result = InEdge.data(self.asNode);
+        self.operands = UnsafeHashSet!(OutEdge)();
+        const error = self.operands.rehash(n);
+        if (error) return ENOMEM;
+
+        return 0;
     }
 
- @nogc nothrow: // TODO
-    bool opEquals(ref const(typeof(this)) rhs) const {
-        return this is rhs;
+    /// Frees all resources allocated by this node and sets it to an uninitialized state.
+    static void dispose(MultiplicationNoOverflowSignedNode* self) {
+        self.operands.dispose();
+        *self = MultiplicationNoOverflowSignedNode.init;
+    }
+
+    /// Semantic equality <=> structural equality.
+    bool opEquals(ref const(MultiplicationNoOverflowSignedNode) rhs) const {
+        return this.operands == rhs.operands;
     }
 
     hash_t toHash() const {
-        return 0;
+        return this.operands.toHash();
     }
+
+    /// Adjusts in-edge slots after a move.
+    void opPostMove(ref const(MultiplicationNoOverflowSignedNode) old) pure {
+        this.result.owner = this.asNode;
+    }
+}
+
+@nogc nothrow unittest {
+    MultiplicationNoOverflowSignedNode tmp = void;
+    MultiplicationNoOverflowSignedNode.initialize(&tmp);
+    //
+    MultiplicationNoOverflowSignedNode mulnos = void;
+    moveEmplace(tmp, mulnos);
+    //
+    assert(mulnos == mulnos);
+    assert(mulnos.result.owner == mulnos.asNode);
+    //
+    MultiplicationNoOverflowSignedNode.dispose(&mulnos);
 }
 
 /++
@@ -1243,24 +2540,70 @@ struct UnsignedDivisionNode {
 
     /// Dividend operand.
     OutEdge dividend;
-    invariant (dividend.kind == EdgeKind.data);
 
     /// Divisor operand.
     OutEdge divisor;
-    invariant (divisor.kind == EdgeKind.data);
 
     /// Resulting quotient.
     InEdge quotient;
-    invariant (quotient.kind == EdgeKind.data);
 
- @nogc nothrow: // TODO
-    bool opEquals(ref const(typeof(this)) rhs) const {
-        return this is rhs;
+ @nogc nothrow:
+    /++
+    Initializes a division node.
+
+    Params:
+        self = Address of node being initialized.
+
+    Returns:
+        Zero on success, non-zero on failure (null node).
+    +/
+    static err_t initialize(UnsignedDivisionNode* self)
+    in (self != null)
+    {
+        if (self == null) return EINVAL;
+        *self = UnsignedDivisionNode.init;
+
+        self.vptr = &UnsignedDivisionNode.vtbl;
+        self.dividend = OutEdge.data;
+        self.divisor = OutEdge.data;
+        self.quotient = InEdge.data(self.asNode);
+
+        return 0;
+    }
+
+    /// Frees all resources allocated by this node and sets it to an uninitialized state.
+    static void dispose(UnsignedDivisionNode* self) {
+        *self = UnsignedDivisionNode.init;
+    }
+
+    /// Semantic equality <=> structural equality.
+    bool opEquals(ref const(UnsignedDivisionNode) other) const {
+        if (this.dividend != other.dividend) return false;
+        if (this.divisor != other.divisor) return false;
+        return true;
     }
 
     hash_t toHash() const {
-        return 0;
+        return (this.dividend.toHash() - this.divisor.toHash()).hashOf;
     }
+
+    /// Adjusts in-edge slots after a move.
+    void opPostMove(ref const(UnsignedDivisionNode) old) pure {
+        this.quotient.owner = this.asNode;
+    }
+}
+
+@nogc nothrow unittest {
+    UnsignedDivisionNode tmp = void;
+    UnsignedDivisionNode.initialize(&tmp);
+    //
+    UnsignedDivisionNode divu = void;
+    moveEmplace(tmp, divu);
+    //
+    assert(divu == divu);
+    assert(divu.quotient.owner == divu.asNode);
+    //
+    UnsignedDivisionNode.dispose(&divu);
 }
 
 /++
@@ -1276,24 +2619,70 @@ struct SignedDivisionNode {
 
     /// Dividend operand.
     OutEdge dividend;
-    invariant (dividend.kind == EdgeKind.data);
 
     /// Divisor operand.
     OutEdge divisor;
-    invariant (divisor.kind == EdgeKind.data);
 
     /// Resulting quotient.
     InEdge quotient;
-    invariant (quotient.kind == EdgeKind.data);
 
- @nogc nothrow: // TODO
-    bool opEquals(ref const(typeof(this)) rhs) const {
-        return this is rhs;
+ @nogc nothrow:
+    /++
+    Initializes a division node.
+
+    Params:
+        self = Address of node being initialized.
+
+    Returns:
+        Zero on success, non-zero on failure (null node).
+    +/
+    static err_t initialize(SignedDivisionNode* self)
+    in (self != null)
+    {
+        if (self == null) return EINVAL;
+        *self = SignedDivisionNode.init;
+
+        self.vptr = &SignedDivisionNode.vtbl;
+        self.dividend = OutEdge.data;
+        self.divisor = OutEdge.data;
+        self.quotient = InEdge.data(self.asNode);
+
+        return 0;
+    }
+
+    /// Frees all resources allocated by this node and sets it to an uninitialized state.
+    static void dispose(SignedDivisionNode* self) {
+        *self = SignedDivisionNode.init;
+    }
+
+    /// Semantic equality <=> structural equality.
+    bool opEquals(ref const(SignedDivisionNode) other) const {
+        if (this.dividend != other.dividend) return false;
+        if (this.divisor != other.divisor) return false;
+        return true;
     }
 
     hash_t toHash() const {
-        return 0;
+        return (this.dividend.toHash() - this.divisor.toHash()).hashOf;
     }
+
+    /// Adjusts in-edge slots after a move.
+    void opPostMove(ref const(SignedDivisionNode) old) pure {
+        this.quotient.owner = this.asNode;
+    }
+}
+
+@nogc nothrow unittest {
+    SignedDivisionNode tmp = void;
+    SignedDivisionNode.initialize(&tmp);
+    //
+    SignedDivisionNode divs = void;
+    moveEmplace(tmp, divs);
+    //
+    assert(divs == divs);
+    assert(divs.quotient.owner == divs.asNode);
+    //
+    SignedDivisionNode.dispose(&divs);
 }
 
 /++
@@ -1308,24 +2697,70 @@ struct UnsignedRemainderNode {
 
     /// Dividend operand.
     OutEdge dividend;
-    invariant (dividend.kind == EdgeKind.data);
 
     /// Divisor operand.
     OutEdge divisor;
-    invariant (divisor.kind == EdgeKind.data);
 
     /// Resulting remainder.
     InEdge remainder;
-    invariant (remainder.kind == EdgeKind.data);
 
- @nogc nothrow: // TODO
-    bool opEquals(ref const(typeof(this)) rhs) const {
-        return this is rhs;
+ @nogc nothrow:
+    /++
+    Initializes a remainder node.
+
+    Params:
+        self = Address of node being initialized.
+
+    Returns:
+        Zero on success, non-zero on failure (null node).
+    +/
+    static err_t initialize(UnsignedRemainderNode* self)
+    in (self != null)
+    {
+        if (self == null) return EINVAL;
+        *self = UnsignedRemainderNode.init;
+
+        self.vptr = &UnsignedRemainderNode.vtbl;
+        self.dividend = OutEdge.data;
+        self.divisor = OutEdge.data;
+        self.remainder = InEdge.data(self.asNode);
+
+        return 0;
+    }
+
+    /// Frees all resources allocated by this node and sets it to an uninitialized state.
+    static void dispose(UnsignedRemainderNode* self) {
+        *self = UnsignedRemainderNode.init;
+    }
+
+    /// Semantic equality <=> structural equality.
+    bool opEquals(ref const(UnsignedRemainderNode) other) const {
+        if (this.dividend != other.dividend) return false;
+        if (this.divisor != other.divisor) return false;
+        return true;
     }
 
     hash_t toHash() const {
-        return 0;
+        return (this.dividend.toHash() - this.divisor.toHash()).hashOf;
     }
+
+    /// Adjusts in-edge slots after a move.
+    void opPostMove(ref const(UnsignedRemainderNode) old) pure {
+        this.remainder.owner = this.asNode;
+    }
+}
+
+@nogc nothrow unittest {
+    UnsignedRemainderNode tmp = void;
+    UnsignedRemainderNode.initialize(&tmp);
+    //
+    UnsignedRemainderNode remu = void;
+    moveEmplace(tmp, remu);
+    //
+    assert(remu == remu);
+    assert(remu.remainder.owner == remu.asNode);
+    //
+    UnsignedRemainderNode.dispose(&remu);
 }
 
 /++
@@ -1341,24 +2776,70 @@ struct SignedRemainderNode {
 
     /// Dividend operand.
     OutEdge dividend;
-    invariant (dividend.kind == EdgeKind.data);
 
     /// Divisor operand.
     OutEdge divisor;
-    invariant (divisor.kind == EdgeKind.data);
 
     /// Resulting remainder.
     InEdge remainder;
-    invariant (remainder.kind == EdgeKind.data);
 
- @nogc nothrow: // TODO
-    bool opEquals(ref const(typeof(this)) rhs) const {
-        return this is rhs;
+ @nogc nothrow:
+    /++
+    Initializes a remainder node.
+
+    Params:
+        self = Address of node being initialized.
+
+    Returns:
+        Zero on success, non-zero on failure (null node).
+    +/
+    static err_t initialize(SignedRemainderNode* self)
+    in (self != null)
+    {
+        if (self == null) return EINVAL;
+        *self = SignedRemainderNode.init;
+
+        self.vptr = &SignedRemainderNode.vtbl;
+        self.dividend = OutEdge.data;
+        self.divisor = OutEdge.data;
+        self.remainder = InEdge.data(self.asNode);
+
+        return 0;
+    }
+
+    /// Frees all resources allocated by this node and sets it to an uninitialized state.
+    static void dispose(SignedRemainderNode* self) {
+        *self = SignedRemainderNode.init;
+    }
+
+    /// Semantic equality <=> structural equality.
+    bool opEquals(ref const(SignedRemainderNode) other) const {
+        if (this.dividend != other.dividend) return false;
+        if (this.divisor != other.divisor) return false;
+        return true;
     }
 
     hash_t toHash() const {
-        return 0;
+        return (this.dividend.toHash() - this.divisor.toHash()).hashOf;
     }
+
+    /// Adjusts in-edge slots after a move.
+    void opPostMove(ref const(SignedRemainderNode) old) pure {
+        this.remainder.owner = this.asNode;
+    }
+}
+
+@nogc nothrow unittest {
+    SignedRemainderNode tmp = void;
+    SignedRemainderNode.initialize(&tmp);
+    //
+    SignedRemainderNode rems = void;
+    moveEmplace(tmp, rems);
+    //
+    assert(rems == rems);
+    assert(rems.remainder.owner == rems.asNode);
+    //
+    SignedRemainderNode.dispose(&rems);
 }
 
 /// Compares two bit patterns for equality.
@@ -1367,24 +2848,70 @@ struct EqualNode {
 
     /// Left-hand-side operand.
     OutEdge lhs;
-    invariant (lhs.kind == EdgeKind.data);
 
     /// Right-hand-side operand.
     OutEdge rhs;
-    invariant (rhs.kind == EdgeKind.data);
 
     /// A single resulting bit indicating whether operands are equal.
     InEdge result;
-    invariant (result.kind == EdgeKind.data);
 
- @nogc nothrow: // TODO
-    bool opEquals(ref const(typeof(this)) rhs) const {
-        return this is rhs;
+ @nogc nothrow:
+    /++
+    Initializes an equal node.
+
+    Params:
+        self = Address of node being initialized.
+
+    Returns:
+        Zero on success, non-zero on failure (null node).
+    +/
+    static err_t initialize(EqualNode* self)
+    in (self != null)
+    {
+        if (self == null) return EINVAL;
+        *self = EqualNode.init;
+
+        self.vptr = &EqualNode.vtbl;
+        self.lhs = OutEdge.data;
+        self.rhs = OutEdge.data;
+        self.result = InEdge.data(self.asNode);
+
+        return 0;
+    }
+
+    /// Frees all resources allocated by this node and sets it to an uninitialized state.
+    static void dispose(EqualNode* self) {
+        *self = EqualNode.init;
+    }
+
+    /// Semantic equality <=> structural equality.
+    bool opEquals(ref const(EqualNode) other) const {
+        if (this.lhs != other.lhs) return false;
+        if (this.rhs != other.rhs) return false;
+        return true;
     }
 
     hash_t toHash() const {
-        return 0;
+        return this.lhs.toHash() ^ this.rhs.toHash();
     }
+
+    /// Adjusts in-edge slots after a move.
+    void opPostMove(ref const(EqualNode) old) pure {
+        this.result.owner = this.asNode;
+    }
+}
+
+@nogc nothrow unittest {
+    EqualNode tmp = void;
+    EqualNode.initialize(&tmp);
+    //
+    EqualNode eq = void;
+    moveEmplace(tmp, eq);
+    //
+    assert(eq == eq);
+    assert(eq.result.owner == eq.asNode);
+    //
+    EqualNode.dispose(&eq);
 }
 
 /// Compares two bit patterns for inequality.
@@ -1393,24 +2920,70 @@ struct NotEqualNode {
 
     /// Left-hand-side operand.
     OutEdge lhs;
-    invariant (lhs.kind == EdgeKind.data);
 
     /// Right-hand-side operand.
     OutEdge rhs;
-    invariant (rhs.kind == EdgeKind.data);
 
     /// A single resulting bit indicating whether operands are different.
     InEdge result;
-    invariant (result.kind == EdgeKind.data);
 
- @nogc nothrow: // TODO
-    bool opEquals(ref const(typeof(this)) rhs) const {
-        return this is rhs;
+ @nogc nothrow:
+    /++
+    Initializes a not-equal node.
+
+    Params:
+        self = Address of node being initialized.
+
+    Returns:
+        Zero on success, non-zero on failure (null node).
+    +/
+    static err_t initialize(NotEqualNode* self)
+    in (self != null)
+    {
+        if (self == null) return EINVAL;
+        *self = NotEqualNode.init;
+
+        self.vptr = &NotEqualNode.vtbl;
+        self.lhs = OutEdge.data;
+        self.rhs = OutEdge.data;
+        self.result = InEdge.data(self.asNode);
+
+        return 0;
+    }
+
+    /// Frees all resources allocated by this node and sets it to an uninitialized state.
+    static void dispose(NotEqualNode* self) {
+        *self = NotEqualNode.init;
+    }
+
+    /// Semantic equality <=> structural equality.
+    bool opEquals(ref const(NotEqualNode) other) const {
+        if (this.lhs != other.lhs) return false;
+        if (this.rhs != other.rhs) return false;
+        return true;
     }
 
     hash_t toHash() const {
-        return 0;
+        return this.lhs.toHash() ^ this.rhs.toHash();
     }
+
+    /// Adjusts in-edge slots after a move.
+    void opPostMove(ref const(NotEqualNode) old) pure {
+        this.result.owner = this.asNode;
+    }
+}
+
+@nogc nothrow unittest {
+    NotEqualNode tmp = void;
+    NotEqualNode.initialize(&tmp);
+    //
+    NotEqualNode ne = void;
+    moveEmplace(tmp, ne);
+    //
+    assert(ne == ne);
+    assert(ne.result.owner == ne.asNode);
+    //
+    NotEqualNode.dispose(&ne);
 }
 
 /++
@@ -1423,24 +2996,70 @@ struct UnsignedLessThanNode {
 
     /// Left-hand-side operand.
     OutEdge lhs;
-    invariant (lhs.kind == EdgeKind.data);
 
     /// Right-hand-side operand.
     OutEdge rhs;
-    invariant (rhs.kind == EdgeKind.data);
 
     /// A single resulting bit indicating `lhs < rhs`.
     InEdge result;
-    invariant (result.kind == EdgeKind.data);
 
- @nogc nothrow: // TODO
-    bool opEquals(ref const(typeof(this)) rhs) const {
-        return this is rhs;
+ @nogc nothrow:
+    /++
+    Initializes a unsigned-less-than node.
+
+    Params:
+        self = Address of node being initialized.
+
+    Returns:
+        Zero on success, non-zero on failure (null node).
+    +/
+    static err_t initialize(UnsignedLessThanNode* self)
+    in (self != null)
+    {
+        if (self == null) return EINVAL;
+        *self = UnsignedLessThanNode.init;
+
+        self.vptr = &UnsignedLessThanNode.vtbl;
+        self.lhs = OutEdge.data;
+        self.rhs = OutEdge.data;
+        self.result = InEdge.data(self.asNode);
+
+        return 0;
+    }
+
+    /// Frees all resources allocated by this node and sets it to an uninitialized state.
+    static void dispose(UnsignedLessThanNode* self) {
+        *self = UnsignedLessThanNode.init;
+    }
+
+    /// Semantic equality <=> structural equality.
+    bool opEquals(ref const(UnsignedLessThanNode) other) const {
+        if (this.lhs != other.lhs) return false;
+        if (this.rhs != other.rhs) return false;
+        return true;
     }
 
     hash_t toHash() const {
-        return 0;
+        return (this.lhs.toHash() - this.rhs.toHash()).hashOf;
     }
+
+    /// Adjusts in-edge slots after a move.
+    void opPostMove(ref const(UnsignedLessThanNode) old) pure {
+        this.result.owner = this.asNode;
+    }
+}
+
+@nogc nothrow unittest {
+    UnsignedLessThanNode tmp = void;
+    UnsignedLessThanNode.initialize(&tmp);
+    //
+    UnsignedLessThanNode ltu = void;
+    moveEmplace(tmp, ltu);
+    //
+    assert(ltu == ltu);
+    assert(ltu.result.owner == ltu.asNode);
+    //
+    UnsignedLessThanNode.dispose(&ltu);
 }
 
 /++
@@ -1453,24 +3072,70 @@ struct SignedLessThanNode {
 
     /// Left-hand-side operand.
     OutEdge lhs;
-    invariant (lhs.kind == EdgeKind.data);
 
     /// Right-hand-side operand.
     OutEdge rhs;
-    invariant (rhs.kind == EdgeKind.data);
 
     /// A single resulting bit indicating `lhs < rhs`.
     InEdge result;
-    invariant (result.kind == EdgeKind.data);
 
- @nogc nothrow: // TODO
-    bool opEquals(ref const(typeof(this)) rhs) const {
-        return this is rhs;
+ @nogc nothrow:
+    /++
+    Initializes a signed-less-than node.
+
+    Params:
+        self = Address of node being initialized.
+
+    Returns:
+        Zero on success, non-zero on failure (null node).
+    +/
+    static err_t initialize(SignedLessThanNode* self)
+    in (self != null)
+    {
+        if (self == null) return EINVAL;
+        *self = SignedLessThanNode.init;
+
+        self.vptr = &SignedLessThanNode.vtbl;
+        self.lhs = OutEdge.data;
+        self.rhs = OutEdge.data;
+        self.result = InEdge.data(self.asNode);
+
+        return 0;
+    }
+
+    /// Frees all resources allocated by this node and sets it to an uninitialized state.
+    static void dispose(SignedLessThanNode* self) {
+        *self = SignedLessThanNode.init;
+    }
+
+    /// Semantic equality <=> structural equality.
+    bool opEquals(ref const(SignedLessThanNode) other) const {
+        if (this.lhs != other.lhs) return false;
+        if (this.rhs != other.rhs) return false;
+        return true;
     }
 
     hash_t toHash() const {
-        return 0;
+        return (this.lhs.toHash() - this.rhs.toHash()).hashOf;
     }
+
+    /// Adjusts in-edge slots after a move.
+    void opPostMove(ref const(SignedLessThanNode) old) pure {
+        this.result.owner = this.asNode;
+    }
+}
+
+@nogc nothrow unittest {
+    SignedLessThanNode tmp = void;
+    SignedLessThanNode.initialize(&tmp);
+    //
+    SignedLessThanNode lts = void;
+    moveEmplace(tmp, lts);
+    //
+    assert(lts == lts);
+    assert(lts.result.owner == lts.asNode);
+    //
+    SignedLessThanNode.dispose(&lts);
 }
 
 /++
@@ -1483,24 +3148,70 @@ struct UnsignedGreaterOrEqualNode {
 
     /// Left-hand-side operand.
     OutEdge lhs;
-    invariant (lhs.kind == EdgeKind.data);
 
     /// Right-hand-side operand.
     OutEdge rhs;
-    invariant (rhs.kind == EdgeKind.data);
 
     /// A single resulting bit indicating `lhs >= rhs`.
     InEdge result;
-    invariant (result.kind == EdgeKind.data);
 
- @nogc nothrow: // TODO
-    bool opEquals(ref const(typeof(this)) rhs) const {
-        return this is rhs;
+ @nogc nothrow:
+    /++
+    Initializes an unsigned-greater-than-or-equal-to node.
+
+    Params:
+        self = Address of node being initialized.
+
+    Returns:
+        Zero on success, non-zero on failure (null node).
+    +/
+    static err_t initialize(UnsignedGreaterOrEqualNode* self)
+    in (self != null)
+    {
+        if (self == null) return EINVAL;
+        *self = UnsignedGreaterOrEqualNode.init;
+
+        self.vptr = &UnsignedGreaterOrEqualNode.vtbl;
+        self.lhs = OutEdge.data;
+        self.rhs = OutEdge.data;
+        self.result = InEdge.data(self.asNode);
+
+        return 0;
+    }
+
+    /// Frees all resources allocated by this node and sets it to an uninitialized state.
+    static void dispose(UnsignedGreaterOrEqualNode* self) {
+        *self = UnsignedGreaterOrEqualNode.init;
+    }
+
+    /// Semantic equality <=> structural equality.
+    bool opEquals(ref const(UnsignedGreaterOrEqualNode) other) const {
+        if (this.lhs != other.lhs) return false;
+        if (this.rhs != other.rhs) return false;
+        return true;
     }
 
     hash_t toHash() const {
-        return 0;
+        return (this.lhs.toHash() - this.rhs.toHash()).hashOf;
     }
+
+    /// Adjusts in-edge slots after a move.
+    void opPostMove(ref const(UnsignedGreaterOrEqualNode) old) pure {
+        this.result.owner = this.asNode;
+    }
+}
+
+@nogc nothrow unittest {
+    UnsignedGreaterOrEqualNode tmp = void;
+    UnsignedGreaterOrEqualNode.initialize(&tmp);
+    //
+    UnsignedGreaterOrEqualNode geu = void;
+    moveEmplace(tmp, geu);
+    //
+    assert(geu == geu);
+    assert(geu.result.owner == geu.asNode);
+    //
+    UnsignedGreaterOrEqualNode.dispose(&geu);
 }
 
 /++
@@ -1513,24 +3224,70 @@ struct SignedGreaterOrEqualNode {
 
     /// Left-hand-side operand.
     OutEdge lhs;
-    invariant (lhs.kind == EdgeKind.data);
 
     /// Right-hand-side operand.
     OutEdge rhs;
-    invariant (rhs.kind == EdgeKind.data);
 
     /// A single resulting bit indicating `lhs >= rhs`.
     InEdge result;
-    invariant (result.kind == EdgeKind.data);
 
- @nogc nothrow: // TODO
-    bool opEquals(ref const(typeof(this)) rhs) const {
-        return this is rhs;
+ @nogc nothrow:
+    /++
+    Initializes a signed-greater-than-or-equal-to node.
+
+    Params:
+        self = Address of node being initialized.
+
+    Returns:
+        Zero on success, non-zero on failure (null node).
+    +/
+    static err_t initialize(SignedGreaterOrEqualNode* self)
+    in (self != null)
+    {
+        if (self == null) return EINVAL;
+        *self = SignedGreaterOrEqualNode.init;
+
+        self.vptr = &SignedGreaterOrEqualNode.vtbl;
+        self.lhs = OutEdge.data;
+        self.rhs = OutEdge.data;
+        self.result = InEdge.data(self.asNode);
+
+        return 0;
+    }
+
+    /// Frees all resources allocated by this node and sets it to an uninitialized state.
+    static void dispose(SignedGreaterOrEqualNode* self) {
+        *self = SignedGreaterOrEqualNode.init;
+    }
+
+    /// Semantic equality <=> structural equality.
+    bool opEquals(ref const(SignedGreaterOrEqualNode) other) const {
+        if (this.lhs != other.lhs) return false;
+        if (this.rhs != other.rhs) return false;
+        return true;
     }
 
     hash_t toHash() const {
-        return 0;
+        return (this.lhs.toHash() - this.rhs.toHash()).hashOf;
     }
+
+    /// Adjusts in-edge slots after a move.
+    void opPostMove(ref const(SignedGreaterOrEqualNode) old) pure {
+        this.result.owner = this.asNode;
+    }
+}
+
+@nogc nothrow unittest {
+    SignedGreaterOrEqualNode tmp = void;
+    SignedGreaterOrEqualNode.initialize(&tmp);
+    //
+    SignedGreaterOrEqualNode ges = void;
+    moveEmplace(tmp, ges);
+    //
+    assert(ges == ges);
+    assert(ges.result.owner == ges.asNode);
+    //
+    SignedGreaterOrEqualNode.dispose(&ges);
 }
 
 

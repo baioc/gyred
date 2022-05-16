@@ -33,19 +33,19 @@ Params:
     n = Number of contiguous elements to allocate.
 
 Returns:
-    Pointer to the allocated memory, or null in case of OOM, overflow or zero-sized allocation.
+    Allocated memory block (null in case of OOM, overflow or zero-sized allocation).
 
 Version:
     XXX: It would have been nice to parameterize this by global structs following the same duck-typed interface of the [core std.experimental allocators](https://dlang.org/phobos/std_experimental_allocator.html), but they don't seem to be linked in when compiling in betterC mode.
 +/
-T* allocate(T)(size_t n = 1) @nogc nothrow
+T[] allocate(T)(size_t n) @nogc nothrow
 @trusted // because malloc and friends can be trusted (there's also the cast)
 {
     import core.checkedint : mulu;
 
     bool overflow = false;
     const size_t totalBytes = mulu(n, T.sizeof, overflow);
-    if (overflow) return null;
+    if (overflow || totalBytes == 0) return [];
 
     version (D_BetterC) {
         void* ptr = malloc(totalBytes);
@@ -57,30 +57,58 @@ T* allocate(T)(size_t n = 1) @nogc nothrow
         }
     }
 
-    return cast(T*) ptr;
+    debug version (Eris_VerboseAllocations) if (ptr != null) {
+        const current = allocated.atomicOp!"+="(totalBytes);
+        fprintf(stderr, "Allocated bytes: %lu\n", current);
+    }
+    return ptr != null ? (cast(T*)ptr)[0 .. n] : [];
+}
+
+/// ditto
+T* allocate(T)() @nogc nothrow
+@trusted // because of direct ptr access
+{
+    T[] memory = allocate!T(1);
+    return memory.ptr;
+}
+
+debug version (Eris_VerboseAllocations) {
+    import core.atomic : atomicOp;
+    import core.stdc.stdio : fprintf, stderr;
+    private shared size_t allocated = 0;
 }
 
 /++
 Frees previously [allocate]d memory block.
 
 Params:
-    ptr = Pointer to previously [allocate]d memory block (or null, in which case nothing happens).
-    n = Must match the parameter used to [allocate] the given block.
+    memory = Previously [allocate]d memory block (or null, in which case nothing happens).
 +/
-void deallocate(T)(T* ptr, size_t n = 1) @nogc nothrow @system {
+void deallocate(T)(T[] memory) @nogc nothrow @system {
+    debug version (Eris_VerboseAllocations) if (memory != null) {
+        const totalBytes = memory.length * T.sizeof;
+        const current = allocated.atomicOp!"-="(totalBytes);
+        fprintf(stderr, "Allocated bytes: %lu\n", current);
+    }
     version (D_BetterC) {} else {
         static if (hasIndirections!T) {
             import core.memory : GC;
-            GC.removeRange(ptr);
+            GC.removeRange(memory.ptr);
         }
     }
-    free(ptr);
+    free(memory.ptr);
+}
+
+/// ditto
+void deallocate(T)(T* memory) @nogc nothrow @system {
+    deallocate(memory[0 .. 1]);
 }
 
 /// Consider using `scope(exit)` to ensure deallocation (but beware of double frees).
 @nogc nothrow unittest {
     auto cacheLine = allocate!ubyte(64);
-    scope(exit) deallocate(cacheLine, 64);
+    scope(exit) cacheLine.deallocate();
+    assert(cacheLine != null);
 }
 
 
