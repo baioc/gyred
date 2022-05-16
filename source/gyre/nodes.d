@@ -353,7 +353,9 @@ private mixin template NodeInheritance() {
             "common node prefix must be at a zero offset for safe polymorphism"
         );
 
-        inout(Node)* asNode() inout pure {
+        inout(Node)* asNode() inout pure
+        return /// XXX: return annotation needed in DMD 2.100.0
+        {
             return cast(inout(Node)*)&this._node;
         }
 
