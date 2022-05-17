@@ -15,7 +15,6 @@ NOTE: The implementation does NOT attempt to handle overflows. Use a custom type
 struct Rational(Z) if (__traits(isPOD, Z)) {
     private Z _numerator = 0;
     private Z _denominator = 1;
-    invariant (_denominator > 0, "denominator must always be positive");
 
  pragma(inline):
     /// Reduced-form numerator.
@@ -31,6 +30,7 @@ struct Rational(Z) if (__traits(isPOD, Z)) {
     /// Constructs a Rational from given numerator and (non-zero) denominator.
     this(inout(Z) numerator, inout(Z) denominator = 1) inout
     in (denominator != 0, "denominator must not be zero")
+    out (; this.denominator > 0, "denominator must always be positive")
     {
         const bool invert = denominator < 0;
         auto num = invert ? -numerator : numerator;

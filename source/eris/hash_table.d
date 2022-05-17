@@ -13,10 +13,9 @@ import core.lifetime : forward;
 import core.stdc.errno : ENOMEM, EINVAL;
 import std.algorithm.mutation : moveEmplace, swap;
 import std.math.traits : isPowerOf2;
-import std.meta : ApplyRight;
 import std.traits : Parameters, ReturnType;
 
-import eris.core : allocate, deallocate, err_t, Unit, hash_t;
+import eris.core : allocate, deallocate, err_t, hash_t, Unit;
 import eris.rational : Rational;
 import eris.util : RefCountedTrusted;
 
@@ -43,7 +42,7 @@ private {
 
     // static settings
     enum maxLoadFactor = Rational!size_t(3, 4);
-    enum size_t minAllocatedSize = 8;
+    enum size_t minAllocatedSize = 4;
 
     // Returns the index where the given key is or would be placed.
     size_t probeFor(Key)(const(Bucket!(Key)[]) buckets, ref const(Key) key)
@@ -117,18 +116,11 @@ struct UnsafeHashMap(Key, Value) {
     alias Bucket = .Bucket!Key;
 
     Bucket[] buckets = null;
-
     size_t occupied = 0;
-    invariant (occupied <= buckets.length);
-
     size_t used = 0;
-    invariant (used <= occupied);
 
     // we only need to allocate a value array if its size is non-zero
-    static if (Value.sizeof > 0) {
-        Value* values = null;
-        invariant ((buckets.ptr == null) == (values == null));
-    }
+    static if (Value.sizeof > 0) Value* values = null;
 
     pragma(inline) {
         @property size_t allocated() const {
@@ -267,7 +259,7 @@ struct UnsafeHashMap(Key, Value) {
     }
 
     private err_t initialize(size_t capacity) nothrow
-    in (this.buckets.ptr == null)
+    in (this.buckets == null)
     out (; this.length == 0)
     {
         if (capacity == 0) return 0;
@@ -292,7 +284,7 @@ struct UnsafeHashMap(Key, Value) {
         this.buckets = allocate!Bucket(capacity);
         if (this.buckets == null) return ENOMEM;
         static if (Value.sizeof > 0) {
-            this.values = () @trusted { return allocate!Value(this.buckets.length).ptr; }();
+            this.values = () @trusted { return allocate!Value(capacity).ptr; }();
             if (this.values == null) {
                 () @trusted { this.buckets.deallocate(); }();
                 this.buckets = null;
@@ -386,8 +378,8 @@ struct UnsafeHashMap(Key, Value) {
         return this.rehash(newCapacity);
     }
 
-    private pragma(inline) bool getEntry()(
-        auto ref const(Key) needle,
+    private pragma(inline) bool getEntry(
+        ref const(Key) needle,
         out inout(Bucket)* bucket,
         out inout(Value)* value
     ) inout
@@ -485,6 +477,7 @@ struct UnsafeHashMap(Key, Value) {
         && is(ReturnType!Update == Value)
         && Parameters!Update.length == 1
         && is(Parameters!Update[0] == Value))
+    out (; this.used <= this.occupied && this.occupied <= this.allocated)
     {
         // check whether a load factor increase needs to trigger a rehash
         if (this.occupied + 1 > this.capacity) {
@@ -573,7 +566,7 @@ struct UnsafeHashMap(Key, Value) {
     )
     if (is(ReturnType!Create == Value) && Parameters!Create.length == 0)
     {
-        return this.update(key, create, x => x, error);
+        return this.update(key, create, (ref Value x) => x, error);
     }
 
     /// ditto
@@ -599,16 +592,6 @@ struct UnsafeHashMap(Key, Value) {
                 if (bucket.isOccupied && !bucket.wasDeleted) break;
             }
             this.index = i;
-        }
-
-        invariant {
-            if (this.index < this.table.buckets.length) {
-                auto bucket = &this.table.buckets[this.index];
-                assert(
-                    bucket.isOccupied && !bucket.wasDeleted,
-                    "tried using an invalidated hash table range"
-                );
-            }
         }
 
         public bool empty() const {
@@ -806,7 +789,7 @@ Unordered hash set.
 
 See_Also: The safer [HashSet]
 +/
-alias UnsafeHashSet = ApplyRight!(UnsafeHashMap, Unit);
+alias UnsafeHashSet(T) = UnsafeHashMap!(T, Unit);
 
 ///
 @nogc nothrow @safe unittest {
@@ -999,16 +982,6 @@ struct HashMap(Key, Value) {
             this.index = i;
         }
 
-        invariant {
-            if (this.table.isInitialized && this.index < this.table.impl.buckets.length) {
-                auto bucket = &this.table.impl.buckets[this.index];
-                assert(
-                    bucket.isOccupied && !bucket.wasDeleted,
-                    "tried using an invalidated hash table range"
-                );
-            }
-        }
-
         public bool empty() const {
             return !this.table.isInitialized || this.index >= this.table.impl.buckets.length;
         }
@@ -1098,4 +1071,4 @@ struct HashMap(Key, Value) {
 }
 
 /// Safe version of [UnsafeHashSet].
-alias HashSet = ApplyRight!(HashMap, Unit);
+alias HashSet(T) = HashMap!(T, Unit);

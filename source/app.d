@@ -2,7 +2,7 @@ import core.stdc.stdlib : atoi, rand, srand;
 import core.stdc.stdio : printf, fprintf, stderr;
 import core.stdc.time : clock, clock_t, CLOCKS_PER_SEC;
 
-import eris.hash_table;
+import eris.hash_table : HashMap;
 
 
 version (D_BetterC) {

@@ -8,7 +8,7 @@ Each structure's documentation also explains its intended semantics, albeit this
 Poison_values_and_UB:
 
 In Gyre, every operation may have some conditions imposed on its inputs in order to produce correct behavior / a sane value.
-When the result of a data-only operation isn't well-defined (e.g. integer division by zero), it produces a "poison".
+When the result of a data-only operation isn't well-defined (e.g. [SignedDivisionNode|integer division] by zero), it produces a "poison".
 Poison values, as in [LLVM](https://llvm.org/docs/LangRef.html#poison-values), indicate invalid program behavior;  it is as if every instance of a poison value came from the result of `0/0`.
 Furthermore, these values are "poisonous" because any operation with a result which depends on a poison operand will also produce poison.
 Note that in some cases a result doesn't actually depend on the value of (all of) its operands (e.g. `x * 0` is always `0`).
@@ -47,20 +47,19 @@ import std.bitmanip : taggedPointer;
 import std.traits : EnumMembers;
 
 import eris.core : hash_t, err_t, allocate, deallocate;
-import eris.hash_table;
+import eris.hash_table : UnsafeHashMap;
 
 
 /++
 Possible edge kinds.
-
-Please note the directionality difference between "dependency" and "flow" edges.
-
 
 Each Gyre node has one or more "edge slots", which act as directed connectors.
 This means that nodes don't reference each other directly.
 Instead, they contain slots which connect to the slots of other nodes.
 There are different kinds of edge slots, which indicate their meaning.
 RULE: Every pair of connecting edge slots must have a matching kind.
+
+Please note the directionality difference between "dependency" and "flow" edges.
 
 See_Also: [OutEdge], [InEdge]
 +/
@@ -96,15 +95,25 @@ private mixin template StaticEdgeFactories() {
 /++
 An outgoing edge slot.
 
-Connects to either zero or exactly one [InEdge].
+Connects to exactly one [InEdge].
 +/
 struct OutEdge {
     mixin(taggedPointer!(
-        InEdge*, "target",
+        InEdge*, "_target",
         EdgeKind, "_kind", 2
     ));
 
  pragma(inline) @nogc nothrow:
+    @property InEdge* target() const pure {
+        return this._target;
+    }
+
+    @property void target(InEdge* target) pure
+    in (target == null || target.kind == kind, "connecting edge slots must have matching kinds")
+    {
+        this._target = target;
+    }
+
     @property EdgeKind kind() const pure {
         return this._kind;
     }
@@ -114,9 +123,7 @@ struct OutEdge {
         kind = This edge's kind, fixed on construction.
         target = Must point to a matching in-edge slot.
     +/
-    this(EdgeKind kind, InEdge* target = null) pure
-    in (target == null || target.kind == kind, "connecting edge slots must have matching kinds")
-    {
+    this(EdgeKind kind, InEdge* target = null) pure {
         this._kind = kind;
         this.target = target;
     }
@@ -137,7 +144,6 @@ struct OutEdge {
 
     hash_t toHash() const {
         if (this.target == null) return this.kind.hashOf;
-        assert(this.target.kind == this.kind);
         return this.target.toHash();
     }
 }
@@ -204,11 +210,10 @@ struct InEdge {
     An in-edge slot is only equivalent to another if they represent equal values.
     We approximate this by checking that the slots' owner nodes are equal AND the slots are in a corresponding position in their respective owner (i.e. they stand for the same thing inside that node).
     +/
-    bool opEquals(ref const(InEdge) other) const
-    {
+    bool opEquals(ref const(InEdge) other) const {
         if (this.kind != other.kind) return false;
         if (this.id != other.id) return false;
-        if (this.owner == null && other.owner == null) return true;
+        if (this.owner == other.owner) return true;
         if (this.owner == null || other.owner == null) return false;
         return *this.owner == *other.owner;
     }
@@ -319,7 +324,6 @@ private mixin template NodeInheritance() {
 
     package Node.CommonPrefix _node = { vptr: &vtbl };
     alias _node this;
-    invariant (this.vptr == &vtbl);
 
     package static immutable(Node.VTable) vtbl = {
         opEquals: (const(Node)* lhs, const(Node)* rhs) {
@@ -355,6 +359,7 @@ private mixin template NodeInheritance() {
 
         inout(Node)* asNode() inout pure
         return /// XXX: return annotation needed in DMD 2.100.0
+        in (this.vptr == &vtbl, "can't upcast an uninitialized node")
         {
             return cast(inout(Node)*)&this._node;
         }
@@ -390,6 +395,7 @@ version (unittest) private { // for some reason, this needs to be in global scop
 }
 
 @nogc nothrow unittest {
+    import eris.hash_table : HashSet;
     import eris.util : HashablePointer;
 
     // subtype inherits Node's properties and methods
@@ -432,7 +438,7 @@ They interact with the outside world through zero or more parameters.
 As a join node begins to execute, control flows into its body, where all of its parameters are made available.
 Therefore, a join node behaves like the entry block of a CFG, but with a collection of SSA phis (one for each parameter); so it can be used as an [extended basic block](https://mlir.llvm.org/docs/Rationale/Rationale/#block-arguments-vs-phi-nodes).
 RULE: Gyre graphs can be cyclic, but only if every cycle goes through a join node.
-This is similar to having a DFG with SSA phis, in which data-flow can still be considered causal as long as every cycle goes through phi nodes, indicating a "temporal" control-flow dependency.
+This is similar to having a DFG with SSA phis, in which data-flow can still be considered causal as long as every cycle goes through one or more phi nodes to indicate a "temporal" control-flow dependency.
 
 Since join nodes define subprocedures, one may want to know where such a definitions begins and ends.
 A join node's scope begins with all of its parameters and control flow edges.
@@ -460,65 +466,54 @@ struct JoinNode {
     OutEdge control;
 
     /// Non-empty collection of channels, each containing zero or more of this node's parameters (either data or memory edges).
-    InEdge[][] channels;
+    InEdge[][] channels; // SSO: InEdge[][1] most of the time
 
  @nogc nothrow:
     /++
     Initializes a join node, must be later [dispose]d.
 
+    This procedure initializes the collection of channels and sets up unique indexes for each in-edge slot.
+    Edge slot kinds default to `data`, but this can be later changed by the caller.
+
     Params:
         self = Address of node being initialized.
-        channels = Defines this join node's interface.
+        ms = Number of parameters on each channel.
 
     Returns:
-        Zero on success, non-zero on failure (null node, OOM or invalid edge kinds).
+        Zero on success, non-zero on failure (null node, OOM or invalid number of channels).
     +/
-    static err_t initialize(JoinNode* self, EdgeKind[][] channels)
-    in (self != null && channels.length >= 1)
+    static err_t initialize(JoinNode* self, uint[] ms)
+    in (self != null && ms.length >= 1)
     {
         if (self == null) return EINVAL;
-        if (channels.length == 0) return EINVAL;
-        foreach (parameters; channels) {
-            foreach (paramKind; parameters) {
-                with (EdgeKind) final switch (paramKind) {
-                    case data, memory: break;
-                    case control, type: return EINVAL;
-                }
-            }
-        }
+        if (ms.length < 1) return EINVAL;
         *self = JoinNode.init;
 
         self.vptr = &JoinNode.vtbl;
         self.definition = InEdge.data(self.asNode, 0);
         self.control = OutEdge.control;
 
-        self.channels = allocate!(InEdge[])(channels.length);
+        self.channels = allocate!(InEdge[])(ms.length);
         if (self.channels == null) return ENOMEM;
-
-        InEdge.ID id = 0;
-        foreach (i, parameters; channels) {
-            self.channels[i] = allocate!InEdge(parameters.length);
+        InEdge.ID id = 1;
+        foreach (i, m; ms) {
+            self.channels[i] = allocate!InEdge(m);
 
             // on failure, undo all previous allocations
-            if (parameters.length > 0 && self.channels[i] == null) {
+            if (m > 0 && self.channels[i] == null) {
                 foreach_reverse (previous; 0 .. i) self.channels[previous].deallocate();
                 self.channels.deallocate();
+                self.channels = null;
                 return ENOMEM;
             }
 
-            foreach (j, paramKind; parameters) {
-                self.channels[i][j] = InEdge(paramKind, self.asNode, 1 + id);
+            foreach (j; 0 .. m) {
+                self.channels[i][j] = InEdge.data(self.asNode, id);
                 id++;
             }
         }
 
         return 0;
-    }
-
-    /// ditto
-    static err_t initialize(JoinNode* self, EdgeKind[] parameters ...) {
-        EdgeKind[][1] channels = [parameters];
-        return JoinNode.initialize(self, channels);
     }
 
     /// Frees all resources allocated by this node and sets it to an uninitialized state.
@@ -555,10 +550,11 @@ struct JoinNode {
     }
 }
 
-nothrow unittest {
+@nogc nothrow unittest {
     // initialize one guy
     JoinNode tmp = void;
-    with (EdgeKind) JoinNode.initialize(&tmp, data, memory, data, data);
+    uint[1] channelSizes = [4];
+    JoinNode.initialize(&tmp, channelSizes);
     // move it
     JoinNode join = void;
     moveEmplace(tmp, join);
@@ -577,7 +573,10 @@ Instantiates a [JoinNode|join node].
 Join nodes correspond to static ("dead") subprograms.
 In order to actually use a join node, one must first create a "live" instance of it.
 The result of such an instantiation is a non-empty collection of continuations, one for each channel in the join pattern.
-Then, using a continuation requires one to provide its parameters and [JumpNode|jump] into it.
+Then, using a continuation requires one to provide its parameters and [JumpNode|jump] into it, which may trigger the join node's body.
+
+
+TODO: continuation semantics are unclear w.r.t. multiple uses and scope. e.g.: can a continuation be used more than once (with basic blocks, we would like the answer to be a YES, with return continuations, a NO), or are they consumed when the join triggers? what happens if a continuation is instantiated and never jumped to? what if two threads race to use the same continuation? yet another case is with upwards-escaping continuations, which we want to forbid (so that a function can't return a continuation back into itself)
 
 See_Also: [JoinNode], [JumpNode]
 +/
@@ -588,33 +587,33 @@ struct InstantiationNode {
     OutEdge definition;
 
     /// Non-empty collection of live continuations, each corresponding to a channel in the join pattern.
-    InEdge[] continuations;
+    InEdge[] continuations; // SSO: InEdge[1] most of the time
 
  @nogc nothrow:
     /++
-    Initializes an instantiation node.
+    Initializes an instantiation node, must be later [dispose]d.
+
+    This procedure initializes the collection of continuations and sets up unique indexes for each in-edge slot.
 
     Params:
         self = Address of node being initialized.
-        n = Number of continuations to instantiate (always statically known).
+        n = Number of continuations to instantiate.
 
     Returns:
         Zero on success, non-zero on failure (null node, OOM or zero continuations).
     +/
-    static err_t initialize(InstantiationNode* self, uint n = 1)
+    static err_t initialize(InstantiationNode* self, uint n)
     in (self != null && n >= 1)
     {
         if (self == null) return EINVAL;
-        if (n == 0) return EINVAL;
+        if (n < 1) return EINVAL;
         *self = InstantiationNode.init;
 
         self.vptr = &InstantiationNode.vtbl;
         self.definition = OutEdge.data;
         self.continuations = allocate!InEdge(n);
         if (self.continuations == null) return ENOMEM;
-        foreach (i, ref cont; self.continuations) {
-            cont = InEdge.data(self.asNode, i);
-        }
+        foreach (i, ref cont; self.continuations) cont = InEdge.data(self.asNode, i);
 
         return 0;
     }
@@ -647,7 +646,7 @@ struct InstantiationNode {
 
 @nogc nothrow unittest {
     InstantiationNode tmp = void;
-    InstantiationNode.initialize(&tmp);
+    InstantiationNode.initialize(&tmp, 1);
     //
     InstantiationNode inst = void;
     moveEmplace(tmp, inst);
@@ -690,35 +689,29 @@ struct JumpNode {
 
  @nogc nothrow:
     /++
-    Initializes a jump node.
+    Initializes a jump node, must be later [dispose]d.
+
+    Argument kinds default to `data`, but this can be changed later.
 
     Params:
         self = Address of node being initialized.
-        args = Argument kinds.
+        m = Number of arguments sent through this jump.
 
     Returns:
-        Zero on success, non-zero on failure (null node, OOM or invalid edge kinds).
+        Zero on success, non-zero on failure (null node or OOM).
     +/
-    static err_t initialize(JumpNode* self, EdgeKind[] args ...)
+    static err_t initialize(JumpNode* self, uint m)
     in (self != null)
     {
         if (self == null) return EINVAL;
-        foreach (argKind; args) {
-            with (EdgeKind) final switch (argKind) {
-                case data, memory: break;
-                case control, type: return EINVAL;
-            }
-        }
         *self = JumpNode.init;
 
         self.vptr = &JumpNode.vtbl;
         self.control = InEdge.control(self.asNode);
         self.continuation = OutEdge.data;
-        self.arguments = allocate!OutEdge(args.length);
-        if (args.length > 0 && self.arguments == null) return ENOMEM;
-        foreach (i, argKind; args) {
-            self.arguments[i] = OutEdge.data;
-        }
+        self.arguments = allocate!OutEdge(m);
+        if (m > 0 && self.arguments == null) return ENOMEM;
+        foreach (i; 0 .. m) self.arguments[i] = OutEdge.data;
 
         return 0;
     }
@@ -744,8 +737,8 @@ struct JumpNode {
 
     hash_t toHash() const {
         hash_t hash = this.continuation.toHash();
-        foreach (arg; this.arguments) hash ^= arg.toHash();
-        return 0;
+        foreach (arg; this.arguments) hash -= arg.toHash();
+        return hash;
     }
 
     /// Adjusts in-edge slots after a move.
@@ -754,9 +747,9 @@ struct JumpNode {
     }
 }
 
-nothrow unittest {
+@nogc nothrow unittest {
     JumpNode tmp = void;
-    with (EdgeKind) JumpNode.initialize(&tmp, data, memory, data, data);
+    JumpNode.initialize(&tmp, 4);
     //
     JumpNode jump = void;
     moveEmplace(tmp, jump);
@@ -796,7 +789,7 @@ struct ForkNode {
 
  @nogc nothrow:
     /++
-    Initializes a fork node.
+    Initializes a fork node, must be later [dispose]d.
 
     Params:
         self = Address of node being initialized.
@@ -816,9 +809,7 @@ struct ForkNode {
         self.control = InEdge.control(self.asNode);
         self.threads = allocate!OutEdge(n);
         if (self.threads == null) return ENOMEM;
-        foreach (ref thread; self.threads) {
-            thread = OutEdge.control;
-        }
+        foreach (ref thread; self.threads) thread = OutEdge.control;
 
         return 0;
     }
@@ -832,7 +823,7 @@ struct ForkNode {
     /++
     Semantic equality check.
 
-    Fork nodes are the same if and only if all of their resulting flows behave exactly the same (in which case they are still separate logical threads, but with a shared structure in the IR).
+    Fork nodes are the same if and only if their resulting flows behave exactly the same (in which case they are still separate logical threads, but with a shared structure in the IR).
     +/
     bool opEquals(ref const(ForkNode) rhs) const {
         if (this.threads != rhs.threads) return false;
@@ -841,7 +832,7 @@ struct ForkNode {
 
     hash_t toHash() const {
         hash_t hash = 0;
-        foreach (thread; this.threads) hash ^= thread.toHash();
+        foreach (thread; this.threads) hash -= thread.toHash();
         return hash;
     }
 
@@ -891,39 +882,47 @@ struct ConditionalNode {
 
     Represented as a sparse mapping to avoid having an exponential number of unused options.
     +/
-    UnsafeHashMap!(ulong, OutEdge) options;
+    UnsafeHashMap!(ulong, OutEdge)* options; // SSO: binary branches will probably be the most common
 
  @nogc nothrow:
     /++
-    Initializes a conditional node.
+    Initializes a conditional node, must be later [dispose]d.
 
     Params:
         self = Address of node being initialized.
-        options = Branches to pre-allocate.
+        n = Number of branches to preallocate.
 
     Returns:
         Zero on success, non-zero on failure (null node, OOM or invalid number of branches).
     +/
-    static err_t initialize(ConditionalNode* self, ulong[] options = [0, 1] ...)
-    in (self != null && options.length >= 2)
+    static err_t initialize(ConditionalNode* self, uint n)
+    in (self != null && n >= 2)
     {
         if (self == null) return EINVAL;
-        if (options.length < 2) return EINVAL;
+        if (n < 2) return EINVAL;
         *self = ConditionalNode.init;
 
         self.vptr = &ConditionalNode.vtbl;
         self.selector = OutEdge.data;
         self.control = InEdge.control(self.asNode);
-        self.options = UnsafeHashMap!(ulong, OutEdge)();
-        const error = self.options.rehash(options.length);
-        if (error) return ENOMEM;
+
+        self.options = allocate!(UnsafeHashMap!(ulong, OutEdge));
+        if (self.options == null) return ENOMEM;
+        *self.options = UnsafeHashMap!(ulong, OutEdge).init;
+        const error = self.options.rehash(n);
+        if (error) {
+            deallocate(self.options);
+            self.options = null;
+            return ENOMEM;
+        }
 
         return 0;
     }
 
     /// Frees all resources allocated by this node and sets it to an uninitialized state.
     static void dispose(ConditionalNode* self) {
-        self.options.dispose();
+        if (self.options != null) self.options.dispose();
+        deallocate(self.options);
         *self = ConditionalNode.init;
     }
 
@@ -934,7 +933,7 @@ struct ConditionalNode {
     +/
     bool opEquals(ref const(ConditionalNode) rhs) const {
         if (this.selector != rhs.selector) return false;
-        if (this.options != rhs.options) return false;
+        if (*this.options != *rhs.options) return false;
         return true;
     }
 
@@ -948,9 +947,9 @@ struct ConditionalNode {
     }
 }
 
-nothrow unittest {
+@nogc nothrow unittest {
     ConditionalNode tmp = void;
-    ConditionalNode.initialize(&tmp);
+    ConditionalNode.initialize(&tmp, 2);
     //
     ConditionalNode cond = void;
     moveEmplace(tmp, cond);
@@ -1002,21 +1001,19 @@ struct MacroNode {
     /++
     Initializes a macro node, must be later [dispose]d.
 
+    This procedure sets up unique indexes for each in-edge slot.
+    All slot kinds default to `data`, but this can be later changed by the caller.
+
     Params:
         self = Address of node being initialized.
         id = Macro node identification number.
-        inEdges = Defines this node's interface (in edges only).
-        outEdges = Defines this node's interface (out edges only).
+        ins = Number of (preallocated) in-edges in this node.
+        outs = Number of (preallocated) out-edges in this node.
 
     Returns:
         Zero on success, non-zero on failure (null node or OOM).
     +/
-    static err_t initialize(
-        MacroNode* self,
-        MacroNode.ID id,
-        EdgeKind[] inEdges,
-        EdgeKind[] outEdges
-    )
+    static err_t initialize(MacroNode* self, MacroNode.ID id, uint ins, uint outs)
     in (self != null)
     {
         if (self == null) return EINVAL;
@@ -1025,26 +1022,25 @@ struct MacroNode {
         self.vptr = &MacroNode.vtbl;
         self.id = id;
 
-        self.inEdges = allocate!InEdge(inEdges.length);
-        if (inEdges.length > 0 && self.inEdges == null) {
-            self.outEdges.deallocate();
+        self.inEdges = allocate!InEdge(ins);
+        if (ins > 0 && self.inEdges == null) return ENOMEM;
+        foreach (i; 0 .. ins) self.inEdges[i] = InEdge.data(self.asNode, i);
+
+        self.outEdges = allocate!OutEdge(outs);
+        if (outs > 0 && self.outEdges == null) {
+            self.inEdges.deallocate();
+            self.inEdges = null;
             return ENOMEM;
         }
-        foreach (i, kind; inEdges)
-            self.inEdges[i] = InEdge(kind, self.asNode, i);
-
-        self.outEdges = allocate!OutEdge(outEdges.length);
-        if (outEdges.length > 0 && self.outEdges == null) return ENOMEM;
-        foreach (i, kind; outEdges)
-            self.outEdges[i] = OutEdge(kind);
+        foreach (i; 0 .. outs) self.outEdges[i] = OutEdge.data;
 
         return 0;
     }
 
     /// Frees all resources allocated by this node and sets it to an uninitialized state.
     static void dispose(MacroNode* self) {
-        self.inEdges.deallocate();
         self.outEdges.deallocate();
+        self.inEdges.deallocate();
         *self = MacroNode.init;
     }
 
@@ -1063,14 +1059,13 @@ struct MacroNode {
 
     /// Adjusts in-edge slots after a move.
     void opPostMove(ref const(MacroNode) old) pure {
-        foreach (ref slot; this.inEdges)
-            slot.owner = this.asNode;
+        foreach (ref slot; this.inEdges) slot.owner = this.asNode;
     }
 }
 
-nothrow unittest {
+@nogc nothrow unittest {
     MacroNode tmp = void;
-    with (EdgeKind) MacroNode.initialize(&tmp, 42, [control, type, data], [control, control]);
+    MacroNode.initialize(&tmp, MacroNode.ID(42), 3, 2);
     //
     MacroNode node = void;
     moveEmplace(tmp, node);
@@ -1468,46 +1463,54 @@ struct MultiplexerNode {
 
     Represented as a sparse mapping to avoid having an exponential number of unused input edges.
     +/
-    UnsafeHashMap!(ulong, OutEdge) inputs;
+    UnsafeHashMap!(ulong, OutEdge)* inputs; // SSO: binary mux will probably be the most common
 
  @nogc nothrow:
     /++
-    Initializes a multiplexer node.
+    Initializes a multiplexer node, must be later [dispose]d.
 
     Params:
         self = Address of node being initialized.
-        inputs = Input slots to pre-allocate.
+        n = Number of inputs to preallocate.
 
     Returns:
         Zero on success, non-zero on failure (null node, OOM or invalid number of inputs).
     +/
-    static err_t initialize(MultiplexerNode* self, ulong[] inputs = [0, 1] ...)
-    in (self != null && inputs.length >= 2)
+    static err_t initialize(MultiplexerNode* self, uint n)
+    in (self != null && n >= 2)
     {
         if (self == null) return EINVAL;
-        if (inputs.length < 2) return EINVAL;
+        if (n < 2) return EINVAL;
         *self = MultiplexerNode.init;
 
         self.vptr = &MultiplexerNode.vtbl;
         self.selector = OutEdge.data;
         self.output = InEdge.data(self.asNode);
-        self.inputs = UnsafeHashMap!(ulong, OutEdge)();
-        const error = self.inputs.rehash(inputs.length);
-        if (error) return ENOMEM;
+
+        self.inputs = allocate!(UnsafeHashMap!(ulong, OutEdge));
+        if (self.inputs == null) return ENOMEM;
+        *self.inputs = UnsafeHashMap!(ulong, OutEdge).init;
+        const error = self.inputs.rehash(n);
+        if (error) {
+            deallocate(self.inputs);
+            self.inputs = null;
+            return ENOMEM;
+        }
 
         return 0;
     }
 
     /// Frees all resources allocated by this node and sets it to an uninitialized state.
     static void dispose(MultiplexerNode* self) {
-        self.inputs.dispose();
+        if (self.inputs != null) self.inputs.dispose();
+        deallocate(self.inputs);
         *self = MultiplexerNode.init;
     }
 
     /// Semantic equality <=> structural equality.
     bool opEquals(ref const(MultiplexerNode) rhs) const {
         if (this.selector != rhs.selector) return false;
-        if (this.inputs != rhs.inputs) return false;
+        if (*this.inputs != *rhs.inputs) return false;
         return true;
     }
 
@@ -1521,9 +1524,9 @@ struct MultiplexerNode {
     }
 }
 
-nothrow unittest {
+@nogc nothrow unittest {
     MultiplexerNode tmp = void;
-    MultiplexerNode.initialize(&tmp, 0, 1, 2, 3);
+    MultiplexerNode.initialize(&tmp, 2);
     //
     MultiplexerNode mux = void;
     moveEmplace(tmp, mux);
@@ -1541,8 +1544,9 @@ struct AndNode {
     /// Resulting bit pattern.
     InEdge result;
 
-    /// Set of operands (order does not matter).
-    UnsafeHashSet!OutEdge operands;
+    /// Operands.
+    OutEdge lhs;
+    OutEdge rhs; /// ditto
 
  @nogc nothrow:
     /++
@@ -1550,40 +1554,37 @@ struct AndNode {
 
     Params:
         self = Address of node being initialized.
-        n = Number of operands to pre-allocate.
 
     Returns:
-        Zero on success, non-zero on failure (null node, OOM or invalid number of operands).
+        Zero on success, non-zero on failure (null node).
     +/
-    static err_t initialize(AndNode* self, uint n = 2)
-    in (self != null && n >= 2)
+    static err_t initialize(AndNode* self)
+    in (self != null)
     {
         if (self == null) return EINVAL;
-        if (n < 2) return EINVAL;
         *self = AndNode.init;
 
         self.vptr = &AndNode.vtbl;
         self.result = InEdge.data(self.asNode);
-        self.operands = UnsafeHashSet!(OutEdge)();
-        const error = self.operands.rehash(n);
-        if (error) return ENOMEM;
+        self.lhs = OutEdge.data;
+        self.rhs = OutEdge.data;
 
         return 0;
     }
 
     /// Frees all resources allocated by this node and sets it to an uninitialized state.
     static void dispose(AndNode* self) {
-        self.operands.dispose();
         *self = AndNode.init;
     }
 
-    /// Semantic equality <=> structural equality.
-    bool opEquals(ref const(AndNode) rhs) const {
-        return this.operands == rhs.operands;
+    /// Semantic equality <=> structural equality (modulo operand order).
+    bool opEquals(ref const(AndNode) other) const {
+        return (this.lhs == other.lhs && this.rhs == other.rhs)
+            || (this.lhs == other.rhs && this.rhs == other.lhs);
     }
 
     hash_t toHash() const {
-        return this.operands.toHash();
+        return this.lhs.toHash() ^ this.rhs.toHash();
     }
 
     /// Adjusts in-edge slots after a move.
@@ -1612,8 +1613,9 @@ struct OrNode {
     /// Resulting bit pattern.
     InEdge result;
 
-    /// Set of operands (order does not matter).
-    UnsafeHashSet!OutEdge operands;
+    /// Operands.
+    OutEdge lhs;
+    OutEdge rhs; /// ditto
 
  @nogc nothrow:
     /++
@@ -1621,40 +1623,37 @@ struct OrNode {
 
     Params:
         self = Address of node being initialized.
-        n = Number of operands to pre-allocate.
 
     Returns:
-        Zero on success, non-zero on failure (null node, OOM or invalid number of operands).
+        Zero on success, non-zero on failure (null node).
     +/
-    static err_t initialize(OrNode* self, uint n = 2)
-    in (self != null && n >= 2)
+    static err_t initialize(OrNode* self)
+    in (self != null)
     {
         if (self == null) return EINVAL;
-        if (n < 2) return EINVAL;
         *self = OrNode.init;
 
         self.vptr = &OrNode.vtbl;
         self.result = InEdge.data(self.asNode);
-        self.operands = UnsafeHashSet!(OutEdge)();
-        const error = self.operands.rehash(n);
-        if (error) return ENOMEM;
+        self.lhs = OutEdge.data;
+        self.rhs = OutEdge.data;
 
         return 0;
     }
 
     /// Frees all resources allocated by this node and sets it to an uninitialized state.
     static void dispose(OrNode* self) {
-        self.operands.dispose();
         *self = OrNode.init;
     }
 
-    /// Semantic equality <=> structural equality.
-    bool opEquals(ref const(OrNode) rhs) const {
-        return this.operands == rhs.operands;
+    /// Semantic equality <=> structural equality (modulo operand order).
+    bool opEquals(ref const(OrNode) other) const {
+        return (this.lhs == other.lhs && this.rhs == other.rhs)
+            || (this.lhs == other.rhs && this.rhs == other.lhs);
     }
 
     hash_t toHash() const {
-        return this.operands.toHash();
+        return this.lhs.toHash() ^ this.rhs.toHash();
     }
 
     /// Adjusts in-edge slots after a move.
@@ -1679,7 +1678,7 @@ struct OrNode {
 /++
 Bitwise `XOR` operation.
 
-Doubles as an unary `NOT` operation when given two operands and one is an all-ones constant.
+Can be used as a unary `NOT` operation when one operand is an all-ones constant.
 +/
 struct XorNode {
     mixin NodeInheritance;
@@ -1687,49 +1686,47 @@ struct XorNode {
     /// Resulting bit pattern.
     InEdge result;
 
-    /// Set of operands (order does not matter).
-    UnsafeHashSet!OutEdge operands;
+    /// Operands.
+    OutEdge lhs;
+    OutEdge rhs; /// ditto
 
  @nogc nothrow:
     /++
-    Initializes a XOR node.
+    Initializes an XOR node.
 
     Params:
         self = Address of node being initialized.
-        n = Number of operands to pre-allocate.
 
     Returns:
-        Zero on success, non-zero on failure (null node, OOM or invalid number of operands).
+        Zero on success, non-zero on failure (null node).
     +/
-    static err_t initialize(XorNode* self, uint n = 2)
-    in (self != null && n >= 2)
+    static err_t initialize(XorNode* self)
+    in (self != null)
     {
         if (self == null) return EINVAL;
-        if (n < 2) return EINVAL;
         *self = XorNode.init;
 
         self.vptr = &XorNode.vtbl;
         self.result = InEdge.data(self.asNode);
-        self.operands = UnsafeHashSet!(OutEdge)();
-        const error = self.operands.rehash(n);
-        if (error) return ENOMEM;
+        self.lhs = OutEdge.data;
+        self.rhs = OutEdge.data;
 
         return 0;
     }
 
     /// Frees all resources allocated by this node and sets it to an uninitialized state.
     static void dispose(XorNode* self) {
-        self.operands.dispose();
         *self = XorNode.init;
     }
 
-    /// Semantic equality <=> structural equality.
-    bool opEquals(ref const(XorNode) rhs) const {
-        return this.operands == rhs.operands;
+    /// Semantic equality <=> structural equality (modulo operand order).
+    bool opEquals(ref const(XorNode) other) const {
+        return (this.lhs == other.lhs && this.rhs == other.rhs)
+            || (this.lhs == other.rhs && this.rhs == other.lhs);
     }
 
     hash_t toHash() const {
-        return this.operands.toHash();
+        return this.lhs.toHash() ^ this.rhs.toHash();
     }
 
     /// Adjusts in-edge slots after a move.
@@ -1807,7 +1804,7 @@ struct LeftShiftNode {
     }
 
     hash_t toHash() const {
-        return (this.input.toHash() - this.shift.toHash()).hashOf;
+        return this.input.toHash() - this.shift.toHash();
     }
 
     /// Adjusts in-edge slots after a move.
@@ -1887,7 +1884,7 @@ struct LeftShiftNoOverflowNode {
     }
 
     hash_t toHash() const {
-        return (this.input.toHash() - this.shift.toHash()).hashOf;
+        return this.input.toHash() - this.shift.toHash();
     }
 
     /// Adjusts in-edge slots after a move.
@@ -1965,7 +1962,7 @@ struct UnsignedRightShiftNode {
     }
 
     hash_t toHash() const {
-        return (this.input.toHash() - this.shift.toHash()).hashOf;
+        return this.input.toHash() - this.shift.toHash();
     }
 
     /// Adjusts in-edge slots after a move.
@@ -2043,7 +2040,7 @@ struct SignedRightShiftNode {
     }
 
     hash_t toHash() const {
-        return (this.input.toHash() - this.shift.toHash()).hashOf;
+        return this.input.toHash() - this.shift.toHash();
     }
 
     /// Adjusts in-edge slots after a move.
@@ -2078,8 +2075,9 @@ struct AdditionNode {
     /// Resulting sum.
     InEdge result;
 
-    /// Set of operands (order does not matter).
-    UnsafeHashSet!OutEdge operands;
+    /// Operands.
+    OutEdge lhs;
+    OutEdge rhs; /// ditto
 
  @nogc nothrow:
     /++
@@ -2087,40 +2085,37 @@ struct AdditionNode {
 
     Params:
         self = Address of node being initialized.
-        n = Number of operands to pre-allocate.
 
     Returns:
-        Zero on success, non-zero on failure (null node, OOM or invalid number of operands).
+        Zero on success, non-zero on failure (null node).
     +/
-    static err_t initialize(AdditionNode* self, uint n = 2)
-    in (self != null && n >= 2)
+    static err_t initialize(AdditionNode* self)
+    in (self != null)
     {
         if (self == null) return EINVAL;
-        if (n < 2) return EINVAL;
         *self = AdditionNode.init;
 
         self.vptr = &AdditionNode.vtbl;
         self.result = InEdge.data(self.asNode);
-        self.operands = UnsafeHashSet!(OutEdge)();
-        const error = self.operands.rehash(n);
-        if (error) return ENOMEM;
+        self.lhs = OutEdge.data;
+        self.rhs = OutEdge.data;
 
         return 0;
     }
 
     /// Frees all resources allocated by this node and sets it to an uninitialized state.
     static void dispose(AdditionNode* self) {
-        self.operands.dispose();
         *self = AdditionNode.init;
     }
 
-    /// Semantic equality <=> structural equality.
-    bool opEquals(ref const(AdditionNode) rhs) const {
-        return this.operands == rhs.operands;
+    /// Semantic equality <=> structural equality (modulo operand order).
+    bool opEquals(ref const(AdditionNode) other) const {
+        return (this.lhs == other.lhs && this.rhs == other.rhs)
+            || (this.lhs == other.rhs && this.rhs == other.lhs);
     }
 
     hash_t toHash() const {
-        return this.operands.toHash();
+        return this.lhs.toHash() ^ this.rhs.toHash();
     }
 
     /// Adjusts in-edge slots after a move.
@@ -2155,8 +2150,9 @@ struct AdditionNoOverflowSignedNode {
     /// Resulting sum.
     InEdge result;
 
-    /// Set of operands (order does not matter).
-    UnsafeHashSet!OutEdge operands;
+    /// Operands.
+    OutEdge lhs;
+    OutEdge rhs; /// ditto
 
  @nogc nothrow:
     /++
@@ -2164,40 +2160,37 @@ struct AdditionNoOverflowSignedNode {
 
     Params:
         self = Address of node being initialized.
-        n = Number of operands to pre-allocate.
 
     Returns:
-        Zero on success, non-zero on failure (null node, OOM or invalid number of operands).
+        Zero on success, non-zero on failure (null node).
     +/
-    static err_t initialize(AdditionNoOverflowSignedNode* self, uint n = 2)
-    in (self != null && n >= 2)
+    static err_t initialize(AdditionNoOverflowSignedNode* self)
+    in (self != null)
     {
         if (self == null) return EINVAL;
-        if (n < 2) return EINVAL;
         *self = AdditionNoOverflowSignedNode.init;
 
         self.vptr = &AdditionNoOverflowSignedNode.vtbl;
         self.result = InEdge.data(self.asNode);
-        self.operands = UnsafeHashSet!(OutEdge)();
-        const error = self.operands.rehash(n);
-        if (error) return ENOMEM;
+        self.lhs = OutEdge.data;
+        self.rhs = OutEdge.data;
 
         return 0;
     }
 
     /// Frees all resources allocated by this node and sets it to an uninitialized state.
     static void dispose(AdditionNoOverflowSignedNode* self) {
-        self.operands.dispose();
         *self = AdditionNoOverflowSignedNode.init;
     }
 
-    /// Semantic equality <=> structural equality.
-    bool opEquals(ref const(AdditionNoOverflowSignedNode) rhs) const {
-        return this.operands == rhs.operands;
+    /// Semantic equality <=> structural equality (modulo operand order).
+    bool opEquals(ref const(AdditionNoOverflowSignedNode) other) const {
+        return (this.lhs == other.lhs && this.rhs == other.rhs)
+            || (this.lhs == other.rhs && this.rhs == other.lhs);
     }
 
     hash_t toHash() const {
-        return this.operands.toHash();
+        return this.lhs.toHash() ^ this.rhs.toHash();
     }
 
     /// Adjusts in-edge slots after a move.
@@ -2275,7 +2268,7 @@ struct SubtractionNode {
     }
 
     hash_t toHash() const {
-        return (this.lhs.toHash() - this.rhs.toHash()).hashOf;
+        return this.lhs.toHash() - this.rhs.toHash();
     }
 
     /// Adjusts in-edge slots after a move.
@@ -2353,7 +2346,7 @@ struct SubtractionNoOverflowSignedNode {
     }
 
     hash_t toHash() const {
-        return (this.lhs.toHash() - this.rhs.toHash()).hashOf;
+        return this.lhs.toHash() - this.rhs.toHash();
     }
 
     /// Adjusts in-edge slots after a move.
@@ -2389,49 +2382,47 @@ struct MultiplicationNode {
     /// Resulting product.
     InEdge result;
 
-    /// Set of operands (order does not matter).
-    UnsafeHashSet!OutEdge operands;
+    /// Operands.
+    OutEdge lhs;
+    OutEdge rhs; /// ditto
 
  @nogc nothrow:
     /++
-    Initializes an addition node.
+    Initializes a multiplication node.
 
     Params:
         self = Address of node being initialized.
-        n = Number of operands to pre-allocate.
 
     Returns:
-        Zero on success, non-zero on failure (null node, OOM or invalid number of operands).
+        Zero on success, non-zero on failure (null node).
     +/
-    static err_t initialize(MultiplicationNode* self, uint n = 2)
-    in (self != null && n >= 2)
+    static err_t initialize(MultiplicationNode* self)
+    in (self != null)
     {
         if (self == null) return EINVAL;
-        if (n < 2) return EINVAL;
         *self = MultiplicationNode.init;
 
         self.vptr = &MultiplicationNode.vtbl;
         self.result = InEdge.data(self.asNode);
-        self.operands = UnsafeHashSet!(OutEdge)();
-        const error = self.operands.rehash(n);
-        if (error) return ENOMEM;
+        self.lhs = OutEdge.data;
+        self.rhs = OutEdge.data;
 
         return 0;
     }
 
     /// Frees all resources allocated by this node and sets it to an uninitialized state.
     static void dispose(MultiplicationNode* self) {
-        self.operands.dispose();
         *self = MultiplicationNode.init;
     }
 
-    /// Semantic equality <=> structural equality.
-    bool opEquals(ref const(MultiplicationNode) rhs) const {
-        return this.operands == rhs.operands;
+    /// Semantic equality <=> structural equality (modulo operand order).
+    bool opEquals(ref const(MultiplicationNode) other) const {
+        return (this.lhs == other.lhs && this.rhs == other.rhs)
+            || (this.lhs == other.rhs && this.rhs == other.lhs);
     }
 
     hash_t toHash() const {
-        return this.operands.toHash();
+        return this.lhs.toHash() ^ this.rhs.toHash();
     }
 
     /// Adjusts in-edge slots after a move.
@@ -2466,49 +2457,47 @@ struct MultiplicationNoOverflowSignedNode {
     /// Resulting product.
     InEdge result;
 
-    /// Set of operands (order does not matter).
-    UnsafeHashSet!OutEdge operands;
+    /// Operands.
+    OutEdge lhs;
+    OutEdge rhs; /// ditto
 
  @nogc nothrow:
     /++
-    Initializes an addition node.
+    Initializes a multiplication node.
 
     Params:
         self = Address of node being initialized.
-        n = Number of operands to pre-allocate.
 
     Returns:
-        Zero on success, non-zero on failure (null node, OOM or invalid number of operands).
+        Zero on success, non-zero on failure (null node).
     +/
-    static err_t initialize(MultiplicationNoOverflowSignedNode* self, uint n = 2)
-    in (self != null && n >= 2)
+    static err_t initialize(MultiplicationNoOverflowSignedNode* self)
+    in (self != null)
     {
         if (self == null) return EINVAL;
-        if (n < 2) return EINVAL;
         *self = MultiplicationNoOverflowSignedNode.init;
 
         self.vptr = &MultiplicationNoOverflowSignedNode.vtbl;
         self.result = InEdge.data(self.asNode);
-        self.operands = UnsafeHashSet!(OutEdge)();
-        const error = self.operands.rehash(n);
-        if (error) return ENOMEM;
+        self.lhs = OutEdge.data;
+        self.rhs = OutEdge.data;
 
         return 0;
     }
 
     /// Frees all resources allocated by this node and sets it to an uninitialized state.
     static void dispose(MultiplicationNoOverflowSignedNode* self) {
-        self.operands.dispose();
         *self = MultiplicationNoOverflowSignedNode.init;
     }
 
-    /// Semantic equality <=> structural equality.
-    bool opEquals(ref const(MultiplicationNoOverflowSignedNode) rhs) const {
-        return this.operands == rhs.operands;
+    /// Semantic equality <=> structural equality (modulo operand order).
+    bool opEquals(ref const(MultiplicationNoOverflowSignedNode) other) const {
+        return (this.lhs == other.lhs && this.rhs == other.rhs)
+            || (this.lhs == other.rhs && this.rhs == other.lhs);
     }
 
     hash_t toHash() const {
-        return this.operands.toHash();
+        return this.lhs.toHash() ^ this.rhs.toHash();
     }
 
     /// Adjusts in-edge slots after a move.
@@ -2586,7 +2575,7 @@ struct UnsignedDivisionNode {
     }
 
     hash_t toHash() const {
-        return (this.dividend.toHash() - this.divisor.toHash()).hashOf;
+        return this.dividend.toHash() - this.divisor.toHash();
     }
 
     /// Adjusts in-edge slots after a move.
@@ -2612,7 +2601,7 @@ struct UnsignedDivisionNode {
 Two's complement division operation for signed operands, rounds towards zero.
 
 The divisor must not be zero, otherwise the result is a [poison](gyre.nodes.html#poison-values-and-ub) value.
-Furthermore, dividing the "most negative" value representable (`-1 * 2^(N-1)` for N bits) by `-1` also results in poison.
+Furthermore, dividing the "most negative" value representable (in N bits, $(MATH -1 \times 2^{N-1})) by `-1` also results in poison.
 
 See_Also: [UnsignedDivisionNode]
 +/
@@ -2665,7 +2654,7 @@ struct SignedDivisionNode {
     }
 
     hash_t toHash() const {
-        return (this.dividend.toHash() - this.divisor.toHash()).hashOf;
+        return this.dividend.toHash() - this.divisor.toHash();
     }
 
     /// Adjusts in-edge slots after a move.
@@ -2743,7 +2732,7 @@ struct UnsignedRemainderNode {
     }
 
     hash_t toHash() const {
-        return (this.dividend.toHash() - this.divisor.toHash()).hashOf;
+        return this.dividend.toHash() - this.divisor.toHash();
     }
 
     /// Adjusts in-edge slots after a move.
@@ -2769,7 +2758,7 @@ struct UnsignedRemainderNode {
 Two's complement remainder operation for signed operands, rounds towards zero.
 
 The divisor must not be zero, otherwise the result is a [poison](gyre.nodes.html#poison-values-and-ub) value.
-Furthermore, dividing the "most negative" value representable (`-1 * 2^(N-1)` for N bits) by `-1` also results in poison.
+Furthermore, dividing the "most negative" value representable (in N bits, $(MATH -1 \times 2^{N-1})) by `-1` also results in poison.
 
 See_Also: [UnsignedRemainderNode]
 +/
@@ -2822,7 +2811,7 @@ struct SignedRemainderNode {
     }
 
     hash_t toHash() const {
-        return (this.dividend.toHash() - this.divisor.toHash()).hashOf;
+        return this.dividend.toHash() - this.divisor.toHash();
     }
 
     /// Adjusts in-edge slots after a move.
@@ -2848,11 +2837,9 @@ struct SignedRemainderNode {
 struct EqualNode {
     mixin NodeInheritance;
 
-    /// Left-hand-side operand.
+    /// Operands (order doesn't matter).
     OutEdge lhs;
-
-    /// Right-hand-side operand.
-    OutEdge rhs;
+    OutEdge rhs; /// ditto
 
     /// A single resulting bit indicating whether operands are equal.
     InEdge result;
@@ -2888,9 +2875,8 @@ struct EqualNode {
 
     /// Semantic equality <=> structural equality.
     bool opEquals(ref const(EqualNode) other) const {
-        if (this.lhs != other.lhs) return false;
-        if (this.rhs != other.rhs) return false;
-        return true;
+        return (this.lhs == other.lhs && this.rhs == other.rhs)
+            || (this.lhs == other.rhs && this.rhs == other.lhs);
     }
 
     hash_t toHash() const {
@@ -2920,11 +2906,9 @@ struct EqualNode {
 struct NotEqualNode {
     mixin NodeInheritance;
 
-    /// Left-hand-side operand.
+    /// Operands (order doesn't matter).
     OutEdge lhs;
-
-    /// Right-hand-side operand.
-    OutEdge rhs;
+    OutEdge rhs; /// ditto
 
     /// A single resulting bit indicating whether operands are different.
     InEdge result;
@@ -2960,9 +2944,8 @@ struct NotEqualNode {
 
     /// Semantic equality <=> structural equality.
     bool opEquals(ref const(NotEqualNode) other) const {
-        if (this.lhs != other.lhs) return false;
-        if (this.rhs != other.rhs) return false;
-        return true;
+        return (this.lhs == other.lhs && this.rhs == other.rhs)
+            || (this.lhs == other.rhs && this.rhs == other.lhs);
     }
 
     hash_t toHash() const {
@@ -3042,7 +3025,7 @@ struct UnsignedLessThanNode {
     }
 
     hash_t toHash() const {
-        return (this.lhs.toHash() - this.rhs.toHash()).hashOf;
+        return this.lhs.toHash() - this.rhs.toHash();
     }
 
     /// Adjusts in-edge slots after a move.
@@ -3118,7 +3101,7 @@ struct SignedLessThanNode {
     }
 
     hash_t toHash() const {
-        return (this.lhs.toHash() - this.rhs.toHash()).hashOf;
+        return this.lhs.toHash() - this.rhs.toHash();
     }
 
     /// Adjusts in-edge slots after a move.
@@ -3194,7 +3177,7 @@ struct UnsignedGreaterOrEqualNode {
     }
 
     hash_t toHash() const {
-        return (this.lhs.toHash() - this.rhs.toHash()).hashOf;
+        return this.lhs.toHash() - this.rhs.toHash();
     }
 
     /// Adjusts in-edge slots after a move.
@@ -3270,7 +3253,7 @@ struct SignedGreaterOrEqualNode {
     }
 
     hash_t toHash() const {
-        return (this.lhs.toHash() - this.rhs.toHash()).hashOf;
+        return this.lhs.toHash() - this.rhs.toHash();
     }
 
     /// Adjusts in-edge slots after a move.

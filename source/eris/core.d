@@ -57,9 +57,9 @@ T[] allocate(T)(size_t n) @nogc nothrow
         }
     }
 
-    debug version (Eris_VerboseAllocations) if (ptr != null) {
+    debug if (ptr != null) {
         const current = allocated.atomicOp!"+="(totalBytes);
-        fprintf(stderr, "Allocated bytes: %lu\n", current);
+        version (Eris_VerboseAllocations) fprintf(stderr, "Total allocated bytes: %lu\n", current);
     }
     return ptr != null ? (cast(T*)ptr)[0 .. n] : [];
 }
@@ -72,10 +72,10 @@ T* allocate(T)() @nogc nothrow
     return memory.ptr;
 }
 
-debug version (Eris_VerboseAllocations) {
+debug {
     import core.atomic : atomicOp;
-    import core.stdc.stdio : fprintf, stderr;
     private shared size_t allocated = 0;
+    version (Eris_VerboseAllocations) import core.stdc.stdio : fprintf, stderr;
 }
 
 /++
@@ -85,10 +85,9 @@ Params:
     memory = Previously [allocate]d memory block (or null, in which case nothing happens).
 +/
 void deallocate(T)(T[] memory) @nogc nothrow @system {
-    debug version (Eris_VerboseAllocations) if (memory != null) {
-        const totalBytes = memory.length * T.sizeof;
-        const current = allocated.atomicOp!"-="(totalBytes);
-        fprintf(stderr, "Allocated bytes: %lu\n", current);
+    debug if (memory != null) {
+        const current = allocated.atomicOp!"-="(memory.length * T.sizeof);
+        version (Eris_VerboseAllocations) fprintf(stderr, "Total allocated bytes: %lu\n", current);
     }
     version (D_BetterC) {} else {
         static if (hasIndirections!T) {
