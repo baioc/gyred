@@ -27,10 +27,13 @@ We'll always manage memory like this in the context of a [Graph].
 +/
 module gyre.graph;
 
-import core.stdc.errno : ENOMEM;
+import core.stdc.errno : ENOMEM, EINVAL;
+import core.lifetime : forward, move, moveEmplace;
+import std.bitmanip : taggedPointer;
 import std.meta : AliasSeq, Filter;
 import std.traits : EnumMembers, Fields, Parameters;
 
+import betterclist : List;
 import eris.core : err_t, allocate, deallocate;
 import eris.util : HashablePointer;
 import eris.hash_table : UnsafeHashMap, UnsafeHashSet;
@@ -91,12 +94,23 @@ private { // step 2: collect all symbols/types corresponding to concrete nodes
     }
 
     enum nodeNames = Filter!(isGyreNode, __traits(allMembers, gyre.nodes)); // symbols
-    alias AllNodes = Unquote!nodeNames; // types
+    package alias AllNodes = Unquote!nodeNames; // types
 }
 
 private { // step 3: profit
-    mixin("enum NodeKind : ubyte { " ~ JoinArgs!nodeNames ~ " }"); // enum (type tag)
-    // NOTE: these tags are technically redundant: we could derive them from vptrs
+    version (D_Ddoc) {
+        /++
+        Indicates node types in this module's API.
+
+        See_Also: [gyre.mnemonics]
+        +/
+        public enum NodeKind : ubyte {
+            JoinNode, /// Corresponds to the eponymous [gyre.nodes.JoinNode|type].
+            etc /// Other members follow the same naming pattern.
+        }
+    } else {
+        mixin("public enum NodeKind : ubyte { " ~ JoinArgs!nodeNames ~ " }"); // enum (type tag)
+    }
 
     union AnyNode { // big union type
         static foreach (NodeType; AllNodes) {
@@ -107,14 +121,54 @@ private { // step 3: profit
         mixin("return node.as" ~ AllNodes[kind].stringof ~ ";");
     }
 
-    // sanity check: tags must correspond to the right types and union members
+    // sanity check: tags must index the right types and union members
     static foreach (tag; EnumMembers!NodeKind) {
         static assert(__traits(identifier, EnumMembers!NodeKind[tag]) == AllNodes[tag].stringof);
         static assert(is(AllNodes[tag] == Fields!AnyNode[tag]));
     }
 
-    // XXX: needs to be declared outside Graph because "delegate cannot be struct members"
-    alias DefaultSetUp(NodeType) = delegate(NodeType* node){};
+    // NOTE: type tags are technically redundant since they could be derived from vptrs
+    struct NodeStorage {
+        AnyNode node;
+        NodeKind tag;
+
+        static if (NodeStorage.sizeof > 64) pragma(msg, __FILE__ ~ "(" ~ __LINE__.stringof ~ ",0)"
+            ~ ": Warning: Fat nodes: each one is taking up " ~ NodeStorage.sizeof.stringof ~ " bytes"
+        );
+
+     @nogc nothrow:
+        void dispose() {
+            final switch (this.tag) {
+                static foreach (kind; EnumMembers!NodeKind) {
+                    case kind: {
+                        alias NodeType = AllNodes[kind];
+                        NodeType.dispose(&this.node.as!kind);
+                        return;
+                    }
+                }
+            }
+        }
+
+        void opPostMove(ref NodeStorage old) pure {
+            final switch (this.tag) {
+                static foreach (kind; EnumMembers!NodeKind) {
+                    case kind: {
+                        move(old.node.as!kind, this.node.as!kind);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/++
+Represents frequent [NodeKind] use patterns.
+
+These symbols are also re-exported in [gyre.mnemonics].
++/
+enum NodeSugar {
+    @mnemonic("func") SingleChannelJoinNode, /// A single-channel [JoinNode].
 }
 
 
@@ -129,13 +183,15 @@ Due to our representation, internal graph storage will probably resemble a spagh
 As a result, relocations are expensive, and in the worst case we could be moving the entire graph (e.g. if we need to expand our backing memory arena).
 Since references may need to be adjusted anyway, we might as well keep related nodes close to each other, improving locality while we're at it.
 In the end, we'll implement something similar to a moving mark-and-sweep GC over a private memory pool.
+
+See_Also: [Transaction]
 +/
 struct Graph {
  private:
     // map of generic nodes (used for structural sharing) => in-neighbor sets,
     // where any reference held here must point into this graph's arena
-    UnsafeHashMap!(NodeHandle, InNeighbors) nodes;
-    alias NodeHandle = HashablePointer!Node;
+    UnsafeHashMap!(HashableNode, InNeighbors) nodes;
+    alias HashableNode = HashablePointer!Node;
     alias InNeighbors = UnsafeHashSet!(Node*);
 
     // corresponds to the notion of a "top-level". also used as a GC root:
@@ -143,14 +199,7 @@ struct Graph {
     MacroNode topLevel;
 
     // backing memory pool for this graph's nodes (all except the topLevel)
-    NodeStorage[] nodePool;
-    struct NodeStorage { AnyNode node; NodeKind tag; }
-    static if (Graph.NodeStorage.sizeof > 64) pragma(msg, __FILE__ ~ "(" ~ __LINE__.stringof ~ ",0)"
-        ~ ": Warning: Fat nodes: each one is taking up " ~ Graph.NodeStorage.sizeof.stringof ~ " bytes"
-    );
-
-    // bump allocator index, either at the first free slot or `>= nodePool.length`
-    size_t cursor;
+    List!NodeStorage nodePool;
 
  public @nogc nothrow:
     /++
@@ -165,8 +214,8 @@ struct Graph {
     Params:
         self = Graph being initialized.
         id = This graph's unique identifier.
-        exports = Preallocated number of "exported" symbols (or [InEdge|in-edge]s for macro node definitions).
-        imports = Preallocated number of "imported" symbols (or [OutEdge|out-edge]s for macro node definitions).
+        exports = Preallocated number of "exported" defs (or [InEdge|in-edge]s for [MacroNode|macro node] definitions).
+        imports = Preallocated number of "imported" defs (or [OutEdge|out-edge]s for [MacroNode|macro node] definitions).
         capacity = Number of nodes to preallocate.
 
     Returns:
@@ -174,16 +223,14 @@ struct Graph {
     +/
     err_t initialize(MacroNode.ID id, uint exports = 1, uint imports = 0, size_t capacity = 256)
     in (this is Graph.init, "detected memory leak caused by Graph re-initialization")
-    out (error; !error || this is Graph.init)
     {
         err_t error = 0;
         scope(exit) if (error) this = Graph.init;
 
         // allocate backing memory pool and set up free index
-        this.nodePool = allocate!(Graph.NodeStorage)(capacity);
-        scope(exit) if (error) this.nodePool.deallocate();
-        if (capacity > 0 && this.nodePool == null) return (error = ENOMEM);
-        this.cursor = 0;
+        this.nodePool = List!NodeStorage(allocate!NodeStorage(capacity));
+        scope(exit) if (error) this.nodePool.array.deallocate();
+        if (capacity > 0 && this.nodePool.capacity == 0) return (error = ENOMEM);
 
         // reserve some space for node handles
         error = this.nodes.rehash(1 + capacity/2);
@@ -208,107 +255,237 @@ struct Graph {
     /// Frees all resources allocated by this graph and sets it to an uninitialized state.
     void dispose() {
         MacroNode.dispose(&this.topLevel);
+
+        foreach (ref inNeighbors; this.nodes.byValue) {
+            inNeighbors.dispose();
+        }
         this.nodes.dispose();
-        this.nodePool.deallocate(); // TODO: dispose each in-use node slot
+
+        foreach_reverse (ref node; this.nodePool) {
+            node.dispose();
+        }
+        this.nodePool.array.deallocate();
+
         this = Graph.init;
     }
 
-    private alias InitParams(NodeType) = Parameters!(NodeType.initialize)[1 .. $];
-    private alias SetUp(NodeType) = void delegate(NodeType*) @nogc nothrow;
-
-    /++
-    Allocates and adds a single node to the graph.
-
-    NOTE: Adding a node with this method only works if its dependencies have already been added, so a topological order is required.
-    NOTE: Operations which use the added node's address (such as adding it to another's in-neighbors) can only be done with the return value.
-
-    Params:
-        args = Arguments used to in-place initialize the node.
-        setUp = Callback used to set up the new node once it's been allocated.
-            When this callable returns, the node's structure is assumed stable; notably, `toHash` must yield a valid hash.
-
-    Returns:
-        Either a pointer to the node in the graph, or `null` in case of failure.
-        Even on success, the returned pointer might not be the same one which was passed to `setUp`, since our structural sharing scheme may have chosen to return some equivalent pre-existing node.
-    +/
-    AllNodes[kind]* add(NodeKind kind)(
-        auto ref InitParams!(AllNodes[kind]) args,
-        scope SetUp!(AllNodes[kind]) setUp = DefaultSetUp!(AllNodes[kind])
-    ) {
-        import core.lifetime : forward;
-        err_t error = 0;
-
-        assert(
-            this.cursor < this.nodePool.length,
-            "TODO: implement garbage collection"
-        );
-
-        // coerce the first available slot from the memory pool into the requested node
-        alias NodeType = AllNodes[kind];
-        NodeStorage* storage = &this.nodePool[this.cursor];
-        NodeType* newNode = &storage.node.as!kind;
-
-        // in-place initialize that slot
-        error = NodeType.initialize(newNode, forward!args);
-        if (error) return null;
-        setUp(newNode);
-        // TODO: enforce IR rules
-
-        // this node's structure should now be stable, so we can store its hash
-        newNode.updateHash();
+ private:
+    // moves a single node into the graph in case there's enough space for it
+    // NOTE: assumes node structure is stable and its hash is already cached
+    Node* add(NodeStorage* temp)
+    in (temp != null && !this.nodePool.full)
+    {
+        if (temp == null) return null;
+        if (this.nodePool.full) return null;
 
         // abort the node in case an equivalent one already exists in the graph
-        auto handle = NodeHandle(newNode.asNode);
-        NodeHandle* existing;
+        auto oldNode = cast(Node*)&temp.node;
+        HashableNode* existing;
         InNeighbors* neighbors;
-        const found = this.nodes.get(handle, existing, neighbors);
+        const found = this.nodes.get(HashableNode(oldNode), existing, neighbors);
         if (found) {
-            newNode = NodeType.ofNode(existing.ptr);
-            assert(newNode != null);
-            return newNode;
+            assert(existing != null);
+            return *existing;
         }
 
         // add the new node to the graph, with an empty set of in-neighbors
-        error = (this.nodes[handle] = InNeighbors.init);
-        if (error) return null;
-        cursor++; // and bump our allocator forward
+        this.nodePool ~= NodeStorage.init;
+        NodeStorage* storage = &this.nodePool[$ - 1];
+        moveEmplace(*temp , *storage);
+        auto newNode = cast(Node*)&storage.node;
+        const error = (this.nodes[HashableNode(newNode)] = InNeighbors.init);
+        if (error) {
+            moveEmplace(*storage, *temp); // undo the move
+            this.nodePool.pop();
+            return null;
+        }
+
+        // TODO: register imports/exports
+
+        return newNode;
+    }
+}
+
+
+/++
+First-class representation of a graph operation.
+
+Transactions are used to update a Gyre [Graph] in an "all-or-nothing" fashion while verifying IR rules, expanding graph memory as needed and wiring up in-neighbors correctly.
+Last but not least: whenever a transaction commits, simple peephole optimizations (e.g. arithmetic simplification, constant folding and strength reduction) are performed automatically.
+
+NOTE: Despite the name, transactions cannot be concurrently applied to the same [Graph].
++/
+struct Transaction {
+ private:
+    mixin(taggedPointer!(
+        Graph*, "graph",
+        bool, "began", 1
+    ));
+
+    List!NodeStorage nursery;
+
+ public @nogc nothrow:
+    /// Creates a new transaction.
+    this(ref Graph graph) pure {
+        this.graph = &graph;
+        this.began = false;
+    }
+    @disable this();
+
+    /**
+    Begins the transaction.
+
+    All transactions which have begun must explicitly finish (successfully or otherwise).
+
+    Params:
+        newNodes = Maximum number of added nodes (does not dynamically expand).
+
+    Returns:
+        Zero on success, non-zero otherwise (in which case the transaction fails to begin).
+
+    See_Also: [commit], [abort]
+    **/
+    err_t begin(size_t newNodes)
+    in (!this.began)
+    out (error; error || this.began)
+    {
+        if (this.began) return EINVAL;
+        this.nursery = List!NodeStorage(allocate!NodeStorage(newNodes));
+        if (newNodes > 0 && this.nursery.capacity == 0) return ENOMEM;
+        this.began = true;
+        return 0;
+    }
+
+    /// Finishes the transaction by cancelling it.
+    void abort()
+    in (this.began)
+    out (; !this.began)
+    {
+        if (!this.began) return;
+        foreach_reverse (ref node; this.nursery) {
+            node.dispose();
+        }
+        this.nursery.array.deallocate();
+        this = Transaction(*this.graph);
+    }
+
+    /**
+    Finishes this transaction by applying its changes.
+
+    Returns:
+        Zero on success, non-zero otherwise (in which case the transaction must be [abort]ed).
+    */
+    err_t commit()
+    in (this.began)
+    out (error; error || !this.began)
+    {
+        if (!this.began) return EINVAL;
+
+        // compute how much space we need and how much we have available
+        const neededSpace = this.nursery.availableCapacity;
+        const freeSpace = this.graph.nodePool.availableCapacity;
+
+        assert(
+            freeSpace >= neededSpace,
+            "TODO: implement garbage collection"
+        );
+
+        // TODO: check IR rules
+
+        // TODO: add nodes in topological order
+        foreach (ref slot; this.nursery) {
+            NodeStorage* storage = &slot;
+            auto node = cast(Node*)&storage.node;
+            node.updateHash();
+            this.graph.add(storage);
+        }
+
+        // TODO: rewire in-neighbors
+        // TODO: peephole optimizations
+
+        this.nursery.array.deallocate();
+        this = Transaction(*this.graph);
+        return 0;
+    }
+
+    private alias InitParams(NodeType) = Parameters!(NodeType.initialize)[1 .. $];
+
+    /**
+    Inserts a node during an ongoing transaction.
+
+    Returns:
+        A pointer to the inserted node, or `null` in case something went wrong (OOM).
+    */
+    AllNodes[kind]* insert(NodeKind kind)(auto ref InitParams!(AllNodes[kind]) args)
+    in (this.began)
+    {
+        if (!this.began) return null;
+        alias NodeType = AllNodes[kind];
+
+        // the nursery doesn't expand, so we give up if it would overflow
+        if (this.nursery.full) return null;
+
+        // grab the first available slot and in-place initialize the node there
+        this.nursery ~= NodeStorage.init;
+        NodeStorage* storage = &this.nursery[$ - 1];
+        storage.tag = kind;
+        NodeType* newNode = &storage.node.as!kind;
+        const error = NodeType.initialize(newNode, forward!args);
+        if (error) {
+            this.nursery.pop();
+            return null;
+        }
 
         return newNode;
     }
 
-    ///
-    unittest {
-        Graph graph;
-        graph.initialize(MacroNode.ID(42));
-        scope(exit) graph.dispose();
-        assert(graph.topLevel.id == 42);
-
-        /*
-            join (x, y):
-                a = x + 1
-                b = 1 + x
-        */
-        with (NodeKind) {
-            auto join = graph.add!JoinNode([2], (join){
-                assert(join.channels.length == 1);
-                assert(join.channels[0].length == 2);
-            });
-
-            auto c1 = graph.add!ConstantNode(1);
-
-            auto a = graph.add!AdditionNode((a){
-                a.lhs.target = &join.channels[0][0];
-                a.rhs.target = &c1.value;
-            });
-
-            auto b = graph.add!AdditionNode((b){
-                b.lhs.target = &c1.value;
-                b.rhs.target = &join.channels[0][0];
-            });
-
-            // but b computes the same value as a, so it gets optimized away!
-            assert(b is a);
-            assert(graph.nodes.length == 3);
-        }
+    /// ditto
+    JoinNode* insert(NodeSugar sugar : NodeSugar.SingleChannelJoinNode)(uint argc) {
+        uint[1] ms = [argc];
+        return this.insert!(NodeKind.JoinNode)(cast(uint[])ms);
     }
+}
+
+
+///
+@nogc nothrow unittest {
+    import gyre.mnemonics;
+
+    Graph graph;
+    graph.initialize(MacroNode.ID(42));
+    scope(exit) graph.dispose();
+    assert(graph.topLevel.id == 42);
+
+    /*
+        foo(x, y):
+            a = x + 1
+            b = 1 + x
+    */
+    with (Transaction(graph)) {
+        begin(1);
+        {
+            auto oops = insert!mul;
+        }
+        abort();
+
+        begin(4);
+        {
+            auto func = insert!func(2);
+            auto x = &func.channels[0][0];
+
+            auto c1 = insert!const_(1);
+
+            auto a = insert!add;
+            a.lhs.target = x;
+            a.rhs.target = &c1.value;
+
+            auto b = insert!add;
+            b.lhs.target = &c1.value;
+            b.rhs.target = x;
+        }
+        const error = commit();
+        assert(!error);
+    }
+    // but b computes the same value as a, so it gets optimized away!
+    assert(graph.nodes.length == 3);
 }

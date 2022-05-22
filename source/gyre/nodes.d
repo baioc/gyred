@@ -99,32 +99,18 @@ Connects to exactly one [InEdge].
 +/
 struct OutEdge {
     mixin(taggedPointer!(
-        InEdge*, "_target",
-        EdgeKind, "_kind", 2
+        InEdge*, "target",
+        EdgeKind, "kind", 2
     ));
 
  pragma(inline) @nogc nothrow:
-    @property InEdge* target() const pure {
-        return this._target;
-    }
-
-    @property void target(InEdge* target) pure
-    in (target == null || target.kind == kind, "connecting edge slots must have matching kinds")
-    {
-        this._target = target;
-    }
-
-    @property EdgeKind kind() const pure {
-        return this._kind;
-    }
-
     /++
     Params:
-        kind = This edge's kind, fixed on construction.
+        kind = This edge's kind.
         target = Must point to a matching in-edge slot.
     +/
     this(EdgeKind kind, InEdge* target = null) pure {
-        this._kind = kind;
+        this.kind = kind;
         this.target = target;
     }
     @disable this();
@@ -135,14 +121,16 @@ struct OutEdge {
 
     An out-edge slot is only equivalent to another if they point to equal [InEdge] slots.
     +/
-    bool opEquals(const(OutEdge) other) const {
+    bool opEquals(const(OutEdge) other) const pure
+    in (this.target == null || this.target.kind == this.kind)
+    {
         if (this.kind != other.kind) return false;
         if (this.target == other.target) return true;
         if (this.target == null || other.target == null) return false;
         return *this.target == *other.target;
     }
 
-    hash_t toHash() const {
+    hash_t toHash() const pure {
         if (this.target == null) return this.kind.hashOf;
         return this.target.toHash();
     }
@@ -150,7 +138,7 @@ struct OutEdge {
 
 ///
 @nogc nothrow unittest {
-    auto def = InEdge.data;
+    auto def = InEdge.data(null);
     auto use1 = OutEdge.data;
     auto use2 = OutEdge.data;
     // data edges are directed from uses to defs
@@ -177,27 +165,23 @@ Therefore, most structural node comparisons actually translate into a series of 
 struct InEdge {
     mixin(taggedPointer!(
         Node*, "owner",
-        EdgeKind, "_kind", 2
+        EdgeKind, "kind", 2
     ));
 
     ID id;
     alias ID = ushort;
 
  pragma(inline) @nogc nothrow:
-    @property EdgeKind kind() const pure {
-        return this._kind;
-    }
-
     /++
     Params:
-        kind = This edge's kind, fixed on construction.
+        kind = This edge's kind.
         owner = Must point to the node which owns this edge slot.
         id = Uniquely identifies this in-edge slot within its owner node (internal usage only).
     +/
-    this(EdgeKind kind, Node* owner = null, size_t id = 0) pure
+    this(EdgeKind kind, Node* owner, size_t id = 0) pure
     in (id <= ID.max, "can't have an internal id greater than " ~ ID.max.stringof)
     {
-        this._kind = kind;
+        this.kind = kind;
         this.owner = owner;
         this.id = cast(ID)id;
     }
@@ -210,7 +194,7 @@ struct InEdge {
     An in-edge slot is only equivalent to another if they represent equal values.
     We approximate this by checking that the slots' owner nodes are equal AND the slots are in a corresponding position in their respective owner (i.e. they stand for the same thing inside that node).
     +/
-    bool opEquals(ref const(InEdge) other) const {
+    bool opEquals(ref const(InEdge) other) const pure {
         if (this.kind != other.kind) return false;
         if (this.id != other.id) return false;
         if (this.owner == other.owner) return true;
@@ -218,7 +202,7 @@ struct InEdge {
         return *this.owner == *other.owner;
     }
 
-    hash_t toHash() const {
+    hash_t toHash() const pure {
         hash_t hash = this.kind.hashOf ^ this.id.hashOf;
         if (this.owner != null) hash ^= this.owner.toHash();
         return hash;
@@ -228,7 +212,7 @@ struct InEdge {
 ///
 @nogc nothrow pure unittest {
     auto A = OutEdge.control;
-    auto B = InEdge.control;
+    auto B = InEdge.control(null);
     // control is flowing out from A and into B
     A.target = &B;
     assert(A.target.owner is B.owner);
@@ -267,7 +251,7 @@ $(SMALL_TABLE
 struct Node {
  package:
     struct VTable {
-     @nogc nothrow:
+     @nogc nothrow pure:
         bool function(const(Node)*, const(Node)*) opEquals = null;
         hash_t function(const(Node)*) toHash = null;
     }
@@ -280,7 +264,7 @@ struct Node {
     CommonPrefix _node;
     alias _node this;
 
- public pragma(inline) @nogc nothrow:
+ public pragma(inline) @nogc nothrow pure:
     /++
     Updates a node's cached hash value.
 
@@ -308,7 +292,7 @@ struct Node {
     }
 
     /// Returns this node's (assumedly [updateHash|up to date]) cached hash value.
-    hash_t toHash() const pure {
+    hash_t toHash() const {
         return this.hash ^ this.vptr.hashOf;
     }
 }
@@ -326,7 +310,7 @@ private mixin template NodeInheritance() {
     alias _node this;
 
     package static immutable(Node.VTable) vtbl = {
-        opEquals: (const(Node)* lhs, const(Node)* rhs) {
+        opEquals: (const(Node)* lhs, const(Node)* rhs) @nogc nothrow pure {
             const(This)* self = This.ofNode(lhs);
             const(This)* other = This.ofNode(rhs);
             assert(self != null && other != null);
@@ -336,7 +320,7 @@ private mixin template NodeInheritance() {
             );
             return *self == *other;
         },
-        toHash: (const(Node)* node) {
+        toHash: (const(Node)* node) @nogc nothrow pure {
             const(This)* self = This.ofNode(node);
             assert(self != null);
             static assert(
@@ -347,7 +331,7 @@ private mixin template NodeInheritance() {
         },
     };
 
-    public pragma(inline) @nogc nothrow {
+    public pragma(inline) @nogc nothrow pure {
         void updateHash() {
             this._node.hash = this.toHash();
         }
@@ -357,14 +341,14 @@ private mixin template NodeInheritance() {
             "common node prefix must be at a zero offset for safe polymorphism"
         );
 
-        inout(Node)* asNode() inout pure
+        inout(Node)* asNode() inout
         return /// XXX: return annotation needed in DMD 2.100.0
         in (this.vptr == &vtbl, "can't upcast an uninitialized node")
         {
             return cast(inout(Node)*)&this._node;
         }
 
-        static inout(This)* ofNode(inout(Node)* node) pure {
+        static inout(This)* ofNode(inout(Node)* node) {
             if (node == null || node.vptr != &vtbl) return null;
             return cast(inout(This)*)node;
         }
@@ -379,7 +363,7 @@ version (unittest) private { // for some reason, this needs to be in global scop
         mixin NodeInheritance;
         int value;
 
-     @nogc nothrow:
+     @nogc nothrow pure:
         this(int value) { this.value = value; }
 
         bool opEquals(ref const(UnittestNode) rhs) const {
@@ -427,6 +411,9 @@ version (unittest) private { // for some reason, this needs to be in global scop
 }
 
 
+package struct mnemonic { string shorthand; }
+
+
 /++
 Gyre's main mechanism for procedural abstraction, the join node.
 
@@ -456,7 +443,7 @@ Thus, join nodes can also be used to merge concurrent control flows, which shoul
 
 See_Also: [InstantiationNode], [JumpNode], [ForkNode]
 +/
-struct JoinNode {
+@mnemonic("join") struct JoinNode {
     mixin NodeInheritance;
 
     /// This join node's definition (a `data` slot), used to instantiate and invoke it.
@@ -531,15 +518,21 @@ struct JoinNode {
     Every join node has its own identity, so no two are equal.
     NOTE: We use join nodes as cycle breakers when doing structural comparison (since that's a cheap way to avoid infinite recursion), therefore the cycle rule MUST be maintained by container graphs.
     +/
-    bool opEquals(ref const(JoinNode) rhs) const {
+    bool opEquals(ref const(JoinNode) rhs) const pure {
         return this.asNode == rhs.asNode; // self-ptr
     }
 
-    hash_t toHash() const {
-        return this.asNode.hashOf;
+    hash_t toHash() const pure {
+        hash_t hash = 0;
+        foreach (parameters; channels) {
+            foreach (param; parameters) {
+                hash -= param.kind.hashOf;
+            }
+        }
+        return hash;
     }
 
-    /// Adjusts in-edge slots after a move.
+    /// Post-move adjusts in-edge slots' internal pointer.
     void opPostMove(ref const(JoinNode) old) pure {
         this.definition.owner = this.asNode;
         foreach (parameters; this.channels) {
@@ -563,7 +556,8 @@ struct JoinNode {
     assert(join.definition.owner == join.asNode);
     assert(join.channels.length == 1);
     assert(join.channels[0].length == 4);
-    // free it
+    // free it (and the second free should be a no-op)
+    JoinNode.dispose(&join);
     JoinNode.dispose(&join);
 }
 
@@ -580,7 +574,7 @@ TODO: continuation semantics are unclear w.r.t. multiple uses and scope. e.g.: c
 
 See_Also: [JoinNode], [JumpNode]
 +/
-struct InstantiationNode {
+@mnemonic("inst") struct InstantiationNode {
     mixin NodeInheritance;
 
     /// Points to the definition of the join node being instantiated.
@@ -630,15 +624,15 @@ struct InstantiationNode {
     Every instantiation node has its own identity, so no two are equal.
     If this weren't the case, there would be no way to instantiate a join pattern twice and use the two instances independently.
     +/
-    bool opEquals(ref const(InstantiationNode) rhs) const {
+    bool opEquals(ref const(InstantiationNode) rhs) const pure {
         return this.asNode == rhs.asNode; // self-ptr
     }
 
-    hash_t toHash() const {
-        return this.asNode.hashOf;
+    hash_t toHash() const pure {
+        return continuations.length.hashOf;
     }
 
-    /// Adjusts in-edge slots after a move.
+    /// Post-move adjusts in-edge slots' internal pointer.
     void opPostMove(ref const(InstantiationNode) old) pure {
         foreach (ref cont; this.continuations) cont.owner = this.asNode;
     }
@@ -652,8 +646,10 @@ struct InstantiationNode {
     moveEmplace(tmp, inst);
     //
     assert(inst == inst);
+    assert(inst.continuations[0].owner == inst.asNode);
     assert(inst.continuations.length == 1);
     //
+    InstantiationNode.dispose(&inst);
     InstantiationNode.dispose(&inst);
 }
 
@@ -675,7 +671,7 @@ Note that this does not apply to single-channel join patterns.
 
 See_Also: [JoinNode]
 +/
-struct JumpNode {
+@mnemonic("jump") struct JumpNode {
     mixin NodeInheritance;
 
     /// Incoming control flow which is about to be yielded to the target continuation.
@@ -729,19 +725,19 @@ struct JumpNode {
     Notice that, since procedure calls usually take return continuations as parameters, this does not eliminate subexpressions which are only equal in a syntactic sense.
     For instance, `printf("hi") + printf("hi")` cannot be transformed to `(t = printf("hi")), t + t`, since the continuation of each `printf` call is different.
     +/
-    bool opEquals(ref const(JumpNode) rhs) const {
+    bool opEquals(ref const(JumpNode) rhs) const pure {
         if (this.continuation != rhs.continuation) return false;
         if (this.arguments != rhs.arguments) return false;
         return true;
     }
 
-    hash_t toHash() const {
+    hash_t toHash() const pure {
         hash_t hash = this.continuation.toHash();
         foreach (arg; this.arguments) hash -= arg.toHash();
         return hash;
     }
 
-    /// Adjusts in-edge slots after a move.
+    /// Post-move adjusts in-edge slots' internal pointer.
     void opPostMove(ref const(JumpNode) old) pure {
         this.control.owner = this.asNode;
     }
@@ -758,6 +754,7 @@ struct JumpNode {
     assert(jump.control.owner == jump.asNode);
     assert(jump.arguments.length == 4);
     //
+    JumpNode.dispose(&jump);
     JumpNode.dispose(&jump);
 }
 
@@ -778,7 +775,7 @@ TODO: fork semantics are unclear w.r.t. progress. e.g.: when one thread blocks (
 
 See_Also: [JoinNode], [JumpNode]
 +/
-struct ForkNode {
+@mnemonic("fork") struct ForkNode {
     mixin NodeInheritance;
 
     /// Incoming single control flow.
@@ -825,18 +822,18 @@ struct ForkNode {
 
     Fork nodes are the same if and only if their resulting flows behave exactly the same (in which case they are still separate logical threads, but with a shared structure in the IR).
     +/
-    bool opEquals(ref const(ForkNode) rhs) const {
+    bool opEquals(ref const(ForkNode) rhs) const pure {
         if (this.threads != rhs.threads) return false;
         return true;
     }
 
-    hash_t toHash() const {
+    hash_t toHash() const pure {
         hash_t hash = 0;
         foreach (thread; this.threads) hash -= thread.toHash();
         return hash;
     }
 
-    /// Adjusts in-edge slots after a move.
+    /// Post-move adjusts in-edge slots' internal pointer.
     void opPostMove(ref const(ForkNode) old) pure {
         this.control.owner = this.asNode;
     }
@@ -853,6 +850,7 @@ struct ForkNode {
     assert(fork.control.owner == fork.asNode);
     //
     ForkNode.dispose(&fork);
+    ForkNode.dispose(&fork);
 }
 
 /++
@@ -868,7 +866,7 @@ In the worst case, however, this would require one extra [InstantiationNode|inst
 
 See_Also: [MultiplexerNode]
 +/
-struct ConditionalNode {
+@mnemonic("cond") struct ConditionalNode {
     mixin NodeInheritance;
 
     /// Data selector used to choose the taken branch.
@@ -931,17 +929,17 @@ struct ConditionalNode {
 
     Conditional nodes are the same if and only if they use the same value to select the taken branch and every branch in one has a corresponding branch in the other.
     +/
-    bool opEquals(ref const(ConditionalNode) rhs) const {
+    bool opEquals(ref const(ConditionalNode) rhs) const pure {
         if (this.selector != rhs.selector) return false;
         if (*this.options != *rhs.options) return false;
         return true;
     }
 
-    hash_t toHash() const {
+    hash_t toHash() const pure {
         return this.selector.toHash() ^ this.options.toHash();
     }
 
-    /// Adjusts in-edge slots after a move.
+    /// Post-move adjusts in-edge slots' internal pointer.
     void opPostMove(ref const(ConditionalNode) old) pure {
         this.control.owner = this.asNode;
     }
@@ -957,6 +955,7 @@ struct ConditionalNode {
     assert(cond == cond);
     assert(cond.control.owner == cond.asNode);
     //
+    ConditionalNode.dispose(&cond);
     ConditionalNode.dispose(&cond);
 }
 
@@ -984,7 +983,7 @@ The intention is that macros must always have the same semantics, but a Gyre com
 Just like linker-resolved symbols, macro nodes need to be uniquely identified.
 It is this identification which allows the compiler to, later in the compilation pipeline, substitute the macro node with (i.e. "link in") its definition.
 +/
-struct MacroNode {
+@mnemonic("macro_") struct MacroNode {
     mixin NodeInheritance;
 
     /// Links this macro node to its external definition.
@@ -1049,15 +1048,15 @@ struct MacroNode {
 
     Since macro nodes can expand into arbitrary subgraphs, we treat each one individually.
     +/
-    bool opEquals(ref const(MacroNode) rhs) const {
+    bool opEquals(ref const(MacroNode) rhs) const pure {
         return this.id == rhs.id && this.asNode == rhs.asNode; // self-ptr
     }
 
-    hash_t toHash() const {
-        return this.id.hashOf ^ this.asNode.hashOf;
+    hash_t toHash() const pure {
+        return this.id.hashOf;
     }
 
-    /// Adjusts in-edge slots after a move.
+    /// Post-move adjusts in-edge slots' internal pointer.
     void opPostMove(ref const(MacroNode) old) pure {
         foreach (ref slot; this.inEdges) slot.owner = this.asNode;
     }
@@ -1074,7 +1073,9 @@ struct MacroNode {
     assert(node.id == 42);
     assert(node.inEdges.length == 3);
     assert(node.outEdges.length == 2);
+    assert(node.inEdges[0].owner == node.asNode);
     //
+    MacroNode.dispose(&node);
     MacroNode.dispose(&node);
 }
 
@@ -1084,7 +1085,7 @@ Constructs a constant value of a certain type.
 
 See_Also: [UndefinedNode]
 +/
-struct ConstantNode {
+@mnemonic("const_") struct ConstantNode {
     mixin NodeInheritance;
 
     // FIXME: temporary assumption that all types are i64
@@ -1127,15 +1128,15 @@ struct ConstantNode {
 
     The easy case: constants are equal if and only if their values are equal.
     +/
-    bool opEquals(ref const(ConstantNode) rhs) const {
+    bool opEquals(ref const(ConstantNode) rhs) const pure {
         return this.literal == rhs.literal;
     }
 
-    hash_t toHash() const {
+    hash_t toHash() const pure {
         return this.literal.hashOf;
     }
 
-    /// Adjusts in-edge slots after a move.
+    /// Post-move adjusts in-edge slots' internal pointer.
     void opPostMove(ref const(ConstantNode) old) pure {
         this.value.owner = this.asNode;
     }
@@ -1152,6 +1153,7 @@ struct ConstantNode {
     assert(lit.value.owner == lit.asNode);
     //
     ConstantNode.dispose(&lit);
+    ConstantNode.dispose(&lit);
 }
 
 /++
@@ -1165,7 +1167,7 @@ Rationale: Undefined values cannot be produced by [ConstantNode]s, because the l
 
 See_Also: [ConstantNode]
 +/
-struct UndefinedNode {
+@mnemonic("undef") struct UndefinedNode {
     mixin NodeInheritance;
 
     /// The resulting value.
@@ -1203,15 +1205,15 @@ struct UndefinedNode {
 
     Since different undefined nodes can resolve to different values, each has its own identity.
     +/
-    bool opEquals(ref const(UndefinedNode) rhs) const {
+    bool opEquals(ref const(UndefinedNode) rhs) const pure {
         return this.asNode == rhs.asNode; // self-ptr
     }
 
-    hash_t toHash() const {
-        return this.asNode.hashOf;
+    hash_t toHash() const pure {
+        return hash_t.max;
     }
 
-    /// Adjusts in-edge slots after a move.
+    /// Post-move adjusts in-edge slots' internal pointer.
     void opPostMove(ref const(UndefinedNode) old) pure {
         this.value.owner = this.asNode;
     }
@@ -1228,10 +1230,11 @@ struct UndefinedNode {
     assert(undef.value.owner == undef.asNode);
     //
     UndefinedNode.dispose(&undef);
+    UndefinedNode.dispose(&undef);
 }
 
 /// Yields the lowermost bits of its input.
-struct TruncationNode { // FIXME: doesn't make sense without type info
+@mnemonic("trunc") struct TruncationNode { // FIXME: doesn't make sense without type info
     mixin NodeInheritance;
 
     /// Bit pattern being truncated.
@@ -1269,15 +1272,15 @@ struct TruncationNode { // FIXME: doesn't make sense without type info
     }
 
     /// Semantic equality <=> structural equality.
-    bool opEquals(ref const(TruncationNode) rhs) const {
+    bool opEquals(ref const(TruncationNode) rhs) const pure {
         return this.input == rhs.input;
     }
 
-    hash_t toHash() const {
+    hash_t toHash() const pure {
         return this.input.toHash();
     }
 
-    /// Adjusts in-edge slots after a move.
+    /// Post-move adjusts in-edge slots' internal pointer.
     void opPostMove(ref const(TruncationNode) old) pure {
         this.output.owner = this.asNode;
     }
@@ -1294,6 +1297,7 @@ struct TruncationNode { // FIXME: doesn't make sense without type info
     assert(trunc.output.owner == trunc.asNode);
     //
     TruncationNode.dispose(&trunc);
+    TruncationNode.dispose(&trunc);
 }
 
 /++
@@ -1301,7 +1305,7 @@ Yields a wider version of its input, with added bits set to zero.
 
 See_Also: [SignedExtensionNode]
 +/
-struct UnsignedExtensionNode { // FIXME: doesn't make sense without type info
+@mnemonic("extu") struct UnsignedExtensionNode { // FIXME: doesn't make sense without type info
     mixin NodeInheritance;
 
     /// Bit pattern being extended.
@@ -1339,15 +1343,15 @@ struct UnsignedExtensionNode { // FIXME: doesn't make sense without type info
     }
 
     /// Semantic equality <=> structural equality.
-    bool opEquals(ref const(UnsignedExtensionNode) rhs) const {
+    bool opEquals(ref const(UnsignedExtensionNode) rhs) const pure {
         return this.input == rhs.input;
     }
 
-    hash_t toHash() const {
+    hash_t toHash() const pure {
         return this.input.toHash();
     }
 
-    /// Adjusts in-edge slots after a move.
+    /// Post-move adjusts in-edge slots' internal pointer.
     void opPostMove(ref const(UnsignedExtensionNode) old) pure {
         this.output.owner = this.asNode;
     }
@@ -1364,6 +1368,7 @@ struct UnsignedExtensionNode { // FIXME: doesn't make sense without type info
     assert(extu.output.owner == extu.asNode);
     //
     UnsignedExtensionNode.dispose(&extu);
+    UnsignedExtensionNode.dispose(&extu);
 }
 
 /++
@@ -1371,7 +1376,7 @@ Yields a wider version of its input, with added bits equal to the input's sign b
 
 See_Also: [UnsignedExtensionNode]
 +/
-struct SignedExtensionNode { // FIXME: doesn't make sense without type info
+@mnemonic("exts") struct SignedExtensionNode { // FIXME: doesn't make sense without type info
     mixin NodeInheritance;
 
     /// Bit pattern being extended.
@@ -1409,15 +1414,15 @@ struct SignedExtensionNode { // FIXME: doesn't make sense without type info
     }
 
     /// Semantic equality <=> structural equality.
-    bool opEquals(ref const(SignedExtensionNode) rhs) const {
+    bool opEquals(ref const(SignedExtensionNode) rhs) const pure {
         return this.input == rhs.input;
     }
 
-    hash_t toHash() const {
+    hash_t toHash() const pure {
         return this.input.toHash();
     }
 
-    /// Adjusts in-edge slots after a move.
+    /// Post-move adjusts in-edge slots' internal pointer.
     void opPostMove(ref const(SignedExtensionNode) old) pure {
         this.output.owner = this.asNode;
     }
@@ -1434,6 +1439,7 @@ struct SignedExtensionNode { // FIXME: doesn't make sense without type info
     assert(exts.output.owner == exts.asNode);
     //
     SignedExtensionNode.dispose(&exts);
+    SignedExtensionNode.dispose(&exts);
 }
 
 /++
@@ -1449,7 +1455,7 @@ Thus, its semantics are slightly different: whereas a control flow branch disall
 
 See_Also: [ConditionalNode]
 +/
-struct MultiplexerNode {
+@mnemonic("mux") struct MultiplexerNode {
     mixin NodeInheritance;
 
     /// Data dependency used to choose which of the given inputs will be returned.
@@ -1508,17 +1514,17 @@ struct MultiplexerNode {
     }
 
     /// Semantic equality <=> structural equality.
-    bool opEquals(ref const(MultiplexerNode) rhs) const {
+    bool opEquals(ref const(MultiplexerNode) rhs) const pure {
         if (this.selector != rhs.selector) return false;
         if (*this.inputs != *rhs.inputs) return false;
         return true;
     }
 
-    hash_t toHash() const {
+    hash_t toHash() const pure {
         return this.selector.toHash() ^ this.inputs.toHash();
     }
 
-    /// Adjusts in-edge slots after a move.
+    /// Post-move adjusts in-edge slots' internal pointer.
     void opPostMove(ref const(MultiplexerNode) old) pure {
         this.output.owner = this.asNode;
     }
@@ -1535,10 +1541,11 @@ struct MultiplexerNode {
     assert(mux.output.owner == mux.asNode);
     //
     MultiplexerNode.dispose(&mux);
+    MultiplexerNode.dispose(&mux);
 }
 
 /// Bitwise `AND` operation.
-struct AndNode {
+@mnemonic("and") struct AndNode {
     mixin NodeInheritance;
 
     /// Resulting bit pattern.
@@ -1578,16 +1585,16 @@ struct AndNode {
     }
 
     /// Semantic equality <=> structural equality (modulo operand order).
-    bool opEquals(ref const(AndNode) other) const {
+    bool opEquals(ref const(AndNode) other) const pure {
         return (this.lhs == other.lhs && this.rhs == other.rhs)
             || (this.lhs == other.rhs && this.rhs == other.lhs);
     }
 
-    hash_t toHash() const {
+    hash_t toHash() const pure {
         return this.lhs.toHash() ^ this.rhs.toHash();
     }
 
-    /// Adjusts in-edge slots after a move.
+    /// Post-move adjusts in-edge slots' internal pointer.
     void opPostMove(ref const(AndNode) old) pure {
         this.result.owner = this.asNode;
     }
@@ -1604,10 +1611,11 @@ struct AndNode {
     assert(and.result.owner == and.asNode);
     //
     AndNode.dispose(&and);
+    AndNode.dispose(&and);
 }
 
 /// Bitwise `OR` operation.
-struct OrNode {
+@mnemonic("or") struct OrNode {
     mixin NodeInheritance;
 
     /// Resulting bit pattern.
@@ -1647,16 +1655,16 @@ struct OrNode {
     }
 
     /// Semantic equality <=> structural equality (modulo operand order).
-    bool opEquals(ref const(OrNode) other) const {
+    bool opEquals(ref const(OrNode) other) const pure {
         return (this.lhs == other.lhs && this.rhs == other.rhs)
             || (this.lhs == other.rhs && this.rhs == other.lhs);
     }
 
-    hash_t toHash() const {
+    hash_t toHash() const pure {
         return this.lhs.toHash() ^ this.rhs.toHash();
     }
 
-    /// Adjusts in-edge slots after a move.
+    /// Post-move adjusts in-edge slots' internal pointer.
     void opPostMove(ref const(OrNode) old) pure {
         this.result.owner = this.asNode;
     }
@@ -1673,6 +1681,7 @@ struct OrNode {
     assert(or.result.owner == or.asNode);
     //
     OrNode.dispose(&or);
+    OrNode.dispose(&or);
 }
 
 /++
@@ -1680,7 +1689,7 @@ Bitwise `XOR` operation.
 
 Can be used as a unary `NOT` operation when one operand is an all-ones constant.
 +/
-struct XorNode {
+@mnemonic("xor") struct XorNode {
     mixin NodeInheritance;
 
     /// Resulting bit pattern.
@@ -1720,16 +1729,16 @@ struct XorNode {
     }
 
     /// Semantic equality <=> structural equality (modulo operand order).
-    bool opEquals(ref const(XorNode) other) const {
+    bool opEquals(ref const(XorNode) other) const pure {
         return (this.lhs == other.lhs && this.rhs == other.rhs)
             || (this.lhs == other.rhs && this.rhs == other.lhs);
     }
 
-    hash_t toHash() const {
+    hash_t toHash() const pure {
         return this.lhs.toHash() ^ this.rhs.toHash();
     }
 
-    /// Adjusts in-edge slots after a move.
+    /// Post-move adjusts in-edge slots' internal pointer.
     void opPostMove(ref const(XorNode) old) pure {
         this.result.owner = this.asNode;
     }
@@ -1746,6 +1755,7 @@ struct XorNode {
     assert(xor.result.owner == xor.asNode);
     //
     XorNode.dispose(&xor);
+    XorNode.dispose(&xor);
 }
 
 /++
@@ -1755,7 +1765,7 @@ Shift amount must be no greater than the number of input bits, otherwise results
 
 See_Also: [LeftShiftNoOverflowNode]
 +/
-struct LeftShiftNode {
+@mnemonic("shl") struct LeftShiftNode {
     mixin NodeInheritance;
 
     /// Initial bit pattern being shifted.
@@ -1797,17 +1807,17 @@ struct LeftShiftNode {
     }
 
     /// Semantic equality <=> structural equality.
-    bool opEquals(ref const(LeftShiftNode) rhs) const {
+    bool opEquals(ref const(LeftShiftNode) rhs) const pure {
         if (this.input != rhs.input) return false;
         if (this.shift != rhs.shift) return false;
         return true;
     }
 
-    hash_t toHash() const {
+    hash_t toHash() const pure {
         return this.input.toHash() - this.shift.toHash();
     }
 
-    /// Adjusts in-edge slots after a move.
+    /// Post-move adjusts in-edge slots' internal pointer.
     void opPostMove(ref const(LeftShiftNode) old) pure {
         this.output.owner = this.asNode;
     }
@@ -1824,6 +1834,7 @@ struct LeftShiftNode {
     assert(shl.output.owner == shl.asNode);
     //
     LeftShiftNode.dispose(&shl);
+    LeftShiftNode.dispose(&shl);
 }
 
 /++
@@ -1835,7 +1846,7 @@ In other words, the result is treated as multiplication by a power of two and it
 
 See_Also: [LeftShiftNode]
 +/
-struct LeftShiftNoOverflowNode {
+@mnemonic("shlno") struct LeftShiftNoOverflowNode {
     mixin NodeInheritance;
 
     /// Initial bit pattern being shifted.
@@ -1877,17 +1888,17 @@ struct LeftShiftNoOverflowNode {
     }
 
     /// Semantic equality <=> structural equality.
-    bool opEquals(ref const(LeftShiftNoOverflowNode) rhs) const {
+    bool opEquals(ref const(LeftShiftNoOverflowNode) rhs) const pure {
         if (this.input != rhs.input) return false;
         if (this.shift != rhs.shift) return false;
         return true;
     }
 
-    hash_t toHash() const {
+    hash_t toHash() const pure {
         return this.input.toHash() - this.shift.toHash();
     }
 
-    /// Adjusts in-edge slots after a move.
+    /// Post-move adjusts in-edge slots' internal pointer.
     void opPostMove(ref const(LeftShiftNoOverflowNode) old) pure {
         this.output.owner = this.asNode;
     }
@@ -1904,6 +1915,7 @@ struct LeftShiftNoOverflowNode {
     assert(shlno.output.owner == shlno.asNode);
     //
     LeftShiftNoOverflowNode.dispose(&shlno);
+    LeftShiftNoOverflowNode.dispose(&shlno);
 }
 
 /++
@@ -1913,7 +1925,7 @@ Shift amount must be no greater than the number of input bits, otherwise results
 
 See_Also: [SignedRightShiftNode]
 +/
-struct UnsignedRightShiftNode {
+@mnemonic("shru") struct UnsignedRightShiftNode {
     mixin NodeInheritance;
 
     /// Initial bit pattern being shifted.
@@ -1955,17 +1967,17 @@ struct UnsignedRightShiftNode {
     }
 
     /// Semantic equality <=> structural equality.
-    bool opEquals(ref const(UnsignedRightShiftNode) rhs) const {
+    bool opEquals(ref const(UnsignedRightShiftNode) rhs) const pure {
         if (this.input != rhs.input) return false;
         if (this.shift != rhs.shift) return false;
         return true;
     }
 
-    hash_t toHash() const {
+    hash_t toHash() const pure {
         return this.input.toHash() - this.shift.toHash();
     }
 
-    /// Adjusts in-edge slots after a move.
+    /// Post-move adjusts in-edge slots' internal pointer.
     void opPostMove(ref const(UnsignedRightShiftNode) old) pure {
         this.output.owner = this.asNode;
     }
@@ -1982,6 +1994,7 @@ struct UnsignedRightShiftNode {
     assert(shru.output.owner == shru.asNode);
     //
     UnsignedRightShiftNode.dispose(&shru);
+    UnsignedRightShiftNode.dispose(&shru);
 }
 
 /++
@@ -1991,7 +2004,7 @@ Shift amount must be no greater than the number of input bits, otherwise results
 
 See_Also: [UnsignedRightShiftNode]
 +/
-struct SignedRightShiftNode {
+@mnemonic("shrs") struct SignedRightShiftNode {
     mixin NodeInheritance;
 
     /// Initial bit pattern being shifted.
@@ -2033,17 +2046,17 @@ struct SignedRightShiftNode {
     }
 
     /// Semantic equality <=> structural equality.
-    bool opEquals(ref const(SignedRightShiftNode) rhs) const {
+    bool opEquals(ref const(SignedRightShiftNode) rhs) const pure {
         if (this.input != rhs.input) return false;
         if (this.shift != rhs.shift) return false;
         return true;
     }
 
-    hash_t toHash() const {
+    hash_t toHash() const pure {
         return this.input.toHash() - this.shift.toHash();
     }
 
-    /// Adjusts in-edge slots after a move.
+    /// Post-move adjusts in-edge slots' internal pointer.
     void opPostMove(ref const(SignedRightShiftNode) old) pure {
         this.output.owner = this.asNode;
     }
@@ -2060,6 +2073,7 @@ struct SignedRightShiftNode {
     assert(shrs.output.owner == shrs.asNode);
     //
     SignedRightShiftNode.dispose(&shrs);
+    SignedRightShiftNode.dispose(&shrs);
 }
 
 /++
@@ -2069,7 +2083,7 @@ Wraps around on overflow.
 
 See_Also: [AdditionNoOverflowSignedNode]
 +/
-struct AdditionNode {
+@mnemonic("add") struct AdditionNode {
     mixin NodeInheritance;
 
     /// Resulting sum.
@@ -2109,16 +2123,16 @@ struct AdditionNode {
     }
 
     /// Semantic equality <=> structural equality (modulo operand order).
-    bool opEquals(ref const(AdditionNode) other) const {
+    bool opEquals(ref const(AdditionNode) other) const pure {
         return (this.lhs == other.lhs && this.rhs == other.rhs)
             || (this.lhs == other.rhs && this.rhs == other.lhs);
     }
 
-    hash_t toHash() const {
+    hash_t toHash() const pure {
         return this.lhs.toHash() ^ this.rhs.toHash();
     }
 
-    /// Adjusts in-edge slots after a move.
+    /// Post-move adjusts in-edge slots' internal pointer.
     void opPostMove(ref const(AdditionNode) old) pure {
         this.result.owner = this.asNode;
     }
@@ -2135,6 +2149,7 @@ struct AdditionNode {
     assert(add.result.owner == add.asNode);
     //
     AdditionNode.dispose(&add);
+    AdditionNode.dispose(&add);
 }
 
 /++
@@ -2144,7 +2159,7 @@ Produces [poison](gyre.nodes.html#poison-values-and-ub) on signed overflow.
 
 See_Also: [AdditionNode]
 +/
-struct AdditionNoOverflowSignedNode {
+@mnemonic("addnos") struct AdditionNoOverflowSignedNode {
     mixin NodeInheritance;
 
     /// Resulting sum.
@@ -2184,16 +2199,16 @@ struct AdditionNoOverflowSignedNode {
     }
 
     /// Semantic equality <=> structural equality (modulo operand order).
-    bool opEquals(ref const(AdditionNoOverflowSignedNode) other) const {
+    bool opEquals(ref const(AdditionNoOverflowSignedNode) other) const pure {
         return (this.lhs == other.lhs && this.rhs == other.rhs)
             || (this.lhs == other.rhs && this.rhs == other.lhs);
     }
 
-    hash_t toHash() const {
+    hash_t toHash() const pure {
         return this.lhs.toHash() ^ this.rhs.toHash();
     }
 
-    /// Adjusts in-edge slots after a move.
+    /// Post-move adjusts in-edge slots' internal pointer.
     void opPostMove(ref const(AdditionNoOverflowSignedNode) old) pure {
         this.result.owner = this.asNode;
     }
@@ -2210,6 +2225,7 @@ struct AdditionNoOverflowSignedNode {
     assert(addnos.result.owner == addnos.asNode);
     //
     AdditionNoOverflowSignedNode.dispose(&addnos);
+    AdditionNoOverflowSignedNode.dispose(&addnos);
 }
 
 /++
@@ -2219,7 +2235,7 @@ Wraps around on overflow.
 
 See_Also: [SubtractionNoOverflowSignedNode]
 +/
-struct SubtractionNode {
+@mnemonic("sub") struct SubtractionNode {
     mixin NodeInheritance;
 
     /// Left-hand-side operand.
@@ -2261,17 +2277,17 @@ struct SubtractionNode {
     }
 
     /// Semantic equality <=> structural equality.
-    bool opEquals(ref const(SubtractionNode) other) const {
+    bool opEquals(ref const(SubtractionNode) other) const pure {
         if (this.lhs != other.lhs) return false;
         if (this.rhs != other.rhs) return false;
         return true;
     }
 
-    hash_t toHash() const {
+    hash_t toHash() const pure {
         return this.lhs.toHash() - this.rhs.toHash();
     }
 
-    /// Adjusts in-edge slots after a move.
+    /// Post-move adjusts in-edge slots' internal pointer.
     void opPostMove(ref const(SubtractionNode) old) pure {
         this.result.owner = this.asNode;
     }
@@ -2288,6 +2304,7 @@ struct SubtractionNode {
     assert(sub.result.owner == sub.asNode);
     //
     SubtractionNode.dispose(&sub);
+    SubtractionNode.dispose(&sub);
 }
 
 /++
@@ -2297,7 +2314,7 @@ Produces [poison](gyre.nodes.html#poison-values-and-ub) on signed overflow.
 
 See_Also: [SubtractionNode]
 +/
-struct SubtractionNoOverflowSignedNode {
+@mnemonic("subnos") struct SubtractionNoOverflowSignedNode {
     mixin NodeInheritance;
 
     /// Left-hand-side operand.
@@ -2339,17 +2356,17 @@ struct SubtractionNoOverflowSignedNode {
     }
 
     /// Semantic equality <=> structural equality.
-    bool opEquals(ref const(SubtractionNoOverflowSignedNode) other) const {
+    bool opEquals(ref const(SubtractionNoOverflowSignedNode) other) const pure {
         if (this.lhs != other.lhs) return false;
         if (this.rhs != other.rhs) return false;
         return true;
     }
 
-    hash_t toHash() const {
+    hash_t toHash() const pure {
         return this.lhs.toHash() - this.rhs.toHash();
     }
 
-    /// Adjusts in-edge slots after a move.
+    /// Post-move adjusts in-edge slots' internal pointer.
     void opPostMove(ref const(SubtractionNoOverflowSignedNode) old) pure {
         this.result.owner = this.asNode;
     }
@@ -2366,6 +2383,7 @@ struct SubtractionNoOverflowSignedNode {
     assert(subnos.result.owner == subnos.asNode);
     //
     SubtractionNoOverflowSignedNode.dispose(&subnos);
+    SubtractionNoOverflowSignedNode.dispose(&subnos);
 }
 
 /++
@@ -2376,7 +2394,7 @@ Wraps around on overflow.
 
 See_Also: [MultiplicationNoOverflowSignedNode]
 +/
-struct MultiplicationNode {
+@mnemonic("mul") struct MultiplicationNode {
     mixin NodeInheritance;
 
     /// Resulting product.
@@ -2416,16 +2434,16 @@ struct MultiplicationNode {
     }
 
     /// Semantic equality <=> structural equality (modulo operand order).
-    bool opEquals(ref const(MultiplicationNode) other) const {
+    bool opEquals(ref const(MultiplicationNode) other) const pure {
         return (this.lhs == other.lhs && this.rhs == other.rhs)
             || (this.lhs == other.rhs && this.rhs == other.lhs);
     }
 
-    hash_t toHash() const {
+    hash_t toHash() const pure {
         return this.lhs.toHash() ^ this.rhs.toHash();
     }
 
-    /// Adjusts in-edge slots after a move.
+    /// Post-move adjusts in-edge slots' internal pointer.
     void opPostMove(ref const(MultiplicationNode) old) pure {
         this.result.owner = this.asNode;
     }
@@ -2442,6 +2460,7 @@ struct MultiplicationNode {
     assert(mul.result.owner == mul.asNode);
     //
     MultiplicationNode.dispose(&mul);
+    MultiplicationNode.dispose(&mul);
 }
 
 /++
@@ -2451,7 +2470,7 @@ Produces [poison](gyre.nodes.html#poison-values-and-ub) when the lower half of t
 
 See_Also: [MultiplicationNode]
 +/
-struct MultiplicationNoOverflowSignedNode {
+@mnemonic("mulnos") struct MultiplicationNoOverflowSignedNode {
     mixin NodeInheritance;
 
     /// Resulting product.
@@ -2491,16 +2510,16 @@ struct MultiplicationNoOverflowSignedNode {
     }
 
     /// Semantic equality <=> structural equality (modulo operand order).
-    bool opEquals(ref const(MultiplicationNoOverflowSignedNode) other) const {
+    bool opEquals(ref const(MultiplicationNoOverflowSignedNode) other) const pure {
         return (this.lhs == other.lhs && this.rhs == other.rhs)
             || (this.lhs == other.rhs && this.rhs == other.lhs);
     }
 
-    hash_t toHash() const {
+    hash_t toHash() const pure {
         return this.lhs.toHash() ^ this.rhs.toHash();
     }
 
-    /// Adjusts in-edge slots after a move.
+    /// Post-move adjusts in-edge slots' internal pointer.
     void opPostMove(ref const(MultiplicationNoOverflowSignedNode) old) pure {
         this.result.owner = this.asNode;
     }
@@ -2517,6 +2536,7 @@ struct MultiplicationNoOverflowSignedNode {
     assert(mulnos.result.owner == mulnos.asNode);
     //
     MultiplicationNoOverflowSignedNode.dispose(&mulnos);
+    MultiplicationNoOverflowSignedNode.dispose(&mulnos);
 }
 
 /++
@@ -2526,7 +2546,7 @@ The divisor must not be zero, otherwise the result is a [poison](gyre.nodes.html
 
 See_Also: [SignedDivisionNode]
 +/
-struct UnsignedDivisionNode {
+@mnemonic("divu") struct UnsignedDivisionNode {
     mixin NodeInheritance;
 
     /// Dividend operand.
@@ -2568,17 +2588,17 @@ struct UnsignedDivisionNode {
     }
 
     /// Semantic equality <=> structural equality.
-    bool opEquals(ref const(UnsignedDivisionNode) other) const {
+    bool opEquals(ref const(UnsignedDivisionNode) other) const pure {
         if (this.dividend != other.dividend) return false;
         if (this.divisor != other.divisor) return false;
         return true;
     }
 
-    hash_t toHash() const {
+    hash_t toHash() const pure {
         return this.dividend.toHash() - this.divisor.toHash();
     }
 
-    /// Adjusts in-edge slots after a move.
+    /// Post-move adjusts in-edge slots' internal pointer.
     void opPostMove(ref const(UnsignedDivisionNode) old) pure {
         this.quotient.owner = this.asNode;
     }
@@ -2595,6 +2615,7 @@ struct UnsignedDivisionNode {
     assert(divu.quotient.owner == divu.asNode);
     //
     UnsignedDivisionNode.dispose(&divu);
+    UnsignedDivisionNode.dispose(&divu);
 }
 
 /++
@@ -2605,7 +2626,7 @@ Furthermore, dividing the "most negative" value representable (in N bits, $(MATH
 
 See_Also: [UnsignedDivisionNode]
 +/
-struct SignedDivisionNode {
+@mnemonic("divs") struct SignedDivisionNode {
     mixin NodeInheritance;
 
     /// Dividend operand.
@@ -2647,17 +2668,17 @@ struct SignedDivisionNode {
     }
 
     /// Semantic equality <=> structural equality.
-    bool opEquals(ref const(SignedDivisionNode) other) const {
+    bool opEquals(ref const(SignedDivisionNode) other) const pure {
         if (this.dividend != other.dividend) return false;
         if (this.divisor != other.divisor) return false;
         return true;
     }
 
-    hash_t toHash() const {
+    hash_t toHash() const pure {
         return this.dividend.toHash() - this.divisor.toHash();
     }
 
-    /// Adjusts in-edge slots after a move.
+    /// Post-move adjusts in-edge slots' internal pointer.
     void opPostMove(ref const(SignedDivisionNode) old) pure {
         this.quotient.owner = this.asNode;
     }
@@ -2674,6 +2695,7 @@ struct SignedDivisionNode {
     assert(divs.quotient.owner == divs.asNode);
     //
     SignedDivisionNode.dispose(&divs);
+    SignedDivisionNode.dispose(&divs);
 }
 
 /++
@@ -2683,7 +2705,7 @@ The divisor must not be zero, otherwise the result is a [poison](gyre.nodes.html
 
 See_Also: [SignedRemainderNode]
 +/
-struct UnsignedRemainderNode {
+@mnemonic("remu") struct UnsignedRemainderNode {
     mixin NodeInheritance;
 
     /// Dividend operand.
@@ -2725,17 +2747,17 @@ struct UnsignedRemainderNode {
     }
 
     /// Semantic equality <=> structural equality.
-    bool opEquals(ref const(UnsignedRemainderNode) other) const {
+    bool opEquals(ref const(UnsignedRemainderNode) other) const pure {
         if (this.dividend != other.dividend) return false;
         if (this.divisor != other.divisor) return false;
         return true;
     }
 
-    hash_t toHash() const {
+    hash_t toHash() const pure {
         return this.dividend.toHash() - this.divisor.toHash();
     }
 
-    /// Adjusts in-edge slots after a move.
+    /// Post-move adjusts in-edge slots' internal pointer.
     void opPostMove(ref const(UnsignedRemainderNode) old) pure {
         this.remainder.owner = this.asNode;
     }
@@ -2752,6 +2774,7 @@ struct UnsignedRemainderNode {
     assert(remu.remainder.owner == remu.asNode);
     //
     UnsignedRemainderNode.dispose(&remu);
+    UnsignedRemainderNode.dispose(&remu);
 }
 
 /++
@@ -2762,7 +2785,7 @@ Furthermore, dividing the "most negative" value representable (in N bits, $(MATH
 
 See_Also: [UnsignedRemainderNode]
 +/
-struct SignedRemainderNode {
+@mnemonic("rems") struct SignedRemainderNode {
     mixin NodeInheritance;
 
     /// Dividend operand.
@@ -2804,17 +2827,17 @@ struct SignedRemainderNode {
     }
 
     /// Semantic equality <=> structural equality.
-    bool opEquals(ref const(SignedRemainderNode) other) const {
+    bool opEquals(ref const(SignedRemainderNode) other) const pure {
         if (this.dividend != other.dividend) return false;
         if (this.divisor != other.divisor) return false;
         return true;
     }
 
-    hash_t toHash() const {
+    hash_t toHash() const pure {
         return this.dividend.toHash() - this.divisor.toHash();
     }
 
-    /// Adjusts in-edge slots after a move.
+    /// Post-move adjusts in-edge slots' internal pointer.
     void opPostMove(ref const(SignedRemainderNode) old) pure {
         this.remainder.owner = this.asNode;
     }
@@ -2831,10 +2854,11 @@ struct SignedRemainderNode {
     assert(rems.remainder.owner == rems.asNode);
     //
     SignedRemainderNode.dispose(&rems);
+    SignedRemainderNode.dispose(&rems);
 }
 
 /// Compares two bit patterns for equality.
-struct EqualNode {
+@mnemonic("eq") struct EqualNode {
     mixin NodeInheritance;
 
     /// Operands (order doesn't matter).
@@ -2874,16 +2898,16 @@ struct EqualNode {
     }
 
     /// Semantic equality <=> structural equality.
-    bool opEquals(ref const(EqualNode) other) const {
+    bool opEquals(ref const(EqualNode) other) const pure {
         return (this.lhs == other.lhs && this.rhs == other.rhs)
             || (this.lhs == other.rhs && this.rhs == other.lhs);
     }
 
-    hash_t toHash() const {
+    hash_t toHash() const pure {
         return this.lhs.toHash() ^ this.rhs.toHash();
     }
 
-    /// Adjusts in-edge slots after a move.
+    /// Post-move adjusts in-edge slots' internal pointer.
     void opPostMove(ref const(EqualNode) old) pure {
         this.result.owner = this.asNode;
     }
@@ -2900,10 +2924,11 @@ struct EqualNode {
     assert(eq.result.owner == eq.asNode);
     //
     EqualNode.dispose(&eq);
+    EqualNode.dispose(&eq);
 }
 
 /// Compares two bit patterns for inequality.
-struct NotEqualNode {
+@mnemonic("ne") struct NotEqualNode {
     mixin NodeInheritance;
 
     /// Operands (order doesn't matter).
@@ -2943,16 +2968,16 @@ struct NotEqualNode {
     }
 
     /// Semantic equality <=> structural equality.
-    bool opEquals(ref const(NotEqualNode) other) const {
+    bool opEquals(ref const(NotEqualNode) other) const pure {
         return (this.lhs == other.lhs && this.rhs == other.rhs)
             || (this.lhs == other.rhs && this.rhs == other.lhs);
     }
 
-    hash_t toHash() const {
+    hash_t toHash() const pure {
         return this.lhs.toHash() ^ this.rhs.toHash();
     }
 
-    /// Adjusts in-edge slots after a move.
+    /// Post-move adjusts in-edge slots' internal pointer.
     void opPostMove(ref const(NotEqualNode) old) pure {
         this.result.owner = this.asNode;
     }
@@ -2969,6 +2994,7 @@ struct NotEqualNode {
     assert(ne.result.owner == ne.asNode);
     //
     NotEqualNode.dispose(&ne);
+    NotEqualNode.dispose(&ne);
 }
 
 /++
@@ -2976,7 +3002,7 @@ Computes whether a (unsigned) two's complement integer is strictly less than ano
 
 There is no equivalent for `>` because it suffices to swap this node's operands.
 +/
-struct UnsignedLessThanNode {
+@mnemonic("ltu") struct UnsignedLessThanNode {
     mixin NodeInheritance;
 
     /// Left-hand-side operand.
@@ -3018,17 +3044,17 @@ struct UnsignedLessThanNode {
     }
 
     /// Semantic equality <=> structural equality.
-    bool opEquals(ref const(UnsignedLessThanNode) other) const {
+    bool opEquals(ref const(UnsignedLessThanNode) other) const pure {
         if (this.lhs != other.lhs) return false;
         if (this.rhs != other.rhs) return false;
         return true;
     }
 
-    hash_t toHash() const {
+    hash_t toHash() const pure {
         return this.lhs.toHash() - this.rhs.toHash();
     }
 
-    /// Adjusts in-edge slots after a move.
+    /// Post-move adjusts in-edge slots' internal pointer.
     void opPostMove(ref const(UnsignedLessThanNode) old) pure {
         this.result.owner = this.asNode;
     }
@@ -3045,6 +3071,7 @@ struct UnsignedLessThanNode {
     assert(ltu.result.owner == ltu.asNode);
     //
     UnsignedLessThanNode.dispose(&ltu);
+    UnsignedLessThanNode.dispose(&ltu);
 }
 
 /++
@@ -3052,7 +3079,7 @@ Computes whether a (signed) two's complement integer is strictly less than anoth
 
 There is no equivalent for `>` because it suffices to swap this node's operands.
 +/
-struct SignedLessThanNode {
+@mnemonic("lts") struct SignedLessThanNode {
     mixin NodeInheritance;
 
     /// Left-hand-side operand.
@@ -3094,17 +3121,17 @@ struct SignedLessThanNode {
     }
 
     /// Semantic equality <=> structural equality.
-    bool opEquals(ref const(SignedLessThanNode) other) const {
+    bool opEquals(ref const(SignedLessThanNode) other) const pure {
         if (this.lhs != other.lhs) return false;
         if (this.rhs != other.rhs) return false;
         return true;
     }
 
-    hash_t toHash() const {
+    hash_t toHash() const pure {
         return this.lhs.toHash() - this.rhs.toHash();
     }
 
-    /// Adjusts in-edge slots after a move.
+    /// Post-move adjusts in-edge slots' internal pointer.
     void opPostMove(ref const(SignedLessThanNode) old) pure {
         this.result.owner = this.asNode;
     }
@@ -3121,6 +3148,7 @@ struct SignedLessThanNode {
     assert(lts.result.owner == lts.asNode);
     //
     SignedLessThanNode.dispose(&lts);
+    SignedLessThanNode.dispose(&lts);
 }
 
 /++
@@ -3128,7 +3156,7 @@ Computes whether a (unsigned) two's complement integer is greater than or equal 
 
 There is no equivalent for `<=` because it suffices to swap this node's operands.
 +/
-struct UnsignedGreaterOrEqualNode {
+@mnemonic("geu") struct UnsignedGreaterOrEqualNode {
     mixin NodeInheritance;
 
     /// Left-hand-side operand.
@@ -3170,17 +3198,17 @@ struct UnsignedGreaterOrEqualNode {
     }
 
     /// Semantic equality <=> structural equality.
-    bool opEquals(ref const(UnsignedGreaterOrEqualNode) other) const {
+    bool opEquals(ref const(UnsignedGreaterOrEqualNode) other) const pure {
         if (this.lhs != other.lhs) return false;
         if (this.rhs != other.rhs) return false;
         return true;
     }
 
-    hash_t toHash() const {
+    hash_t toHash() const pure {
         return this.lhs.toHash() - this.rhs.toHash();
     }
 
-    /// Adjusts in-edge slots after a move.
+    /// Post-move adjusts in-edge slots' internal pointer.
     void opPostMove(ref const(UnsignedGreaterOrEqualNode) old) pure {
         this.result.owner = this.asNode;
     }
@@ -3197,6 +3225,7 @@ struct UnsignedGreaterOrEqualNode {
     assert(geu.result.owner == geu.asNode);
     //
     UnsignedGreaterOrEqualNode.dispose(&geu);
+    UnsignedGreaterOrEqualNode.dispose(&geu);
 }
 
 /++
@@ -3204,7 +3233,7 @@ Computes whether a (signed) two's complement integer is greater than or equal to
 
 There is no equivalent for `<=` because it suffices to swap this node's operands.
 +/
-struct SignedGreaterOrEqualNode {
+@mnemonic("ges") struct SignedGreaterOrEqualNode {
     mixin NodeInheritance;
 
     /// Left-hand-side operand.
@@ -3246,17 +3275,17 @@ struct SignedGreaterOrEqualNode {
     }
 
     /// Semantic equality <=> structural equality.
-    bool opEquals(ref const(SignedGreaterOrEqualNode) other) const {
+    bool opEquals(ref const(SignedGreaterOrEqualNode) other) const pure {
         if (this.lhs != other.lhs) return false;
         if (this.rhs != other.rhs) return false;
         return true;
     }
 
-    hash_t toHash() const {
+    hash_t toHash() const pure {
         return this.lhs.toHash() - this.rhs.toHash();
     }
 
-    /// Adjusts in-edge slots after a move.
+    /// Post-move adjusts in-edge slots' internal pointer.
     void opPostMove(ref const(SignedGreaterOrEqualNode) old) pure {
         this.result.owner = this.asNode;
     }
@@ -3272,6 +3301,7 @@ struct SignedGreaterOrEqualNode {
     assert(ges == ges);
     assert(ges.result.owner == ges.asNode);
     //
+    SignedGreaterOrEqualNode.dispose(&ges);
     SignedGreaterOrEqualNode.dispose(&ges);
 }
 

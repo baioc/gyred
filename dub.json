@@ -6,6 +6,10 @@
 	"targetType": "executable",
 	"mainSourceFile": "source/app.d",
 
+	"dependencies": {
+		"betterclist": "==0.2.2"
+	},
+
 	"toolchainRequirements": {
 		"frontend": ">=2.097"
 	},

@@ -30,7 +30,7 @@ struct Rational(Z) if (__traits(isPOD, Z)) {
     /// Constructs a Rational from given numerator and (non-zero) denominator.
     this(inout(Z) numerator, inout(Z) denominator = 1) inout
     in (denominator != 0, "denominator must not be zero")
-    out (; this.denominator > 0, "denominator must always be positive")
+    out (; this.denominator > 0)
     {
         const bool invert = denominator < 0;
         auto num = invert ? -numerator : numerator;

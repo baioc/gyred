@@ -35,7 +35,7 @@ Equality works similarly to [object references](https://dlang.org/spec/operatoro
 struct HashablePointer(T) if (!isPointer!T) {
     T* ptr = null;
     alias ptr this; // dispatches most pointer-like behaviour to actual pointer
-    static assert((HashablePointer!T).sizeof == (T*).sizeof);
+    static assert((HashablePointer).sizeof == (T*).sizeof);
 
  pragma(inline):
     this(inout(T)* ptr) inout {
@@ -46,14 +46,14 @@ struct HashablePointer(T) if (!isPointer!T) {
         return this.ptr == null ? 0 : hashOf(*this.ptr);
     }
 
-    bool opEquals(ref const(HashablePointer!T) rhs) const {
+    bool opEquals(ref const(HashablePointer) rhs) const {
         if (this.ptr == rhs.ptr) return true;
         if (this.ptr == null || rhs.ptr == null) return false;
         return *this.ptr == *rhs.ptr;
     }
 
     bool opEquals(const(T*) rhs) const {
-        const HashablePointer!T other = rhs;
+        const HashablePointer other = rhs;
         return this == other;
     }
 
@@ -119,6 +119,7 @@ if (!is(T == class) && !(is(T == interface)))
         struct Impl {
             T payload;
             size_t _refCount;
+            @disable this(this);
         }
         Impl* store = null;
 
@@ -175,7 +176,7 @@ if (!is(T == class) && !(is(T == interface)))
     /// Can be `@trusted` as long as this type is used correctly.
     ~this() nothrow @trusted {
         if (!this._refCounted.isInitialized) return;
-        assert(this._refCounted.store._refCount > 0);
+        assert(this._refCounted.store._refCount > 0, "double free detected!");
         this._refCounted.store._refCount -= 1;
         if (this._refCounted.store._refCount > 0) return;
         .destroy(this._refCounted.store.payload);
@@ -205,7 +206,7 @@ if (!is(T == class) && !(is(T == interface)))
     }
     /// ditto
     @property ref inout(T) refCountedPayload() inout @system {
-        assert(this._refCounted.isInitialized, "attempted to access payload");
+        assert(this._refCounted.isInitialized, "can't access uninitialized payload");
         return this._refCounted.store.payload;
     }
 }

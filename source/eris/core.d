@@ -44,22 +44,27 @@ T[] allocate(T)(size_t n) @nogc nothrow
     import core.checkedint : mulu;
 
     bool overflow = false;
-    const size_t totalBytes = mulu(n, T.sizeof, overflow);
-    if (overflow || totalBytes == 0) return [];
+    const size_t bytes = mulu(n, T.sizeof, overflow);
+    if (overflow || bytes == 0) return [];
 
     version (D_BetterC) {
-        void* ptr = malloc(totalBytes);
+        void* ptr = malloc(bytes);
     } else {
         void* ptr = calloc(n, T.sizeof);
         static if (hasIndirections!T) {
             import core.memory : GC;
-            if (ptr != null) GC.addRange(ptr, totalBytes);
+            if (ptr != null) GC.addRange(ptr, bytes);
         }
     }
 
     debug if (ptr != null) {
-        const current = allocated.atomicOp!"+="(totalBytes);
-        version (Eris_VerboseAllocations) fprintf(stderr, "Total allocated bytes: %lu\n", current);
+        const current = allocated.atomicOp!"+="(bytes);
+        version (Eris_VerboseAllocations) {
+            fprintf(stderr,
+                "+%10luB (total: %10luB) for " ~ T.stringof ~ "[%lu]\n",
+                bytes, current, n
+            );
+        }
     }
     return ptr != null ? (cast(T*)ptr)[0 .. n] : [];
 }
@@ -74,8 +79,10 @@ T* allocate(T)() @nogc nothrow
 
 debug {
     import core.atomic : atomicOp;
-    private shared size_t allocated = 0;
-    version (Eris_VerboseAllocations) import core.stdc.stdio : fprintf, stderr;
+    shared size_t allocated = 0;
+    version (Eris_VerboseAllocations) {
+        import core.stdc.stdio : fprintf, stderr;
+    }
 }
 
 /++
@@ -85,9 +92,15 @@ Params:
     memory = Previously [allocate]d memory block (or null, in which case nothing happens).
 +/
 void deallocate(T)(T[] memory) @nogc nothrow @system {
-    debug if (memory != null) {
-        const current = allocated.atomicOp!"-="(memory.length * T.sizeof);
-        version (Eris_VerboseAllocations) fprintf(stderr, "Total allocated bytes: %lu\n", current);
+    debug if (memory.ptr != null) {
+        const bytes = memory.length * T.sizeof;
+        const current = allocated.atomicOp!"-="(bytes);
+        version (Eris_VerboseAllocations) {
+            fprintf(stderr,
+                "-%10luB (total: %10luB) for " ~ T.stringof ~ "[%lu]\n",
+                bytes, current, memory.length
+            );
+        }
     }
     version (D_BetterC) {} else {
         static if (hasIndirections!T) {
@@ -100,7 +113,7 @@ void deallocate(T)(T[] memory) @nogc nothrow @system {
 
 /// ditto
 void deallocate(T)(T* memory) @nogc nothrow @system {
-    deallocate(memory[0 .. 1]);
+    deallocate(memory[0 .. 1]); // slice .ptr may be null
 }
 
 /// Consider using `scope(exit)` to ensure deallocation (but beware of double frees).

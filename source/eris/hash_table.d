@@ -5,12 +5,11 @@ Includes both unsafe (explicitly managed) and safe (refcounted) hash-based data 
 
 
 Performance is roughly equivalent to AAs, but can be made a bit better with preallocation.
-![upserts](https://user-images.githubusercontent.com/27034173/168399480-abe5e5bf-c99e-493f-9c9a-6f603884f6a8.png)
+![upserts](https://user-images.githubusercontent.com/27034173/169673970-43d98400-8be2-48e1-b70d-6b13217d830c.png)
 +/
 module eris.hash_table;
 
-import core.lifetime : forward;
-import core.stdc.errno : ENOMEM, EINVAL;
+import core.stdc.errno : ENOMEM, EINVAL, EOVERFLOW;
 import std.algorithm.mutation : moveEmplace, swap;
 import std.math.traits : isPowerOf2;
 import std.traits : Parameters, ReturnType;
@@ -115,12 +114,12 @@ struct UnsafeHashMap(Key, Value) {
  private:
     alias Bucket = .Bucket!Key;
 
-    Bucket[] buckets = null;
-    size_t occupied = 0;
-    size_t used = 0;
+    Bucket[] buckets;
+    size_t occupied;
+    size_t used;
 
     // we only need to allocate a value array if its size is non-zero
-    static if (Value.sizeof > 0) Value* values = null;
+    static if (Value.sizeof > 0) Value* values;
 
     pragma(inline) {
         @property size_t allocated() const {
@@ -176,7 +175,7 @@ struct UnsafeHashMap(Key, Value) {
         hash_t tableHash = 0;
         foreach (entry; this.byKeyValue) {
             // for each entry, we use a noncommutative operation
-            static if (__traits(compiles, () @safe => entry.value.hashOf)) {
+            static if (Value.sizeof > 0 && __traits(compiles, () @safe => entry.value.hashOf)) {
                 enum size_t scale = 2654435771LU; // approx. 2^32 / phi
                 tableHash ^= (entry.key.hashOf - entry.value.hashOf) * scale; // ok if overflows
             }
@@ -238,11 +237,11 @@ struct UnsafeHashMap(Key, Value) {
 
     See_Also: [require], [get]
     +/
-    static if (Value.sizeof > 0) Value opIndex()(auto ref const(Key) key) inout {
+    static if (Value.sizeof > 0) inout(Value) opIndex()(auto ref const(Key) key) inout {
         inout(Key)* keyp;
         inout(Value)* valp;
         const found = this.get(key, keyp, valp);
-        return found ? () @trusted { return *(cast(Value*)valp); }() : Value.init;
+        return found ? *valp : Value.init;
     }
 
     /++
@@ -252,7 +251,7 @@ struct UnsafeHashMap(Key, Value) {
 
     See_Also: [update]
     +/
-    err_t opIndexAssign(Value value, Key key) {
+    pragma(inline) err_t opIndexAssign(Value value, Key key) {
         err_t error;
         this.update(key, () => value, (ref Value old) => value, error);
         return error;
@@ -265,7 +264,7 @@ struct UnsafeHashMap(Key, Value) {
         if (capacity == 0) return 0;
 
         // adjust allocation size based on max load factor and round to power of two
-        if (capacity * maxLoadFactor.denominator <= capacity) return ENOMEM; // overflow check
+        if (capacity * maxLoadFactor.denominator <= capacity) return EOVERFLOW;
         capacity = capacity * maxLoadFactor.denominator / maxLoadFactor.numerator;
         if (capacity < minAllocatedSize) {
             capacity = minAllocatedSize;
@@ -276,7 +275,7 @@ struct UnsafeHashMap(Key, Value) {
         } else if (!capacity.isPowerOf2) {
             import std.math.algebraic : nextPow2;
             capacity = nextPow2(capacity);
-            if (capacity * maxLoadFactor.numerator <= capacity) return ENOMEM; // overflow check
+            if (capacity * maxLoadFactor.numerator <= capacity) return EOVERFLOW;
         }
         assert(capacity >= minAllocatedSize && capacity.isPowerOf2);
 
@@ -409,7 +408,11 @@ struct UnsafeHashMap(Key, Value) {
 
     Returns: Whether or not the entry was found in the table.
     +/
-    bool get()(auto ref const(Key) needle, out inout(Key)* keyp, out inout(Value)* valp) inout {
+    bool get()(
+        auto ref const(Key) needle,
+        out inout(Key)* keyp,
+        out inout(Value)* valp
+    ) inout {
         inout(Bucket)* bucket;
         const found = this.getEntry(needle, bucket, valp);
         if (!found) return false;
@@ -466,7 +469,7 @@ struct UnsafeHashMap(Key, Value) {
 
     Returns: The entry's final value (or its `.init` in case of failure).
     +/
-    pragma(inline) Value update(Create, Update)(
+    Value update(Create, Update)(
         Key key,
         scope auto ref const(Create) create,
         scope auto ref const(Update) update,
@@ -482,10 +485,7 @@ struct UnsafeHashMap(Key, Value) {
         // check whether a load factor increase needs to trigger a rehash
         if (this.occupied + 1 > this.capacity) {
             size_t newCapacity = this.capacity * 2;
-            if (newCapacity < this.capacity) { // overflow check
-                error = ENOMEM;
-                return Value.init;
-            } else if (newCapacity == 0) {
+            if (newCapacity == 0) {
                 newCapacity = cast(size_t)(minAllocatedSize * maxLoadFactor);
                 static assert(
                     minAllocatedSize * maxLoadFactor > 0,
@@ -493,6 +493,9 @@ struct UnsafeHashMap(Key, Value) {
                     " and max load factor " ~ maxLoadFactor.stringof ~
                     " are incompatible: their product must be greater than zero"
                 );
+            } else if (newCapacity <= this.capacity) {
+                error = EOVERFLOW;
+                return Value.init;
             }
             assert(newCapacity > this.capacity);
             error = this.rehash(newCapacity);
@@ -538,13 +541,7 @@ struct UnsafeHashMap(Key, Value) {
         Key key,
         scope auto ref const(Create) create,
         scope auto ref const(Update) update
-    )
-    if (is(ReturnType!Create == Value)
-        && Parameters!Create.length == 0
-        && is(ReturnType!Update == Value)
-        && Parameters!Update.length == 1
-        && is(Parameters!Update[0] == Value))
-    {
+    ) {
         err_t ignored;
         return this.update(key, create, update, ignored);
     }
@@ -559,95 +556,18 @@ struct UnsafeHashMap(Key, Value) {
 
     Returns: The entry's final value (or its `.init` in case of failure).
     +/
-    Value require(Create)(
+    pragma(inline) Value require(Create)(
         Key key,
         scope auto ref const(Create) create,
         out err_t error
-    )
-    if (is(ReturnType!Create == Value) && Parameters!Create.length == 0)
-    {
+    ) {
         return this.update(key, create, (ref Value x) => x, error);
     }
 
     /// ditto
-    Value require(Create)(Key key, auto ref const(Create) create)
-    if (is(ReturnType!Create == Value) && Parameters!Create.length == 0)
-    {
+    Value require(Create)(Key key, auto ref const(Create) create) {
         err_t ignored;
         return this.require(key, create, ignored);
-    }
-
-    private mixin template UnsafeRangeBoilerplate() {
-        private const(UnsafeHashMap)* table;
-        private size_t index;
-
-        private this(const(UnsafeHashMap)* t) {
-            this.table = t;
-            this.updateIndexFrom(0);
-        }
-
-        private void updateIndexFrom(size_t i) {
-            for (; i < this.table.buckets.length; ++i) {
-                const bucket = &this.table.buckets[i];
-                if (bucket.isOccupied && !bucket.wasDeleted) break;
-            }
-            this.index = i;
-        }
-
-        public bool empty() const {
-            return this.index >= this.table.buckets.length;
-        }
-
-        public void popFront() in (!this.empty) {
-            this.updateIndexFrom(this.index + 1);
-        }
-    }
-
-    /++
-    Can be used to iterate over this table's entries (but iteration order is unspecified).
-
-    NOTE: Mutating a table silently invalidates any ranges over it.
-        Also, ranges must NEVER outlive their backing tables if they are unsafe (this is OK only for the refcounted versions).
-    +/
-    auto byKey() const {
-        struct ByKey {
-            mixin UnsafeRangeBoilerplate;
-            public Key front() const @trusted /* due to cast */ in (!this.empty) {
-                return cast(Key)this.table.buckets[this.index].key;
-            }
-        }
-        return ByKey(&this);
-    }
-
-    /// ditto
-    static if (Value.sizeof > 0) auto byValue() const {
-        struct ByValue {
-            mixin UnsafeRangeBoilerplate;
-            public Value front() const @trusted /* due to cast */ in (!this.empty) {
-                return cast(Value)*this.table.valueAt(this.index);
-            }
-        }
-        return ByValue(&this);
-    }
-
-    /// ditto
-    auto byKeyValue() const {
-        struct ByKeyValue {
-            mixin UnsafeRangeBoilerplate;
-            public KeyValue front() const @trusted /* due to cast */ in (!this.empty) {
-                auto bucket = &this.table.buckets[this.index];
-                static if (Value.sizeof > 0)
-                    return KeyValue(cast(Key)bucket.key, cast(Value)*this.table.valueAt(this.index));
-                else
-                    return KeyValue(cast(Key)bucket.key);
-            }
-            struct KeyValue {
-                Key key;
-                static if (Value.sizeof > 0) Value value;
-                else                         enum value = Value.init;
-            }
-        }
-        return ByKeyValue(&this);
     }
 
     /++
@@ -661,13 +581,13 @@ struct UnsafeHashMap(Key, Value) {
     Returns: A shallow copy of the given hash table, or an empty table in case of failure (OOM).
     +/
     UnsafeHashMap dup(out err_t error) const nothrow
-    out (copy; (!error && copy.length == this.length) || (error && copy.length == 0))
+    out (copy; (!error && copy.length == this.length) || (error && copy.capacity == 0))
     {
         UnsafeHashMap copy;
         error = copy.initialize(this.length);
         if (error) return copy;
         foreach (entry; this.byKeyValue) {
-            error = (copy[entry.key] = entry.value);
+            error = (copy[cast(Key)entry.key] = cast(Value)entry.value);
             assert(!error, "memory already reserved, so insertion can't fail");
         }
         return copy;
@@ -687,6 +607,87 @@ struct UnsafeHashMap(Key, Value) {
     static if (Value.sizeof == 0) pragma(inline) err_t add(Key element) {
         return (this[element] = Value.init);
     }
+
+    private {
+        mixin template UnsafeRangeBoilerplate(bool isConst) {
+            static if (isConst) private const(UnsafeHashMap)* table;
+            else                private UnsafeHashMap* table;
+            private size_t index;
+
+            private this(typeof(this.table) t) {
+                this.table = t;
+                this.updateIndexFrom(0);
+            }
+
+            private void updateIndexFrom(size_t i) {
+                for (; i < this.table.buckets.length; ++i) {
+                    const bucket = &this.table.buckets[i];
+                    if (bucket.isOccupied && !bucket.wasDeleted) break;
+                }
+                this.index = i;
+            }
+
+            public bool empty() const {
+                return this.index >= this.table.buckets.length;
+            }
+
+            public void popFront() in (!this.empty) {
+                this.updateIndexFrom(this.index + 1);
+            }
+        }
+
+        struct ByKey(bool isConst) {
+            mixin UnsafeRangeBoilerplate!isConst;
+            public ref front() in (!this.empty) {
+                return this.table.buckets[this.index].key;
+            }
+        }
+
+        struct ByValue(bool isConst) if (Value.sizeof > 0) {
+            mixin UnsafeRangeBoilerplate!isConst;
+            public ref front() in (!this.empty) {
+                return *this.table.valueAt(this.index);
+            }
+        }
+
+        struct ByKeyValue(bool isConst) {
+            mixin UnsafeRangeBoilerplate!isConst;
+            private struct Pair(K, V) if (V.sizeof > 0) { K key; V value; }
+            private struct Pair(K, V) if (V.sizeof == 0) { K key; enum value = Value.init; }
+            static if (isConst) alias KeyValue = Pair!(const(Key), const(Value));
+            else                alias KeyValue = Pair!(Key, Value);
+            public KeyValue front() in (!this.empty) {
+                auto bucket = &this.table.buckets[this.index];
+                static if (Value.sizeof > 0)
+                    return KeyValue(bucket.key, *this.table.valueAt(this.index));
+                else
+                    return KeyValue(bucket.key);
+            }
+        }
+    }
+
+    /++
+    Can be used to iterate over this table's entries (but iteration order is unspecified).
+
+    NOTE: Mutating a table (silently) invalidates any ranges over it.
+        Also, ranges must NEVER outlive their backing tables (this is only OK for the refcounted versions).
+    +/
+    auto byKey() const { return ByKey!true(&this); }
+
+    /// ditto
+    auto byKey() { return ByKey!false(&this); }
+
+    /// ditto
+    static if (Value.sizeof > 0) {
+        auto byValue() const { return ByValue!true(&this); }
+        auto byValue() { return ByValue!false(&this); }
+    }
+
+    /// ditto
+    auto byKeyValue() const { return ByKeyValue!true(&this); }
+
+    /// ditto
+    auto byKeyValue() { return ByKeyValue!false(&this); }
 }
 
 /// This type optimizes storage when value types are zero-sized (e.g. for [UnsafeHashSet]):
@@ -702,7 +703,8 @@ struct UnsafeHashMap(Key, Value) {
     {
         UnsafeHashMap!(char, long) inner;
         scope(exit) inner.dispose();
-        outer = inner; // but be careful with byref-like copies
+        inner.rehash(42);
+        outer = inner; // but be careful with shallow copies
     }
     // outer.dispose(); // would have caused a double free: `dispose` is unsafe!
 }
@@ -764,18 +766,6 @@ struct UnsafeHashMap(Key, Value) {
     assert( !isAnagram("aabaa", "bbabb")                            );
 }
 
-@nogc nothrow pure @safe unittest {
-    static assert(
-        !__traits(compiles, // assuming -dip1000
-            () @safe {
-                UnsafeHashMap!(char, long) table;
-                return table.byKeyValue; // <- escapes ref to local
-            }
-        ),
-        "must not allow a range to outlive its backing hash table"
-    );
-}
-
 @nogc nothrow @safe unittest {
     HashMap!(int, int) a, b;
     a[0] = 1;
@@ -832,8 +822,11 @@ Again, this type uses reference counting, so cycles must be avoided to ensure me
 +/
 struct HashMap(Key, Value) {
  private:
-    // a safe versions of our hash table needs to ensure two things:
-    // 1) `dispose` is never called twice on a hash table + its copies (i.e. double frees don't happen):
+    import core.lifetime : forward;
+    import std.typecons : RefCountedAutoInitialize;
+
+    // a safe version of our hash table needs to ensure two things:
+    // 1) `dispose` is never called twice on a hash table + its copies (i.e. double frees don't happen)
     // 2) internal storage is never referenced from the outside (i.e. rehashes don't invalidate pointers)
 
     // we begin by making it impossible for user code to call `dispose` on the safe version
@@ -851,13 +844,12 @@ struct HashMap(Key, Value) {
     }
 
     // since non-copyable types are a pain in the ass, we make the RAII table refcounted,
-    // which ensures he destructor is only called once (so we mark it as @trusted)
-    import std.typecons : RefCountedAutoInitialize;
+    // which ensures the destructor is only called once (so we mark it as @trusted)
     RefCountedTrusted!(RAIIUnsafeHashMap, RefCountedAutoInitialize.no) rc;
 
     // as for (2), we manually review the hash table API to only ever expose functionality
     // which does not leak references to the hash table's internal storage
-    // and then mark as @trusted any operation which could rehash (that's safe now)
+    // and then mark as @trusted any operation which could rehash (because that's safe now)
     pragma(inline) @safe {
         @property bool isInitialized() const {
             return this.rc.refCountedStore.isInitialized;
@@ -867,13 +859,14 @@ struct HashMap(Key, Value) {
             this.rc.refCountedStore.ensureInitialized();
         }
 
-        @property ref inout(UnsafeHashMap!(Key, Value)) impl() inout @trusted {
-            assert(this.isInitialized);
+        @property ref inout(UnsafeHashMap!(Key, Value)) impl() inout @trusted
+        in (this.isInitialized)
+        {
             return this.rc.refCountedPayload.table;
         }
     }
 
- public pragma(inline):
+ public:
     void opAssign(HashMap other) {
         this.rc = other.rc;
     }
@@ -934,14 +927,14 @@ struct HashMap(Key, Value) {
     }
 
     /// The safe version matches AA's [get](https://dlang.org/spec/hash-map.html#properties).
-    Value get(Default)(auto ref const(Key) key, scope auto ref const(Default) defaultValue) inout
+    inout(Value) get(Default)(auto ref const(Key) key, scope auto ref const(Default) defaultValue) inout
     if (is(ReturnType!Default == Value) && Parameters!Default.length == 0)
     {
         if (!this.isInitialized) return defaultValue();
         inout(Key)* keyp;
         inout(Value)* valp;
         const found = this.impl.get(key, keyp, valp);
-        return found ? () @trusted { return *(cast(Value*)valp); }() : defaultValue();
+        return found ? *valp : defaultValue();
     }
 
     auto remove()(auto ref const(Key) key) {
@@ -964,76 +957,6 @@ struct HashMap(Key, Value) {
         return this.impl.require(needle, forward!args);
     }
 
-    private mixin template RangeBoilerplate() {
-        private const(HashMap) table;
-        private size_t index;
-
-        private this(ref const(HashMap) t) {
-            this.table = t;
-            this.updateIndexFrom(0);
-        }
-
-        private void updateIndexFrom(size_t i) {
-            if (!this.table.isInitialized) return;
-            for (; i < this.table.impl.buckets.length; ++i) {
-                const bucket = &this.table.impl.buckets[i];
-                if (bucket.isOccupied && !bucket.wasDeleted) break;
-            }
-            this.index = i;
-        }
-
-        public bool empty() const {
-            return !this.table.isInitialized || this.index >= this.table.impl.buckets.length;
-        }
-
-        public void popFront() in (!this.empty) {
-            this.updateIndexFrom(this.index + 1);
-        }
-
-        public typeof(this) save() {
-            return this;
-        }
-    }
-
-    auto byKey() const {
-        struct ByKey {
-            mixin RangeBoilerplate;
-            public Key front() const @trusted /* due to cast */ in (!this.empty) {
-                return cast(Key)this.table.impl.buckets[this.index].key;
-            }
-        }
-        return ByKey(this);
-    }
-
-    static if (Value.sizeof > 0) auto byValue() const {
-        struct ByValue {
-            mixin RangeBoilerplate;
-            public Value front() const @trusted /* due to cast */ in (!this.empty) {
-                return cast(Value)*this.table.impl.valueAt(this.index);
-            }
-        }
-        return ByValue(this);
-    }
-
-    auto byKeyValue() const {
-        struct ByKeyValue {
-            mixin RangeBoilerplate;
-            public KeyValue front() const @trusted /* due to cast */ in (!this.empty) {
-                auto bucket = &this.table.impl.buckets[this.index];
-                static if (Value.sizeof > 0)
-                    return KeyValue(cast(Key)bucket.key, cast(Value)*this.table.impl.valueAt(this.index));
-                else
-                    return KeyValue(cast(Key)bucket.key);
-            }
-            struct KeyValue {
-                Key key;
-                static if (Value.sizeof > 0) Value value;
-                else                         enum value = Value.init;
-            }
-        }
-        return ByKeyValue(this);
-    }
-
     HashMap dup(out err_t error) const @trusted {
         if (!this.isInitialized) return HashMap.init;
         HashMap copy;
@@ -1050,6 +973,76 @@ struct HashMap(Key, Value) {
     static if (Value.sizeof == 0) auto add(Key element) @trusted  {
         return (this[element] = Value.init);
     }
+
+    private {
+        mixin template RangeBoilerplate(bool isConst = true) {
+            static if (isConst) private const(HashMap) table;
+            else                private HashMap table;
+            private size_t index;
+
+            private this(typeof(this.table) t) {
+                this.table = t;
+                this.updateIndexFrom(0);
+            }
+
+            private void updateIndexFrom(size_t i) {
+                if (!this.table.isInitialized) return;
+                for (; i < this.table.impl.buckets.length; ++i) {
+                    const bucket = &this.table.impl.buckets[i];
+                    if (bucket.isOccupied && !bucket.wasDeleted) break;
+                }
+                this.index = i;
+            }
+
+            public bool empty() const {
+                return !this.table.isInitialized || this.index >= this.table.impl.buckets.length;
+            }
+
+            public void popFront() in (!this.empty) {
+                this.updateIndexFrom(this.index + 1);
+            }
+        }
+
+        struct ByKey(bool isConst) {
+            mixin RangeBoilerplate!isConst;
+            public auto front() in (!this.empty) {
+                return this.table.impl.buckets[this.index].key;
+            }
+        }
+
+        struct ByValue(bool isConst) if (Value.sizeof > 0) {
+            mixin RangeBoilerplate!isConst;
+            public auto front() in (!this.empty) {
+                return *this.table.impl.valueAt(this.index);
+            }
+        }
+
+        struct ByKeyValue(bool isConst) {
+            mixin RangeBoilerplate!isConst;
+            private struct Pair(K, V) if (V.sizeof > 0) { K key; V value; }
+            private struct Pair(K, V) if (V.sizeof == 0) { K key; enum value = Value.init; }
+            static if (isConst) alias KeyValue = Pair!(const(Key), const(Value));
+            else                alias KeyValue = Pair!(Key, Value);
+            public KeyValue front() in (!this.empty) {
+                auto bucket = &this.table.impl.buckets[this.index];
+                static if (Value.sizeof > 0)
+                    return KeyValue(bucket.key, *this.table.impl.valueAt(this.index));
+                else
+                    return KeyValue(bucket.key);
+            }
+        }
+    }
+
+    auto byKey() const { return ByKey!true(this); }
+    auto byKey() { return ByKey!false(this); }
+
+    static if (Value.sizeof > 0) {
+        auto byValue() const { return ByValue!true(this); }
+        auto byValue() { return ByValue!false(this); }
+    }
+
+    auto byKeyValue() const { return ByKeyValue!true(this); }
+    auto byKeyValue() { return ByKeyValue!false(this); }
 }
 
 ///
