@@ -17,8 +17,8 @@ import gyre.nodes : mnemonic;
 static foreach (tag; EnumMembers!NodeKind) {
     static if (hasUDA!(AllNodes[tag], mnemonic)) {
         mixin(
-            "alias " ~ getUDAs!(AllNodes[tag], mnemonic)[0].shorthand ~ " = "
-            ~ "NodeKind." ~ __traits(identifier, EnumMembers!NodeKind[tag]) ~ ";"
+            `alias ` ~ getUDAs!(AllNodes[tag], mnemonic)[0].shorthand ~ ` = `
+            ~ `NodeKind.` ~ __traits(identifier, EnumMembers!NodeKind[tag]) ~ `;`
         );
     }
 }
@@ -26,8 +26,8 @@ static foreach (tag; EnumMembers!NodeKind) {
 static foreach (sugar; EnumMembers!NodeSugar) {
     static if (hasUDA!(EnumMembers!NodeSugar[sugar], mnemonic)) {
         mixin(
-            "alias " ~ getUDAs!(EnumMembers!NodeSugar[sugar], mnemonic)[0].shorthand ~ " = "
-            ~ "NodeSugar." ~ __traits(identifier, EnumMembers!NodeSugar[sugar]) ~ ";"
+            `alias ` ~ getUDAs!(EnumMembers!NodeSugar[sugar], mnemonic)[0].shorthand ~ ` = `
+            ~ `NodeSugar.` ~ __traits(identifier, EnumMembers!NodeSugar[sugar]) ~ `;`
         );
     }
 }

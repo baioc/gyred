@@ -44,7 +44,6 @@ module gyre.nodes;
 import core.stdc.errno : EINVAL, ENOMEM;
 import std.algorithm.mutation : moveEmplace;
 import std.bitmanip : taggedPointer;
-import std.traits : EnumMembers;
 
 import eris.core : hash_t, err_t, allocate, deallocate;
 import eris.hash_table : UnsafeHashMap;
@@ -78,16 +77,17 @@ enum EdgeKind : ubyte {
 }
 
 private mixin template StaticEdgeFactories() {
+    private import std.traits : EnumMembers;
     static foreach (kind; EnumMembers!EdgeKind) {
         mixin(
-            "@nogc nothrow pure
-            static typeof(this) " ~ __traits(identifier, EnumMembers!EdgeKind[kind]) ~ "(Args...)(auto ref Args args) {
+            `@nogc nothrow pure
+            static typeof(this) ` ~ __traits(identifier, EnumMembers!EdgeKind[kind]) ~ `(Args...)(auto ref Args args) {
                 import core.lifetime : forward;
                 return typeof(this)(
-                    EdgeKind." ~ __traits(identifier, EnumMembers!EdgeKind[kind]) ~ ",
+                    EdgeKind.` ~ __traits(identifier, EnumMembers!EdgeKind[kind]) ~ `,
                     forward!args
                 );
-            }"
+            }`
         );
     }
 }
@@ -103,16 +103,17 @@ struct OutEdge {
         EdgeKind, "kind", 2
     ));
 
- pragma(inline) @nogc nothrow:
+ pragma(inline) @nogc nothrow pure:
     /++
     Params:
         kind = This edge's kind.
         target = Must point to a matching in-edge slot.
     +/
-    this(EdgeKind kind, InEdge* target = null) pure {
+    this(EdgeKind kind, InEdge* target) {
         this.kind = kind;
         this.target = target;
     }
+    private this(EdgeKind kind) { this(kind, null); }
     @disable this();
     mixin StaticEdgeFactories;
 
@@ -121,16 +122,16 @@ struct OutEdge {
 
     An out-edge slot is only equivalent to another if they point to equal [InEdge] slots.
     +/
-    bool opEquals(const(OutEdge) other) const pure
-    in (this.target == null || this.target.kind == this.kind)
+    bool opEquals(const(OutEdge) other) const
+    in (this.target == null || this.target.kind == this.kind, "edge slot kind mismatch")
     {
+        if (this is other) return true;
         if (this.kind != other.kind) return false;
-        if (this.target == other.target) return true;
         if (this.target == null || other.target == null) return false;
         return *this.target == *other.target;
     }
 
-    hash_t toHash() const pure {
+    hash_t toHash() const {
         if (this.target == null) return this.kind.hashOf;
         return this.target.toHash();
     }
@@ -138,7 +139,7 @@ struct OutEdge {
 
 ///
 @nogc nothrow unittest {
-    auto def = InEdge.data(null);
+    auto def = InEdge.data;
     auto use1 = OutEdge.data;
     auto use2 = OutEdge.data;
     // data edges are directed from uses to defs
@@ -168,23 +169,28 @@ struct InEdge {
         EdgeKind, "kind", 2
     ));
 
-    ID id;
+    ID _id;
     alias ID = ushort;
 
- pragma(inline) @nogc nothrow:
+ pragma(inline) @nogc nothrow pure:
+    @property ID id() const { return this._id; }
+    private @property void id(ID id) { this._id = id; }
+
     /++
     Params:
         kind = This edge's kind.
-        owner = Must point to the node which owns this edge slot.
-        id = Uniquely identifies this in-edge slot within its owner node (internal usage only).
+        owner = Must point to the node which owns this slot.
+        id = Uniquely identifies this in-edge slot within its owner node.
     +/
-    this(EdgeKind kind, Node* owner, size_t id = 0) pure
-    in (id <= ID.max, "can't have an internal id greater than " ~ ID.max.stringof)
+    this(EdgeKind kind, Node* owner, uint id)
+    in (id <= ID.max, "in-edge slot IDs must be at most " ~ ID.max.stringof)
     {
         this.kind = kind;
         this.owner = owner;
         this.id = cast(ID)id;
     }
+    private this(EdgeKind kind, Node* owner) { this(kind, owner, 0); }
+    version (unittest) private this(EdgeKind kind) { this(kind, null, 0); }
     @disable this();
     mixin StaticEdgeFactories;
 
@@ -194,17 +200,19 @@ struct InEdge {
     An in-edge slot is only equivalent to another if they represent equal values.
     We approximate this by checking that the slots' owner nodes are equal AND the slots are in a corresponding position in their respective owner (i.e. they stand for the same thing inside that node).
     +/
-    bool opEquals(ref const(InEdge) other) const pure {
+    bool opEquals(ref const(InEdge) other) const
+    in (this.owner != null && other.owner != null, "can't use an uninitialized in-edge")
+    {
         if (this.kind != other.kind) return false;
         if (this.id != other.id) return false;
-        if (this.owner == other.owner) return true;
-        if (this.owner == null || other.owner == null) return false;
         return *this.owner == *other.owner;
     }
 
-    hash_t toHash() const pure {
+    hash_t toHash() const
+    in (this.owner != null, "can't use an uninitialized in-edge")
+    {
         hash_t hash = this.kind.hashOf ^ this.id.hashOf;
-        if (this.owner != null) hash ^= this.owner.toHash();
+        hash ^= this.owner.toHash();
         return hash;
     }
 }
@@ -212,7 +220,7 @@ struct InEdge {
 ///
 @nogc nothrow pure unittest {
     auto A = OutEdge.control;
-    auto B = InEdge.control(null);
+    auto B = InEdge.control;
     // control is flowing out from A and into B
     A.target = &B;
     assert(A.target.owner is B.owner);
@@ -237,8 +245,7 @@ This check requires a way to compare two nodes (and [InEdge]s) for "semantic equ
 In data-only operations, this usually reduces to structural equality: a node produces the same value (in a corresponding [InEdge] slot) as another when they perform the same operation and their inputs are equal (notice the recursion here).
 Structural comparisons are relatively expensive operations (especially since the graph could be cyclic), so we want to leverage hashing to do as few comparisons as possible.
 Therefore, a node's hash value better reflect its semantic structure: having equal hashes is a necessary (but insufficient) condition for two nodes to be equal.
-Now, computing a node's hash value becomes an expensive operation as well.
-Fortunately, hash values can be cached once a node's structure has stabilized.
+Now, computing a node's hash value becomes an expensive operation as well, but fortunately it can be cached once a node's structure has stabilized.
 
 $(SMALL_TABLE
     Name        | Type              | Description
@@ -342,7 +349,7 @@ private mixin template NodeInheritance() {
         );
 
         inout(Node)* asNode() inout
-        return /// XXX: return annotation needed in DMD 2.100.0
+        return // XXX: `return` annotation needed in DMD 2.100.0
         in (this.vptr == &vtbl, "can't upcast an uninitialized node")
         {
             return cast(inout(Node)*)&this._node;
@@ -460,19 +467,18 @@ See_Also: [InstantiationNode], [JumpNode], [ForkNode]
     Initializes a join node, must be later [dispose]d.
 
     This procedure initializes the collection of channels and sets up unique indexes for each in-edge slot.
-    Edge slot kinds default to `data`, but this can be later changed by the caller.
+    Edge slot kinds default to `data`; this can be changed later but requires a rehash.
 
     Params:
         self = Address of node being initialized.
         ms = Number of parameters on each channel.
 
     Returns:
-        Zero on success, non-zero on failure (null node, OOM or invalid number of channels).
+        Zero on success, non-zero on failure (OOM or invalid number of channels).
     +/
     static err_t initialize(JoinNode* self, uint[] ms)
-    in (self != null && ms.length >= 1)
+    in (ms.length >= 1, "at least one channel is needed")
     {
-        if (self == null) return EINVAL;
         if (ms.length < 1) return EINVAL;
         *self = JoinNode.init;
 
@@ -482,13 +488,15 @@ See_Also: [InstantiationNode], [JumpNode], [ForkNode]
 
         self.channels = allocate!(InEdge[])(ms.length);
         if (self.channels == null) return ENOMEM;
-        InEdge.ID id = 1;
+        uint id = 1;
         foreach (i, m; ms) {
             self.channels[i] = allocate!InEdge(m);
 
             // on failure, undo all previous allocations
             if (m > 0 && self.channels[i] == null) {
-                foreach_reverse (previous; 0 .. i) self.channels[previous].deallocate();
+                foreach_reverse (previous; 0 .. i) {
+                    self.channels[previous].deallocate();
+                }
                 self.channels.deallocate();
                 self.channels = null;
                 return ENOMEM;
@@ -594,12 +602,11 @@ See_Also: [JoinNode], [JumpNode]
         n = Number of continuations to instantiate.
 
     Returns:
-        Zero on success, non-zero on failure (null node, OOM or zero continuations).
+        Zero on success, non-zero on failure (OOM or zero continuations).
     +/
     static err_t initialize(InstantiationNode* self, uint n)
-    in (self != null && n >= 1)
+    in (n >= 1, "at least one continuation is needed")
     {
-        if (self == null) return EINVAL;
         if (n < 1) return EINVAL;
         *self = InstantiationNode.init;
 
@@ -607,7 +614,8 @@ See_Also: [JoinNode], [JumpNode]
         self.definition = OutEdge.data;
         self.continuations = allocate!InEdge(n);
         if (self.continuations == null) return ENOMEM;
-        foreach (i, ref cont; self.continuations) cont = InEdge.data(self.asNode, i);
+        foreach (i; 0 .. n)
+            self.continuations[i] = InEdge.data(self.asNode, i);
 
         return 0;
     }
@@ -687,19 +695,16 @@ See_Also: [JoinNode]
     /++
     Initializes a jump node, must be later [dispose]d.
 
-    Argument kinds default to `data`, but this can be changed later.
+    Argument kinds default to `data`; this can be changed later but requires a rehash.
 
     Params:
         self = Address of node being initialized.
         m = Number of arguments sent through this jump.
 
     Returns:
-        Zero on success, non-zero on failure (null node or OOM).
+        Zero on success, non-zero on failure (OOM).
     +/
-    static err_t initialize(JumpNode* self, uint m)
-    in (self != null)
-    {
-        if (self == null) return EINVAL;
+    static err_t initialize(JumpNode* self, uint m) {
         *self = JumpNode.init;
 
         self.vptr = &JumpNode.vtbl;
@@ -793,12 +798,11 @@ See_Also: [JoinNode], [JumpNode]
         n = Number of forked threads.
 
     Returns:
-        Zero on success, non-zero on failure (null node, OOM or invalid number of threads).
+        Zero on success, non-zero on failure (OOM or invalid number of threads).
     +/
     static err_t initialize(ForkNode* self, uint n)
-    in (self != null && n >= 2)
+    in (n >= 2, "fork must create at least two threads")
     {
-        if (self == null) return EINVAL;
         if (n < 2) return EINVAL;
         *self = ForkNode.init;
 
@@ -875,14 +879,19 @@ See_Also: [MultiplexerNode]
     /// Incoming control flow edge.
     InEdge control;
 
+    // SSO: binary branches will probably be the most common
+    private UnsafeHashMap!(ulong, OutEdge)* _options;
+
+ @nogc nothrow:
     /++
     At least two outgoing control flow edges, only one of which will be taken.
 
     Represented as a sparse mapping to avoid having an exponential number of unused options.
     +/
-    UnsafeHashMap!(ulong, OutEdge)* options; // SSO: binary branches will probably be the most common
+    @property ref inout(UnsafeHashMap!(ulong, OutEdge)) options() inout pure {
+        return *this._options;
+    }
 
- @nogc nothrow:
     /++
     Initializes a conditional node, must be later [dispose]d.
 
@@ -891,12 +900,11 @@ See_Also: [MultiplexerNode]
         n = Number of branches to preallocate.
 
     Returns:
-        Zero on success, non-zero on failure (null node, OOM or invalid number of branches).
+        Zero on success, non-zero on failure (OOM or invalid number of branches).
     +/
     static err_t initialize(ConditionalNode* self, uint n)
-    in (self != null && n >= 2)
+    in (n >= 2, "conditional must have at least two branches")
     {
-        if (self == null) return EINVAL;
         if (n < 2) return EINVAL;
         *self = ConditionalNode.init;
 
@@ -904,13 +912,13 @@ See_Also: [MultiplexerNode]
         self.selector = OutEdge.data;
         self.control = InEdge.control(self.asNode);
 
-        self.options = allocate!(UnsafeHashMap!(ulong, OutEdge));
-        if (self.options == null) return ENOMEM;
-        *self.options = UnsafeHashMap!(ulong, OutEdge).init;
+        self._options = allocate!(UnsafeHashMap!(ulong, OutEdge));
+        if (self._options == null) return ENOMEM;
+        self.options = UnsafeHashMap!(ulong, OutEdge).init;
         const error = self.options.rehash(n);
         if (error) {
-            deallocate(self.options);
-            self.options = null;
+            deallocate(self._options);
+            self._options = null;
             return ENOMEM;
         }
 
@@ -919,8 +927,8 @@ See_Also: [MultiplexerNode]
 
     /// Frees all resources allocated by this node and sets it to an uninitialized state.
     static void dispose(ConditionalNode* self) {
-        if (self.options != null) self.options.dispose();
-        deallocate(self.options);
+        if (self._options != null) self.options.dispose();
+        deallocate(self._options);
         *self = ConditionalNode.init;
     }
 
@@ -931,7 +939,7 @@ See_Also: [MultiplexerNode]
     +/
     bool opEquals(ref const(ConditionalNode) rhs) const pure {
         if (this.selector != rhs.selector) return false;
-        if (*this.options != *rhs.options) return false;
+        if (this.options != rhs.options) return false;
         return true;
     }
 
@@ -988,7 +996,7 @@ It is this identification which allows the compiler to, later in the compilation
 
     /// Links this macro node to its external definition.
     ID id;
-    alias ID = uint; /// ditto
+    alias ID = ushort; /// ditto
 
     /// Edges (any kind) which point out from this node.
     OutEdge[] outEdges;
@@ -1001,7 +1009,7 @@ It is this identification which allows the compiler to, later in the compilation
     Initializes a macro node, must be later [dispose]d.
 
     This procedure sets up unique indexes for each in-edge slot.
-    All slot kinds default to `data`, but this can be later changed by the caller.
+    All slot kinds default to `data`; this can be changed later and does not require a rehash.
 
     Params:
         self = Address of node being initialized.
@@ -1010,20 +1018,20 @@ It is this identification which allows the compiler to, later in the compilation
         outs = Number of (preallocated) out-edges in this node.
 
     Returns:
-        Zero on success, non-zero on failure (null node or OOM).
+        Zero on success, non-zero on failure (OOM).
     +/
-    static err_t initialize(MacroNode* self, MacroNode.ID id, uint ins, uint outs)
-    in (self != null)
+    static err_t initialize(MacroNode* self, uint id, uint ins, uint outs)
+    in (id <= ID.max, "macro node IDs must be at most " ~ ID.max.stringof)
     {
-        if (self == null) return EINVAL;
         *self = MacroNode.init;
 
         self.vptr = &MacroNode.vtbl;
-        self.id = id;
+        self.id = cast(ID)id;
 
         self.inEdges = allocate!InEdge(ins);
         if (ins > 0 && self.inEdges == null) return ENOMEM;
-        foreach (i; 0 .. ins) self.inEdges[i] = InEdge.data(self.asNode, i);
+        foreach (i; 0 .. ins)
+            self.inEdges[i] = InEdge.data(self.asNode, i);
 
         self.outEdges = allocate!OutEdge(outs);
         if (outs > 0 && self.outEdges == null) {
@@ -1052,6 +1060,11 @@ It is this identification which allows the compiler to, later in the compilation
         return this.id == rhs.id && this.asNode == rhs.asNode; // self-ptr
     }
 
+    /++
+    Hash function.
+
+    Depends only on this macro node's identifier.
+    +/
     hash_t toHash() const pure {
         return this.id.hashOf;
     }
@@ -1103,12 +1116,9 @@ See_Also: [UndefinedNode]
         literal = This constant's value.
 
     Returns:
-        Zero on success, non-zero on failure (null node).
+        Zero on success, non-zero on failure.
     +/
-    static err_t initialize(ConstantNode* self, ulong literal)
-    in (self != null)
-    {
-        if (self == null) return EINVAL;
+    static err_t initialize(ConstantNode* self, ulong literal) {
         *self = ConstantNode.init;
 
         self.vptr = &ConstantNode.vtbl;
@@ -1181,12 +1191,9 @@ See_Also: [ConstantNode]
         self = Address of node being initialized.
 
     Returns:
-        Zero on success, non-zero on failure (null node).
+        Zero on success, non-zero on failure.
     +/
-    static err_t initialize(UndefinedNode* self)
-    in (self != null)
-    {
-        if (self == null) return EINVAL;
+    static err_t initialize(UndefinedNode* self) {
         *self = UndefinedNode.init;
 
         self.vptr = &UndefinedNode.vtbl;
@@ -1251,12 +1258,9 @@ See_Also: [ConstantNode]
         self = Address of node being initialized.
 
     Returns:
-        Zero on success, non-zero on failure (null node).
+        Zero on success, non-zero on failure.
     +/
-    static err_t initialize(TruncationNode* self)
-    in (self != null)
-    {
-        if (self == null) return EINVAL;
+    static err_t initialize(TruncationNode* self) {
         *self = TruncationNode.init;
 
         self.vptr = &TruncationNode.vtbl;
@@ -1322,12 +1326,9 @@ See_Also: [SignedExtensionNode]
         self = Address of node being initialized.
 
     Returns:
-        Zero on success, non-zero on failure (null node).
+        Zero on success, non-zero on failure.
     +/
-    static err_t initialize(UnsignedExtensionNode* self)
-    in (self != null)
-    {
-        if (self == null) return EINVAL;
+    static err_t initialize(UnsignedExtensionNode* self) {
         *self = UnsignedExtensionNode.init;
 
         self.vptr = &UnsignedExtensionNode.vtbl;
@@ -1393,12 +1394,9 @@ See_Also: [UnsignedExtensionNode]
         self = Address of node being initialized.
 
     Returns:
-        Zero on success, non-zero on failure (null node).
+        Zero on success, non-zero on failure.
     +/
-    static err_t initialize(SignedExtensionNode* self)
-    in (self != null)
-    {
-        if (self == null) return EINVAL;
+    static err_t initialize(SignedExtensionNode* self) {
         *self = SignedExtensionNode.init;
 
         self.vptr = &SignedExtensionNode.vtbl;
@@ -1464,14 +1462,19 @@ See_Also: [ConditionalNode]
     /// Resulting value.
     InEdge output;
 
+    // SSO: binary mux will probably be the most common
+    private UnsafeHashMap!(ulong, OutEdge)* _inputs;
+
+ @nogc nothrow:
     /++
     At least two inputs, one of which will be forwarded as output.
 
     Represented as a sparse mapping to avoid having an exponential number of unused input edges.
     +/
-    UnsafeHashMap!(ulong, OutEdge)* inputs; // SSO: binary mux will probably be the most common
+    @property ref inout(UnsafeHashMap!(ulong, OutEdge)) inputs() inout pure {
+        return *this._inputs;
+    }
 
- @nogc nothrow:
     /++
     Initializes a multiplexer node, must be later [dispose]d.
 
@@ -1480,12 +1483,11 @@ See_Also: [ConditionalNode]
         n = Number of inputs to preallocate.
 
     Returns:
-        Zero on success, non-zero on failure (null node, OOM or invalid number of inputs).
+        Zero on success, non-zero on failure (OOM or invalid number of inputs).
     +/
     static err_t initialize(MultiplexerNode* self, uint n)
-    in (self != null && n >= 2)
+    in (n >= 2, "multiplexer must have at least two inputs")
     {
-        if (self == null) return EINVAL;
         if (n < 2) return EINVAL;
         *self = MultiplexerNode.init;
 
@@ -1493,13 +1495,13 @@ See_Also: [ConditionalNode]
         self.selector = OutEdge.data;
         self.output = InEdge.data(self.asNode);
 
-        self.inputs = allocate!(UnsafeHashMap!(ulong, OutEdge));
-        if (self.inputs == null) return ENOMEM;
-        *self.inputs = UnsafeHashMap!(ulong, OutEdge).init;
+        self._inputs = allocate!(UnsafeHashMap!(ulong, OutEdge));
+        if (self._inputs == null) return ENOMEM;
+        self.inputs = UnsafeHashMap!(ulong, OutEdge).init;
         const error = self.inputs.rehash(n);
         if (error) {
-            deallocate(self.inputs);
-            self.inputs = null;
+            deallocate(self._inputs);
+            self._inputs = null;
             return ENOMEM;
         }
 
@@ -1508,15 +1510,15 @@ See_Also: [ConditionalNode]
 
     /// Frees all resources allocated by this node and sets it to an uninitialized state.
     static void dispose(MultiplexerNode* self) {
-        if (self.inputs != null) self.inputs.dispose();
-        deallocate(self.inputs);
+        if (self._inputs != null) self.inputs.dispose();
+        deallocate(self._inputs);
         *self = MultiplexerNode.init;
     }
 
     /// Semantic equality <=> structural equality.
     bool opEquals(ref const(MultiplexerNode) rhs) const pure {
         if (this.selector != rhs.selector) return false;
-        if (*this.inputs != *rhs.inputs) return false;
+        if (this.inputs != rhs.inputs) return false;
         return true;
     }
 
@@ -1563,12 +1565,9 @@ See_Also: [ConditionalNode]
         self = Address of node being initialized.
 
     Returns:
-        Zero on success, non-zero on failure (null node).
+        Zero on success, non-zero on failure.
     +/
-    static err_t initialize(AndNode* self)
-    in (self != null)
-    {
-        if (self == null) return EINVAL;
+    static err_t initialize(AndNode* self) {
         *self = AndNode.init;
 
         self.vptr = &AndNode.vtbl;
@@ -1633,12 +1632,9 @@ See_Also: [ConditionalNode]
         self = Address of node being initialized.
 
     Returns:
-        Zero on success, non-zero on failure (null node).
+        Zero on success, non-zero on failure.
     +/
-    static err_t initialize(OrNode* self)
-    in (self != null)
-    {
-        if (self == null) return EINVAL;
+    static err_t initialize(OrNode* self) {
         *self = OrNode.init;
 
         self.vptr = &OrNode.vtbl;
@@ -1707,12 +1703,9 @@ Can be used as a unary `NOT` operation when one operand is an all-ones constant.
         self = Address of node being initialized.
 
     Returns:
-        Zero on success, non-zero on failure (null node).
+        Zero on success, non-zero on failure.
     +/
-    static err_t initialize(XorNode* self)
-    in (self != null)
-    {
-        if (self == null) return EINVAL;
+    static err_t initialize(XorNode* self) {
         *self = XorNode.init;
 
         self.vptr = &XorNode.vtbl;
@@ -1785,12 +1778,9 @@ See_Also: [LeftShiftNoOverflowNode]
         self = Address of node being initialized.
 
     Returns:
-        Zero on success, non-zero on failure (null node).
+        Zero on success, non-zero on failure.
     +/
-    static err_t initialize(LeftShiftNode* self)
-    in (self != null)
-    {
-        if (self == null) return EINVAL;
+    static err_t initialize(LeftShiftNode* self) {
         *self = LeftShiftNode.init;
 
         self.vptr = &LeftShiftNode.vtbl;
@@ -1866,12 +1856,9 @@ See_Also: [LeftShiftNode]
         self = Address of node being initialized.
 
     Returns:
-        Zero on success, non-zero on failure (null node).
+        Zero on success, non-zero on failure.
     +/
-    static err_t initialize(LeftShiftNoOverflowNode* self)
-    in (self != null)
-    {
-        if (self == null) return EINVAL;
+    static err_t initialize(LeftShiftNoOverflowNode* self) {
         *self = LeftShiftNoOverflowNode.init;
 
         self.vptr = &LeftShiftNoOverflowNode.vtbl;
@@ -1945,12 +1932,9 @@ See_Also: [SignedRightShiftNode]
         self = Address of node being initialized.
 
     Returns:
-        Zero on success, non-zero on failure (null node).
+        Zero on success, non-zero on failure.
     +/
-    static err_t initialize(UnsignedRightShiftNode* self)
-    in (self != null)
-    {
-        if (self == null) return EINVAL;
+    static err_t initialize(UnsignedRightShiftNode* self) {
         *self = UnsignedRightShiftNode.init;
 
         self.vptr = &UnsignedRightShiftNode.vtbl;
@@ -2024,12 +2008,9 @@ See_Also: [UnsignedRightShiftNode]
         self = Address of node being initialized.
 
     Returns:
-        Zero on success, non-zero on failure (null node).
+        Zero on success, non-zero on failure.
     +/
-    static err_t initialize(SignedRightShiftNode* self)
-    in (self != null)
-    {
-        if (self == null) return EINVAL;
+    static err_t initialize(SignedRightShiftNode* self) {
         *self = SignedRightShiftNode.init;
 
         self.vptr = &SignedRightShiftNode.vtbl;
@@ -2101,12 +2082,9 @@ See_Also: [AdditionNoOverflowSignedNode]
         self = Address of node being initialized.
 
     Returns:
-        Zero on success, non-zero on failure (null node).
+        Zero on success, non-zero on failure.
     +/
-    static err_t initialize(AdditionNode* self)
-    in (self != null)
-    {
-        if (self == null) return EINVAL;
+    static err_t initialize(AdditionNode* self) {
         *self = AdditionNode.init;
 
         self.vptr = &AdditionNode.vtbl;
@@ -2177,12 +2155,9 @@ See_Also: [AdditionNode]
         self = Address of node being initialized.
 
     Returns:
-        Zero on success, non-zero on failure (null node).
+        Zero on success, non-zero on failure.
     +/
-    static err_t initialize(AdditionNoOverflowSignedNode* self)
-    in (self != null)
-    {
-        if (self == null) return EINVAL;
+    static err_t initialize(AdditionNoOverflowSignedNode* self) {
         *self = AdditionNoOverflowSignedNode.init;
 
         self.vptr = &AdditionNoOverflowSignedNode.vtbl;
@@ -2255,12 +2230,9 @@ See_Also: [SubtractionNoOverflowSignedNode]
         self = Address of node being initialized.
 
     Returns:
-        Zero on success, non-zero on failure (null node).
+        Zero on success, non-zero on failure.
     +/
-    static err_t initialize(SubtractionNode* self)
-    in (self != null)
-    {
-        if (self == null) return EINVAL;
+    static err_t initialize(SubtractionNode* self) {
         *self = SubtractionNode.init;
 
         self.vptr = &SubtractionNode.vtbl;
@@ -2334,12 +2306,9 @@ See_Also: [SubtractionNode]
         self = Address of node being initialized.
 
     Returns:
-        Zero on success, non-zero on failure (null node).
+        Zero on success, non-zero on failure.
     +/
-    static err_t initialize(SubtractionNoOverflowSignedNode* self)
-    in (self != null)
-    {
-        if (self == null) return EINVAL;
+    static err_t initialize(SubtractionNoOverflowSignedNode* self) {
         *self = SubtractionNoOverflowSignedNode.init;
 
         self.vptr = &SubtractionNoOverflowSignedNode.vtbl;
@@ -2412,12 +2381,9 @@ See_Also: [MultiplicationNoOverflowSignedNode]
         self = Address of node being initialized.
 
     Returns:
-        Zero on success, non-zero on failure (null node).
+        Zero on success, non-zero on failure.
     +/
-    static err_t initialize(MultiplicationNode* self)
-    in (self != null)
-    {
-        if (self == null) return EINVAL;
+    static err_t initialize(MultiplicationNode* self) {
         *self = MultiplicationNode.init;
 
         self.vptr = &MultiplicationNode.vtbl;
@@ -2488,12 +2454,9 @@ See_Also: [MultiplicationNode]
         self = Address of node being initialized.
 
     Returns:
-        Zero on success, non-zero on failure (null node).
+        Zero on success, non-zero on failure.
     +/
-    static err_t initialize(MultiplicationNoOverflowSignedNode* self)
-    in (self != null)
-    {
-        if (self == null) return EINVAL;
+    static err_t initialize(MultiplicationNoOverflowSignedNode* self) {
         *self = MultiplicationNoOverflowSignedNode.init;
 
         self.vptr = &MultiplicationNoOverflowSignedNode.vtbl;
@@ -2566,12 +2529,9 @@ See_Also: [SignedDivisionNode]
         self = Address of node being initialized.
 
     Returns:
-        Zero on success, non-zero on failure (null node).
+        Zero on success, non-zero on failure.
     +/
-    static err_t initialize(UnsignedDivisionNode* self)
-    in (self != null)
-    {
-        if (self == null) return EINVAL;
+    static err_t initialize(UnsignedDivisionNode* self) {
         *self = UnsignedDivisionNode.init;
 
         self.vptr = &UnsignedDivisionNode.vtbl;
@@ -2646,12 +2606,9 @@ See_Also: [UnsignedDivisionNode]
         self = Address of node being initialized.
 
     Returns:
-        Zero on success, non-zero on failure (null node).
+        Zero on success, non-zero on failure.
     +/
-    static err_t initialize(SignedDivisionNode* self)
-    in (self != null)
-    {
-        if (self == null) return EINVAL;
+    static err_t initialize(SignedDivisionNode* self) {
         *self = SignedDivisionNode.init;
 
         self.vptr = &SignedDivisionNode.vtbl;
@@ -2725,12 +2682,9 @@ See_Also: [SignedRemainderNode]
         self = Address of node being initialized.
 
     Returns:
-        Zero on success, non-zero on failure (null node).
+        Zero on success, non-zero on failure.
     +/
-    static err_t initialize(UnsignedRemainderNode* self)
-    in (self != null)
-    {
-        if (self == null) return EINVAL;
+    static err_t initialize(UnsignedRemainderNode* self) {
         *self = UnsignedRemainderNode.init;
 
         self.vptr = &UnsignedRemainderNode.vtbl;
@@ -2805,12 +2759,9 @@ See_Also: [UnsignedRemainderNode]
         self = Address of node being initialized.
 
     Returns:
-        Zero on success, non-zero on failure (null node).
+        Zero on success, non-zero on failure.
     +/
-    static err_t initialize(SignedRemainderNode* self)
-    in (self != null)
-    {
-        if (self == null) return EINVAL;
+    static err_t initialize(SignedRemainderNode* self) {
         *self = SignedRemainderNode.init;
 
         self.vptr = &SignedRemainderNode.vtbl;
@@ -2876,12 +2827,9 @@ See_Also: [UnsignedRemainderNode]
         self = Address of node being initialized.
 
     Returns:
-        Zero on success, non-zero on failure (null node).
+        Zero on success, non-zero on failure.
     +/
-    static err_t initialize(EqualNode* self)
-    in (self != null)
-    {
-        if (self == null) return EINVAL;
+    static err_t initialize(EqualNode* self) {
         *self = EqualNode.init;
 
         self.vptr = &EqualNode.vtbl;
@@ -2946,12 +2894,9 @@ See_Also: [UnsignedRemainderNode]
         self = Address of node being initialized.
 
     Returns:
-        Zero on success, non-zero on failure (null node).
+        Zero on success, non-zero on failure.
     +/
-    static err_t initialize(NotEqualNode* self)
-    in (self != null)
-    {
-        if (self == null) return EINVAL;
+    static err_t initialize(NotEqualNode* self) {
         *self = NotEqualNode.init;
 
         self.vptr = &NotEqualNode.vtbl;
@@ -3022,12 +2967,9 @@ There is no equivalent for `>` because it suffices to swap this node's operands.
         self = Address of node being initialized.
 
     Returns:
-        Zero on success, non-zero on failure (null node).
+        Zero on success, non-zero on failure.
     +/
-    static err_t initialize(UnsignedLessThanNode* self)
-    in (self != null)
-    {
-        if (self == null) return EINVAL;
+    static err_t initialize(UnsignedLessThanNode* self) {
         *self = UnsignedLessThanNode.init;
 
         self.vptr = &UnsignedLessThanNode.vtbl;
@@ -3099,12 +3041,9 @@ There is no equivalent for `>` because it suffices to swap this node's operands.
         self = Address of node being initialized.
 
     Returns:
-        Zero on success, non-zero on failure (null node).
+        Zero on success, non-zero on failure.
     +/
-    static err_t initialize(SignedLessThanNode* self)
-    in (self != null)
-    {
-        if (self == null) return EINVAL;
+    static err_t initialize(SignedLessThanNode* self) {
         *self = SignedLessThanNode.init;
 
         self.vptr = &SignedLessThanNode.vtbl;
@@ -3176,12 +3115,9 @@ There is no equivalent for `<=` because it suffices to swap this node's operands
         self = Address of node being initialized.
 
     Returns:
-        Zero on success, non-zero on failure (null node).
+        Zero on success, non-zero on failure.
     +/
-    static err_t initialize(UnsignedGreaterOrEqualNode* self)
-    in (self != null)
-    {
-        if (self == null) return EINVAL;
+    static err_t initialize(UnsignedGreaterOrEqualNode* self) {
         *self = UnsignedGreaterOrEqualNode.init;
 
         self.vptr = &UnsignedGreaterOrEqualNode.vtbl;
@@ -3253,12 +3189,9 @@ There is no equivalent for `<=` because it suffices to swap this node's operands
         self = Address of node being initialized.
 
     Returns:
-        Zero on success, non-zero on failure (null node).
+        Zero on success, non-zero on failure.
     +/
-    static err_t initialize(SignedGreaterOrEqualNode* self)
-    in (self != null)
-    {
-        if (self == null) return EINVAL;
+    static err_t initialize(SignedGreaterOrEqualNode* self) {
         *self = SignedGreaterOrEqualNode.init;
 
         self.vptr = &SignedGreaterOrEqualNode.vtbl;
