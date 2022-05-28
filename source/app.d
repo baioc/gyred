@@ -1,5 +1,5 @@
 import core.stdc.stdlib : atoi, rand, srand;
-import core.stdc.stdio : printf, fprintf, stderr;
+import core.stdc.stdio : printf;
 import core.stdc.time : clock, clock_t, CLOCKS_PER_SEC;
 
 import eris.hash_table : HashMap;
@@ -28,10 +28,10 @@ void microBenchmark(int n, int replications = 1) {
     replications = replications > 0 ? replications : 1;
 
     version (D_BetterC) {
-        fprintf(stderr, "# With custom hash table ...     ");
+        debug printf("# With custom hash table\n");
         alias Dict = HashMap!(ulong, int);
     } else {
-        fprintf(stderr, "# Using D's built-in AAs ...     ");
+        debug printf("# Using D's built-in AAs\n");
         alias Dict = int[ulong];
     }
 
@@ -39,7 +39,6 @@ void microBenchmark(int n, int replications = 1) {
 
     double averageMs = 0.0;
     foreach (experiment; 0 .. replications) {
-        fprintf(stderr, "\b\b\b\b%3.0f%%", experiment * 100.0 / replications);
         const clock_t begin = clock();
 
         Dict dict;
@@ -53,8 +52,7 @@ void microBenchmark(int n, int replications = 1) {
         averageMs += (end - begin) * 1e3 / CLOCKS_PER_SEC;
     }
     averageMs /= replications;
-    fprintf(stderr, "\b\b\b\b100%%\n");
 
-    fprintf(stderr, "Average (across %d runs) time per element (ns): ", replications);
+    debug printf("Average (across %d runs) time per element (ns): ", replications);
     printf("%.3f\n", averageMs * 1e6 / n);
 }

@@ -667,11 +667,12 @@ struct Transaction {
             return 0;
         }
 
-        // set up DFS bookkeeping data structures, then trigger the recursions
+        // set up DFS bookkeeping data structures
         NodeStorage*[] transfers = allocate!(NodeStorage*)(this.cursor);
         scope(exit) transfers.deallocate();
         if (this.cursor > 0 && transfers == null) return ENOMEM;
-        transfers[] = null;
+        foreach (ref mapping; transfers) mapping = null;
+        // then trigger the recursions
         foreach (i; 0 .. this.cursor) {
             if (transfers[i] != null) continue; // <- enables invalid cycle detection in DFS
             const error = depthFirstAdd(transfers, i);

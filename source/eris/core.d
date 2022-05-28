@@ -60,7 +60,7 @@ T[] allocate(T)(size_t n) @nogc nothrow
     debug if (ptr != null) {
         const current = allocated.atomicOp!"+="(bytes);
         version (Eris_VerboseAllocations) {
-            fprintf(stderr,
+            printf(
                 "+%10luB (total: %10luB) for " ~ T.stringof ~ "[%lu]\n",
                 bytes, current, n
             );
@@ -81,7 +81,7 @@ debug {
     import core.atomic : atomicOp;
     shared size_t allocated = 0;
     version (Eris_VerboseAllocations) {
-        import core.stdc.stdio : fprintf, stderr;
+        import core.stdc.stdio : printf;
     }
 }
 
@@ -96,7 +96,7 @@ void deallocate(T)(T[] memory) @nogc nothrow @system {
         const bytes = memory.length * T.sizeof;
         const current = allocated.atomicOp!"-="(bytes);
         version (Eris_VerboseAllocations) {
-            fprintf(stderr,
+            printf(
                 "-%10luB (total: %10luB) for " ~ T.stringof ~ "[%lu]\n",
                 bytes, current, memory.length
             );
