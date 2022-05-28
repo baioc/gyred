@@ -44,6 +44,9 @@ module gyre.nodes;
 import core.stdc.errno : EINVAL, ENOMEM;
 import std.algorithm.mutation : moveEmplace;
 import std.bitmanip : taggedPointer;
+import std.traits :
+    EnumMembers, Parameters,
+    functionAttributes, SetFunctionAttributes, functionLinkage;
 
 import eris.core : hash_t, err_t, allocate, deallocate;
 import eris.hash_table : UnsafeHashMap;
@@ -77,7 +80,6 @@ enum EdgeKind : ubyte {
 }
 
 private mixin template StaticEdgeFactories() {
-    private import std.traits : EnumMembers;
     static foreach (kind; EnumMembers!EdgeKind) {
         mixin(
             `@nogc nothrow pure
@@ -259,8 +261,8 @@ struct Node {
  package:
     struct VTable {
      @nogc nothrow pure:
-        bool function(const(Node)*, const(Node)*) opEquals = null;
-        hash_t function(const(Node)*) toHash = null;
+        bool function(const(Node)*, const(Node)*) opEquals;
+        hash_t function(const(Node)*) toHash;
     }
 
     struct CommonPrefix {
@@ -270,6 +272,12 @@ struct Node {
 
     CommonPrefix _node;
     alias _node this;
+
+    static assert(
+        Node.sizeof == Node.CommonPrefix.sizeof && Node.alignof == Node.CommonPrefix.alignof &&
+        is(typeof(Node._node) == Node.CommonPrefix) && Node._node.offsetof == 0,
+        "`Node` and `Node.CommonPrefix` must be binary-interchangeable"
+    );
 
  public pragma(inline) @nogc nothrow pure:
     /++
@@ -303,12 +311,6 @@ struct Node {
         return this.hash ^ this.vptr.hashOf;
     }
 }
-
-static assert(
-    Node.sizeof == Node.CommonPrefix.sizeof && Node.alignof == Node.CommonPrefix.alignof &&
-    is(typeof(Node._node) == Node.CommonPrefix) && Node._node.offsetof == 0,
-    "`Node` and `Node.CommonPrefix` must be binary-interchangeable"
-);
 
 private mixin template NodeInheritance() {
     private alias This = typeof(this);
@@ -359,6 +361,18 @@ private mixin template NodeInheritance() {
             if (node == null || node.vptr != &vtbl) return null;
             return cast(inout(This)*)node;
         }
+
+        static assert(
+            __traits(hasMember, This, "outEdges") && __traits(hasMember, This, "inEdges"),
+            "all nodes must provide iterators for their out-edge and in-edge slots"
+        );
+
+        /// Post-move adjusts in-edge slots' self-pointer.
+        void opPostMove(ref const(This) old) pure {
+            foreach (ref slot; this.inEdges!(int delegate(ref InEdge) @nogc nothrow pure)) {
+                slot.owner = this.asNode;
+            }
+        }
     }
 }
 
@@ -381,6 +395,20 @@ version (unittest) private { // for some reason, this needs to be in global scop
         hash_t toHash() const {
             debug usingCustomHash = true;
             return this.value;
+        }
+
+        OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+            return OutEdgeIterator!Callable(
+                this.asNode,
+                (Node* self, scope Callable iter) => 0
+            );
+        }
+
+        InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+            return InEdgeIterator!Callable(
+                this.asNode,
+                (Node* self, scope Callable iter) => 0
+            );
         }
     }
 }
@@ -415,6 +443,61 @@ version (unittest) private { // for some reason, this needs to be in global scop
     polymorphic.add(node2);
     assert(polymorphic.length == 1); // since test and test2 are equal
     assert(*node != *other.asNode); // these are still different, tho
+}
+
+
+/// Iterates (with `foreach`) over a node's out-edges.
+struct OutEdgeIterator(Callable) if (is(Parameters!Callable[0] : const(OutEdge))) {
+    private alias Dispatch = SetFunctionAttributes!(
+        int delegate(Node*, scope Callable),
+        functionLinkage!Callable,
+        functionAttributes!Callable
+    );
+    private Node* _node;
+    private Dispatch _opApply;
+    ///
+    int opApply(scope Callable iter) {
+        return this._opApply(this._node, iter);
+    }
+}
+
+/// Iterates (with `foreach`) over a node's in-edges.
+struct InEdgeIterator(Callable) if (is(Parameters!Callable[0] : const(InEdge))) {
+    private alias Dispatch = SetFunctionAttributes!(
+        int delegate(Node*, scope Callable),
+        functionLinkage!Callable,
+        functionAttributes!Callable
+    );
+    private Node* _node;
+    private Dispatch _opApply;
+    ///
+    int opApply(scope Callable iter) {
+        return this._opApply(this._node, iter);
+    }
+}
+
+// common boilerplate for node unittest
+private void nodeTest(NodeType)(
+    Parameters!(NodeType.initialize)[1 .. $] args,
+    scope void delegate(ref NodeType node) @nogc nothrow test = (ref NodeType node){}
+) @nogc nothrow {
+    // initialize one guy
+    NodeType tmp = void;
+    NodeType.initialize(&tmp, args);
+    // move it
+    NodeType node = void;
+    moveEmplace(tmp, node);
+    // check if everything is fine
+    assert(node == node);
+    foreach (inEdge; node.inEdges) {
+        assert(inEdge.owner == node.asNode);
+    }
+    test(node);
+    // free it on scope exit (and the second free should be a no-op)
+    scope(exit) {
+        NodeType.dispose(&node);
+        NodeType.dispose(&node);
+    }
 }
 
 
@@ -540,33 +623,47 @@ See_Also: [InstantiationNode], [JumpNode], [ForkNode]
         return hash;
     }
 
-    /// Post-move adjusts in-edge slots' internal pointer.
-    void opPostMove(ref const(JoinNode) old) pure {
-        this.definition.owner = this.asNode;
-        foreach (parameters; this.channels) {
-            foreach (ref param; parameters) {
-                param.owner = this.asNode;
+    /// Provides an iterator over this node's out-edges.
+    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+        return OutEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = JoinNode.ofNode(self);
+                assert(node != null);
+                return iter(node.control);
             }
-        }
+        );
+    }
+
+    /// Provides an iterator over this node's in-edges.
+    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = JoinNode.ofNode(self);
+                assert(node != null);
+                int stop = iter(node.definition);
+                if (stop) return stop;
+                foreach (parameters; node.channels) {
+                    foreach (ref param; parameters) {
+                        stop = iter(param);
+                        if (stop) return stop;
+                    }
+                }
+                return 0;
+            }
+        );
     }
 }
 
 @nogc nothrow unittest {
-    // initialize one guy
-    JoinNode tmp = void;
-    uint[1] channelSizes = [4];
-    JoinNode.initialize(&tmp, channelSizes);
-    // move it
-    JoinNode join = void;
-    moveEmplace(tmp, join);
-    // check if everything's fine
-    assert(join == join);
-    assert(join.definition.owner == join.asNode);
-    assert(join.channels.length == 1);
-    assert(join.channels[0].length == 4);
-    // free it (and the second free should be a no-op)
-    JoinNode.dispose(&join);
-    JoinNode.dispose(&join);
+    uint[1] channelSizes = [4u];
+    nodeTest!JoinNode(channelSizes[],
+        (ref JoinNode join){
+            assert(join.channels.length == 1);
+            assert(join.channels[0].length == 4);
+        },
+    );
 }
 
 /++
@@ -640,25 +737,41 @@ See_Also: [JoinNode], [JumpNode]
         return continuations.length.hashOf;
     }
 
-    /// Post-move adjusts in-edge slots' internal pointer.
-    void opPostMove(ref const(InstantiationNode) old) pure {
-        foreach (ref cont; this.continuations) cont.owner = this.asNode;
+    /// Provides an iterator over this node's out-edges.
+    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+        return OutEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = InstantiationNode.ofNode(self);
+                assert(node != null);
+                return iter(node.definition);
+            }
+        );
+    }
+
+    /// Provides an iterator over this node's in-edges.
+    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = InstantiationNode.ofNode(self);
+                assert(node != null);
+                foreach (ref cont; node.continuations) {
+                    int stop = iter(cont);
+                    if (stop) return stop;
+                }
+                return 0;
+            }
+        );
     }
 }
 
 @nogc nothrow unittest {
-    InstantiationNode tmp = void;
-    InstantiationNode.initialize(&tmp, 1);
-    //
-    InstantiationNode inst = void;
-    moveEmplace(tmp, inst);
-    //
-    assert(inst == inst);
-    assert(inst.continuations[0].owner == inst.asNode);
-    assert(inst.continuations.length == 1);
-    //
-    InstantiationNode.dispose(&inst);
-    InstantiationNode.dispose(&inst);
+    nodeTest!InstantiationNode(1,
+        (ref InstantiationNode inst){
+            assert(inst.continuations.length == 1);
+        },
+    );
 }
 
 /++
@@ -742,25 +855,43 @@ See_Also: [JoinNode]
         return hash;
     }
 
-    /// Post-move adjusts in-edge slots' internal pointer.
-    void opPostMove(ref const(JumpNode) old) pure {
-        this.control.owner = this.asNode;
+    /// Provides an iterator over this node's out-edges.
+    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+        return OutEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = JumpNode.ofNode(self);
+                assert(node != null);
+                int stop = iter(node.continuation);
+                if (stop) return stop;
+                foreach (ref arg; node.arguments) {
+                    stop = iter(arg);
+                    if (stop) return stop;
+                }
+                return 0;
+            }
+        );
+    }
+
+    /// Provides an iterator over this node's in-edges.
+    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = JumpNode.ofNode(self);
+                assert(node != null);
+                return iter(node.control);
+            }
+        );
     }
 }
 
 @nogc nothrow unittest {
-    JumpNode tmp = void;
-    JumpNode.initialize(&tmp, 4);
-    //
-    JumpNode jump = void;
-    moveEmplace(tmp, jump);
-    //
-    assert(jump == jump);
-    assert(jump.control.owner == jump.asNode);
-    assert(jump.arguments.length == 4);
-    //
-    JumpNode.dispose(&jump);
-    JumpNode.dispose(&jump);
+    nodeTest!JumpNode(4,
+        (ref JumpNode jump){
+            assert(jump.arguments.length == 4);
+        },
+    );
 }
 
 /++
@@ -837,24 +968,41 @@ See_Also: [JoinNode], [JumpNode]
         return hash;
     }
 
-    /// Post-move adjusts in-edge slots' internal pointer.
-    void opPostMove(ref const(ForkNode) old) pure {
-        this.control.owner = this.asNode;
+    /// Provides an iterator over this node's out-edges.
+    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+        return OutEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = ForkNode.ofNode(self);
+                assert(node != null);
+                foreach (ref thread; node.threads) {
+                    int stop = iter(thread);
+                    if (stop) return stop;
+                }
+                return 0;
+            }
+        );
+    }
+
+    /// Provides an iterator over this node's in-edges.
+    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = ForkNode.ofNode(self);
+                assert(node != null);
+                return iter(node.control);
+            }
+        );
     }
 }
 
 @nogc nothrow unittest {
-    ForkNode tmp = void;
-    ForkNode.initialize(&tmp, 2);
-    //
-    ForkNode fork = void;
-    moveEmplace(tmp, fork);
-    //
-    assert(fork == fork);
-    assert(fork.control.owner == fork.asNode);
-    //
-    ForkNode.dispose(&fork);
-    ForkNode.dispose(&fork);
+    nodeTest!ForkNode(2,
+        (ref ForkNode fork){
+            assert(fork.threads.length == 2);
+        },
+    );
 }
 
 /++
@@ -947,24 +1095,45 @@ See_Also: [MultiplexerNode]
         return this.selector.toHash() ^ this.options.toHash();
     }
 
-    /// Post-move adjusts in-edge slots' internal pointer.
-    void opPostMove(ref const(ConditionalNode) old) pure {
-        this.control.owner = this.asNode;
+    /// Provides an iterator over this node's out-edges.
+    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+        return OutEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = ConditionalNode.ofNode(self);
+                assert(node != null);
+                int stop = iter(node.selector);
+                if (stop) return stop;
+                foreach (ref option; node.options.byValue) {
+                    stop = iter(option);
+                    if (stop) return stop;
+                }
+                return 0;
+            }
+        );
+    }
+
+    /// Provides an iterator over this node's in-edges.
+    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = ConditionalNode.ofNode(self);
+                assert(node != null);
+                return iter(node.control);
+            }
+        );
     }
 }
 
 @nogc nothrow unittest {
-    ConditionalNode tmp = void;
-    ConditionalNode.initialize(&tmp, 2);
-    //
-    ConditionalNode cond = void;
-    moveEmplace(tmp, cond);
-    //
-    assert(cond == cond);
-    assert(cond.control.owner == cond.asNode);
-    //
-    ConditionalNode.dispose(&cond);
-    ConditionalNode.dispose(&cond);
+    nodeTest!ConditionalNode(2,
+        (ref ConditionalNode cond){
+            cond.options[0] = OutEdge.control;
+            cond.options[1] = OutEdge.control;
+            assert(cond.options.length == 2);
+        },
+    );
 }
 
 /++
@@ -999,10 +1168,10 @@ It is this identification which allows the compiler to, later in the compilation
     alias ID = ushort; /// ditto
 
     /// Edges (any kind) which point out from this node.
-    OutEdge[] outEdges;
+    OutEdge[] outSlots;
 
     /// Edges (of any kind) which point into this node.
-    InEdge[] inEdges;
+    InEdge[] inSlots;
 
  @nogc nothrow:
     /++
@@ -1028,26 +1197,26 @@ It is this identification which allows the compiler to, later in the compilation
         self.vptr = &MacroNode.vtbl;
         self.id = cast(ID)id;
 
-        self.inEdges = allocate!InEdge(ins);
-        if (ins > 0 && self.inEdges == null) return ENOMEM;
+        self.inSlots = allocate!InEdge(ins);
+        if (ins > 0 && self.inSlots == null) return ENOMEM;
         foreach (i; 0 .. ins)
-            self.inEdges[i] = InEdge.data(self.asNode, i);
+            self.inSlots[i] = InEdge.data(self.asNode, i);
 
-        self.outEdges = allocate!OutEdge(outs);
-        if (outs > 0 && self.outEdges == null) {
-            self.inEdges.deallocate();
-            self.inEdges = null;
+        self.outSlots = allocate!OutEdge(outs);
+        if (outs > 0 && self.outSlots == null) {
+            self.inSlots.deallocate();
+            self.inSlots = null;
             return ENOMEM;
         }
-        foreach (i; 0 .. outs) self.outEdges[i] = OutEdge.data;
+        foreach (i; 0 .. outs) self.outSlots[i] = OutEdge.data;
 
         return 0;
     }
 
     /// Frees all resources allocated by this node and sets it to an uninitialized state.
     static void dispose(MacroNode* self) {
-        self.outEdges.deallocate();
-        self.inEdges.deallocate();
+        self.outSlots.deallocate();
+        self.inSlots.deallocate();
         *self = MacroNode.init;
     }
 
@@ -1069,27 +1238,47 @@ It is this identification which allows the compiler to, later in the compilation
         return this.id.hashOf;
     }
 
-    /// Post-move adjusts in-edge slots' internal pointer.
-    void opPostMove(ref const(MacroNode) old) pure {
-        foreach (ref slot; this.inEdges) slot.owner = this.asNode;
+    /// Provides an iterator over this node's out-edges.
+    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+        return OutEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = MacroNode.ofNode(self);
+                assert(node != null);
+                foreach (ref outEdge; node.outSlots) {
+                    int stop = iter(outEdge);
+                    if (stop) return stop;
+                }
+                return 0;
+            }
+        );
+    }
+
+    /// Provides an iterator over this node's in-edges.
+    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = MacroNode.ofNode(self);
+                assert(node != null);
+                foreach (ref inEdge; node.inSlots) {
+                    int stop = iter(inEdge);
+                    if (stop) return stop;
+                }
+                return 0;
+            }
+        );
     }
 }
 
 @nogc nothrow unittest {
-    MacroNode tmp = void;
-    MacroNode.initialize(&tmp, MacroNode.ID(42), 3, 2);
-    //
-    MacroNode node = void;
-    moveEmplace(tmp, node);
-    //
-    assert(node == node);
-    assert(node.id == 42);
-    assert(node.inEdges.length == 3);
-    assert(node.outEdges.length == 2);
-    assert(node.inEdges[0].owner == node.asNode);
-    //
-    MacroNode.dispose(&node);
-    MacroNode.dispose(&node);
+    nodeTest!MacroNode(MacroNode.ID(42), 3, 2,
+        (ref MacroNode node){
+            assert(node.id == 42);
+            assert(node.inSlots.length == 3);
+            assert(node.outSlots.length == 2);
+        },
+    );
 }
 
 
@@ -1146,24 +1335,33 @@ See_Also: [UndefinedNode]
         return this.literal.hashOf;
     }
 
-    /// Post-move adjusts in-edge slots' internal pointer.
-    void opPostMove(ref const(ConstantNode) old) pure {
-        this.value.owner = this.asNode;
+    /// Provides an iterator over this node's out-edges.
+    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+        return OutEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter) => 0
+        );
+    }
+
+    /// Provides an iterator over this node's in-edges.
+    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = ConstantNode.ofNode(self);
+                assert(node != null);
+                return iter(node.value);
+            }
+        );
     }
 }
 
 @nogc nothrow unittest {
-    ConstantNode tmp = void;
-    ConstantNode.initialize(&tmp, 2);
-    //
-    ConstantNode lit = void;
-    moveEmplace(tmp, lit);
-    //
-    assert(lit == lit);
-    assert(lit.value.owner == lit.asNode);
-    //
-    ConstantNode.dispose(&lit);
-    ConstantNode.dispose(&lit);
+    nodeTest!ConstantNode(1,
+        (ref ConstantNode c1){
+            assert(c1.literal == 1);
+        },
+    );
 }
 
 /++
@@ -1220,25 +1418,28 @@ See_Also: [ConstantNode]
         return hash_t.max;
     }
 
-    /// Post-move adjusts in-edge slots' internal pointer.
-    void opPostMove(ref const(UndefinedNode) old) pure {
-        this.value.owner = this.asNode;
+    /// Provides an iterator over this node's out-edges.
+    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+        return OutEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter) => 0
+        );
+    }
+
+    /// Provides an iterator over this node's in-edges.
+    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = UndefinedNode.ofNode(self);
+                assert(node != null);
+                return iter(node.value);
+            }
+        );
     }
 }
 
-@nogc nothrow unittest {
-    UndefinedNode tmp = void;
-    UndefinedNode.initialize(&tmp);
-    //
-    UndefinedNode undef = void;
-    moveEmplace(tmp, undef);
-    //
-    assert(undef == undef);
-    assert(undef.value.owner == undef.asNode);
-    //
-    UndefinedNode.dispose(&undef);
-    UndefinedNode.dispose(&undef);
-}
+@nogc nothrow unittest { nodeTest!UndefinedNode(); }
 
 /// Yields the lowermost bits of its input.
 @mnemonic("trunc") struct TruncationNode { // FIXME: doesn't make sense without type info
@@ -1284,25 +1485,32 @@ See_Also: [ConstantNode]
         return this.input.toHash();
     }
 
-    /// Post-move adjusts in-edge slots' internal pointer.
-    void opPostMove(ref const(TruncationNode) old) pure {
-        this.output.owner = this.asNode;
+    /// Provides an iterator over this node's out-edges.
+    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+        return OutEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = TruncationNode.ofNode(self);
+                assert(node != null);
+                return iter(node.input);
+            }
+        );
+    }
+
+    /// Provides an iterator over this node's in-edges.
+    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = TruncationNode.ofNode(self);
+                assert(node != null);
+                return iter(node.output);
+            }
+        );
     }
 }
 
-@nogc nothrow unittest {
-    TruncationNode tmp = void;
-    TruncationNode.initialize(&tmp);
-    //
-    TruncationNode trunc = void;
-    moveEmplace(tmp, trunc);
-    //
-    assert(trunc == trunc);
-    assert(trunc.output.owner == trunc.asNode);
-    //
-    TruncationNode.dispose(&trunc);
-    TruncationNode.dispose(&trunc);
-}
+@nogc nothrow unittest { nodeTest!TruncationNode(); }
 
 /++
 Yields a wider version of its input, with added bits set to zero.
@@ -1352,25 +1560,32 @@ See_Also: [SignedExtensionNode]
         return this.input.toHash();
     }
 
-    /// Post-move adjusts in-edge slots' internal pointer.
-    void opPostMove(ref const(UnsignedExtensionNode) old) pure {
-        this.output.owner = this.asNode;
+    /// Provides an iterator over this node's out-edges.
+    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+        return OutEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = UnsignedExtensionNode.ofNode(self);
+                assert(node != null);
+                return iter(node.input);
+            }
+        );
+    }
+
+    /// Provides an iterator over this node's in-edges.
+    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = UnsignedExtensionNode.ofNode(self);
+                assert(node != null);
+                return iter(node.output);
+            }
+        );
     }
 }
 
-@nogc nothrow unittest {
-    UnsignedExtensionNode tmp = void;
-    UnsignedExtensionNode.initialize(&tmp);
-    //
-    UnsignedExtensionNode extu = void;
-    moveEmplace(tmp, extu);
-    //
-    assert(extu == extu);
-    assert(extu.output.owner == extu.asNode);
-    //
-    UnsignedExtensionNode.dispose(&extu);
-    UnsignedExtensionNode.dispose(&extu);
-}
+@nogc nothrow unittest { nodeTest!UnsignedExtensionNode(); }
 
 /++
 Yields a wider version of its input, with added bits equal to the input's sign bit.
@@ -1420,25 +1635,32 @@ See_Also: [UnsignedExtensionNode]
         return this.input.toHash();
     }
 
-    /// Post-move adjusts in-edge slots' internal pointer.
-    void opPostMove(ref const(SignedExtensionNode) old) pure {
-        this.output.owner = this.asNode;
+    /// Provides an iterator over this node's out-edges.
+    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+        return OutEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = SignedExtensionNode.ofNode(self);
+                assert(node != null);
+                return iter(node.input);
+            }
+        );
+    }
+
+    /// Provides an iterator over this node's in-edges.
+    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = SignedExtensionNode.ofNode(self);
+                assert(node != null);
+                return iter(node.output);
+            }
+        );
     }
 }
 
-@nogc nothrow unittest {
-    SignedExtensionNode tmp = void;
-    SignedExtensionNode.initialize(&tmp);
-    //
-    SignedExtensionNode exts = void;
-    moveEmplace(tmp, exts);
-    //
-    assert(exts == exts);
-    assert(exts.output.owner == exts.asNode);
-    //
-    SignedExtensionNode.dispose(&exts);
-    SignedExtensionNode.dispose(&exts);
-}
+@nogc nothrow unittest { nodeTest!SignedExtensionNode(); }
 
 /++
 An operation which chooses one of its inputs to forward as a result.
@@ -1526,24 +1748,45 @@ See_Also: [ConditionalNode]
         return this.selector.toHash() ^ this.inputs.toHash();
     }
 
-    /// Post-move adjusts in-edge slots' internal pointer.
-    void opPostMove(ref const(MultiplexerNode) old) pure {
-        this.output.owner = this.asNode;
+    /// Provides an iterator over this node's out-edges.
+    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+        return OutEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = MultiplexerNode.ofNode(self);
+                assert(node != null);
+                int stop = iter(node.selector);
+                if (stop) return stop;
+                foreach (ref input; node.inputs.byValue) {
+                    stop = iter(input);
+                    if (stop) return stop;
+                }
+                return 0;
+            }
+        );
+    }
+
+    /// Provides an iterator over this node's in-edges.
+    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = MultiplexerNode.ofNode(self);
+                assert(node != null);
+                return iter(node.output);
+            }
+        );
     }
 }
 
 @nogc nothrow unittest {
-    MultiplexerNode tmp = void;
-    MultiplexerNode.initialize(&tmp, 2);
-    //
-    MultiplexerNode mux = void;
-    moveEmplace(tmp, mux);
-    //
-    assert(mux == mux);
-    assert(mux.output.owner == mux.asNode);
-    //
-    MultiplexerNode.dispose(&mux);
-    MultiplexerNode.dispose(&mux);
+    nodeTest!MultiplexerNode(2,
+        (ref MultiplexerNode mux){
+            mux.inputs[0] = OutEdge.data;
+            mux.inputs[1] = OutEdge.data;
+            assert(mux.inputs.length == 2);
+        }
+    );
 }
 
 /// Bitwise `AND` operation.
@@ -1593,25 +1836,35 @@ See_Also: [ConditionalNode]
         return this.lhs.toHash() ^ this.rhs.toHash();
     }
 
-    /// Post-move adjusts in-edge slots' internal pointer.
-    void opPostMove(ref const(AndNode) old) pure {
-        this.result.owner = this.asNode;
+    /// Provides an iterator over this node's out-edges.
+    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+        return OutEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = AndNode.ofNode(self);
+                assert(node != null);
+                int stop = 0;
+                if (!stop) stop = iter(node.lhs);
+                if (!stop) stop = iter(node.rhs);
+                return stop;
+            }
+        );
+    }
+
+    /// Provides an iterator over this node's in-edges.
+    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = AndNode.ofNode(self);
+                assert(node != null);
+                return iter(node.result);
+            }
+        );
     }
 }
 
-@nogc nothrow unittest {
-    AndNode tmp = void;
-    AndNode.initialize(&tmp);
-    //
-    AndNode and = void;
-    moveEmplace(tmp, and);
-    //
-    assert(and == and);
-    assert(and.result.owner == and.asNode);
-    //
-    AndNode.dispose(&and);
-    AndNode.dispose(&and);
-}
+@nogc nothrow unittest { nodeTest!AndNode(); }
 
 /// Bitwise `OR` operation.
 @mnemonic("or") struct OrNode {
@@ -1660,25 +1913,35 @@ See_Also: [ConditionalNode]
         return this.lhs.toHash() ^ this.rhs.toHash();
     }
 
-    /// Post-move adjusts in-edge slots' internal pointer.
-    void opPostMove(ref const(OrNode) old) pure {
-        this.result.owner = this.asNode;
+    /// Provides an iterator over this node's out-edges.
+    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+        return OutEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = OrNode.ofNode(self);
+                assert(node != null);
+                int stop = 0;
+                if (!stop) stop = iter(node.lhs);
+                if (!stop) stop = iter(node.rhs);
+                return stop;
+            }
+        );
+    }
+
+    /// Provides an iterator over this node's in-edges.
+    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = OrNode.ofNode(self);
+                assert(node != null);
+                return iter(node.result);
+            }
+        );
     }
 }
 
-@nogc nothrow unittest {
-    OrNode tmp = void;
-    OrNode.initialize(&tmp);
-    //
-    OrNode or = void;
-    moveEmplace(tmp, or);
-    //
-    assert(or == or);
-    assert(or.result.owner == or.asNode);
-    //
-    OrNode.dispose(&or);
-    OrNode.dispose(&or);
-}
+@nogc nothrow unittest { nodeTest!OrNode(); }
 
 /++
 Bitwise `XOR` operation.
@@ -1731,25 +1994,35 @@ Can be used as a unary `NOT` operation when one operand is an all-ones constant.
         return this.lhs.toHash() ^ this.rhs.toHash();
     }
 
-    /// Post-move adjusts in-edge slots' internal pointer.
-    void opPostMove(ref const(XorNode) old) pure {
-        this.result.owner = this.asNode;
+    /// Provides an iterator over this node's out-edges.
+    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+        return OutEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = XorNode.ofNode(self);
+                assert(node != null);
+                int stop = 0;
+                if (!stop) stop = iter(node.lhs);
+                if (!stop) stop = iter(node.rhs);
+                return stop;
+            }
+        );
+    }
+
+    /// Provides an iterator over this node's in-edges.
+    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = XorNode.ofNode(self);
+                assert(node != null);
+                return iter(node.result);
+            }
+        );
     }
 }
 
-@nogc nothrow unittest {
-    XorNode tmp = void;
-    XorNode.initialize(&tmp);
-    //
-    XorNode xor = void;
-    moveEmplace(tmp, xor);
-    //
-    assert(xor == xor);
-    assert(xor.result.owner == xor.asNode);
-    //
-    XorNode.dispose(&xor);
-    XorNode.dispose(&xor);
-}
+@nogc nothrow unittest { nodeTest!XorNode(); }
 
 /++
 Bitwise left-shift operation; shifts in zeros.
@@ -1807,25 +2080,35 @@ See_Also: [LeftShiftNoOverflowNode]
         return this.input.toHash() - this.shift.toHash();
     }
 
-    /// Post-move adjusts in-edge slots' internal pointer.
-    void opPostMove(ref const(LeftShiftNode) old) pure {
-        this.output.owner = this.asNode;
+    /// Provides an iterator over this node's out-edges.
+    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+        return OutEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = LeftShiftNode.ofNode(self);
+                assert(node != null);
+                int stop = 0;
+                if (!stop) stop = iter(node.input);
+                if (!stop) stop = iter(node.shift);
+                return stop;
+            }
+        );
+    }
+
+    /// Provides an iterator over this node's in-edges.
+    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = LeftShiftNode.ofNode(self);
+                assert(node != null);
+                return iter(node.output);
+            }
+        );
     }
 }
 
-@nogc nothrow unittest {
-    LeftShiftNode tmp = void;
-    LeftShiftNode.initialize(&tmp);
-    //
-    LeftShiftNode shl = void;
-    moveEmplace(tmp, shl);
-    //
-    assert(shl == shl);
-    assert(shl.output.owner == shl.asNode);
-    //
-    LeftShiftNode.dispose(&shl);
-    LeftShiftNode.dispose(&shl);
-}
+@nogc nothrow unittest { nodeTest!LeftShiftNode(); }
 
 /++
 Bitwise left-shift with [no-overflow](gyre.nodes.html#no-overflow-operations) semantics; shifts in zeros.
@@ -1885,25 +2168,35 @@ See_Also: [LeftShiftNode]
         return this.input.toHash() - this.shift.toHash();
     }
 
-    /// Post-move adjusts in-edge slots' internal pointer.
-    void opPostMove(ref const(LeftShiftNoOverflowNode) old) pure {
-        this.output.owner = this.asNode;
+    /// Provides an iterator over this node's out-edges.
+    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+        return OutEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = LeftShiftNoOverflowNode.ofNode(self);
+                assert(node != null);
+                int stop = 0;
+                if (!stop) stop = iter(node.input);
+                if (!stop) stop = iter(node.shift);
+                return stop;
+            }
+        );
+    }
+
+    /// Provides an iterator over this node's in-edges.
+    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = LeftShiftNoOverflowNode.ofNode(self);
+                assert(node != null);
+                return iter(node.output);
+            }
+        );
     }
 }
 
-@nogc nothrow unittest {
-    LeftShiftNoOverflowNode tmp = void;
-    LeftShiftNoOverflowNode.initialize(&tmp);
-    //
-    LeftShiftNoOverflowNode shlno = void;
-    moveEmplace(tmp, shlno);
-    //
-    assert(shlno == shlno);
-    assert(shlno.output.owner == shlno.asNode);
-    //
-    LeftShiftNoOverflowNode.dispose(&shlno);
-    LeftShiftNoOverflowNode.dispose(&shlno);
-}
+@nogc nothrow unittest { nodeTest!LeftShiftNoOverflowNode(); }
 
 /++
 Logical right-shift operation; shifts in zeros.
@@ -1961,25 +2254,35 @@ See_Also: [SignedRightShiftNode]
         return this.input.toHash() - this.shift.toHash();
     }
 
-    /// Post-move adjusts in-edge slots' internal pointer.
-    void opPostMove(ref const(UnsignedRightShiftNode) old) pure {
-        this.output.owner = this.asNode;
+    /// Provides an iterator over this node's out-edges.
+    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+        return OutEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = UnsignedRightShiftNode.ofNode(self);
+                assert(node != null);
+                int stop = 0;
+                if (!stop) stop = iter(node.input);
+                if (!stop) stop = iter(node.shift);
+                return stop;
+            }
+        );
+    }
+
+    /// Provides an iterator over this node's in-edges.
+    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = UnsignedRightShiftNode.ofNode(self);
+                assert(node != null);
+                return iter(node.output);
+            }
+        );
     }
 }
 
-@nogc nothrow unittest {
-    UnsignedRightShiftNode tmp = void;
-    UnsignedRightShiftNode.initialize(&tmp);
-    //
-    UnsignedRightShiftNode shru = void;
-    moveEmplace(tmp, shru);
-    //
-    assert(shru == shru);
-    assert(shru.output.owner == shru.asNode);
-    //
-    UnsignedRightShiftNode.dispose(&shru);
-    UnsignedRightShiftNode.dispose(&shru);
-}
+@nogc nothrow unittest { nodeTest!UnsignedRightShiftNode(); }
 
 /++
 Arithmetic right-shift operation; bits shifted in are equal to the input's most significant bit.
@@ -2037,25 +2340,35 @@ See_Also: [UnsignedRightShiftNode]
         return this.input.toHash() - this.shift.toHash();
     }
 
-    /// Post-move adjusts in-edge slots' internal pointer.
-    void opPostMove(ref const(SignedRightShiftNode) old) pure {
-        this.output.owner = this.asNode;
+    /// Provides an iterator over this node's out-edges.
+    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+        return OutEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = SignedRightShiftNode.ofNode(self);
+                assert(node != null);
+                int stop = 0;
+                if (!stop) stop = iter(node.input);
+                if (!stop) stop = iter(node.shift);
+                return stop;
+            }
+        );
+    }
+
+    /// Provides an iterator over this node's in-edges.
+    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = SignedRightShiftNode.ofNode(self);
+                assert(node != null);
+                return iter(node.output);
+            }
+        );
     }
 }
 
-@nogc nothrow unittest {
-    SignedRightShiftNode tmp = void;
-    SignedRightShiftNode.initialize(&tmp);
-    //
-    SignedRightShiftNode shrs = void;
-    moveEmplace(tmp, shrs);
-    //
-    assert(shrs == shrs);
-    assert(shrs.output.owner == shrs.asNode);
-    //
-    SignedRightShiftNode.dispose(&shrs);
-    SignedRightShiftNode.dispose(&shrs);
-}
+@nogc nothrow unittest { nodeTest!SignedRightShiftNode(); }
 
 /++
 Two's complement addition operation (works for both signed and unsigned integers).
@@ -2110,25 +2423,35 @@ See_Also: [AdditionNoOverflowSignedNode]
         return this.lhs.toHash() ^ this.rhs.toHash();
     }
 
-    /// Post-move adjusts in-edge slots' internal pointer.
-    void opPostMove(ref const(AdditionNode) old) pure {
-        this.result.owner = this.asNode;
+    /// Provides an iterator over this node's out-edges.
+    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+        return OutEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = AdditionNode.ofNode(self);
+                assert(node != null);
+                int stop = 0;
+                if (!stop) stop = iter(node.lhs);
+                if (!stop) stop = iter(node.rhs);
+                return stop;
+            }
+        );
+    }
+
+    /// Provides an iterator over this node's in-edges.
+    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = AdditionNode.ofNode(self);
+                assert(node != null);
+                return iter(node.result);
+            }
+        );
     }
 }
 
-@nogc nothrow unittest {
-    AdditionNode tmp = void;
-    AdditionNode.initialize(&tmp);
-    //
-    AdditionNode add = void;
-    moveEmplace(tmp, add);
-    //
-    assert(add == add);
-    assert(add.result.owner == add.asNode);
-    //
-    AdditionNode.dispose(&add);
-    AdditionNode.dispose(&add);
-}
+@nogc nothrow unittest { nodeTest!AdditionNode(); }
 
 /++
 Two's complement [no-overflow](gyre.nodes.html#no-overflow-operations) signed addition.
@@ -2183,25 +2506,35 @@ See_Also: [AdditionNode]
         return this.lhs.toHash() ^ this.rhs.toHash();
     }
 
-    /// Post-move adjusts in-edge slots' internal pointer.
-    void opPostMove(ref const(AdditionNoOverflowSignedNode) old) pure {
-        this.result.owner = this.asNode;
+    /// Provides an iterator over this node's out-edges.
+    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+        return OutEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = AdditionNoOverflowSignedNode.ofNode(self);
+                assert(node != null);
+                int stop = 0;
+                if (!stop) stop = iter(node.lhs);
+                if (!stop) stop = iter(node.rhs);
+                return stop;
+            }
+        );
+    }
+
+    /// Provides an iterator over this node's in-edges.
+    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = AdditionNoOverflowSignedNode.ofNode(self);
+                assert(node != null);
+                return iter(node.result);
+            }
+        );
     }
 }
 
-@nogc nothrow unittest {
-    AdditionNoOverflowSignedNode tmp = void;
-    AdditionNoOverflowSignedNode.initialize(&tmp);
-    //
-    AdditionNoOverflowSignedNode addnos = void;
-    moveEmplace(tmp, addnos);
-    //
-    assert(addnos == addnos);
-    assert(addnos.result.owner == addnos.asNode);
-    //
-    AdditionNoOverflowSignedNode.dispose(&addnos);
-    AdditionNoOverflowSignedNode.dispose(&addnos);
-}
+@nogc nothrow unittest { nodeTest!AdditionNoOverflowSignedNode(); }
 
 /++
 Two's complement subtraction operation (works for both signed and unsigned integers).
@@ -2259,25 +2592,35 @@ See_Also: [SubtractionNoOverflowSignedNode]
         return this.lhs.toHash() - this.rhs.toHash();
     }
 
-    /// Post-move adjusts in-edge slots' internal pointer.
-    void opPostMove(ref const(SubtractionNode) old) pure {
-        this.result.owner = this.asNode;
+    /// Provides an iterator over this node's out-edges.
+    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+        return OutEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = SubtractionNode.ofNode(self);
+                assert(node != null);
+                int stop = 0;
+                if (!stop) stop = iter(node.lhs);
+                if (!stop) stop = iter(node.rhs);
+                return stop;
+            }
+        );
+    }
+
+    /// Provides an iterator over this node's in-edges.
+    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = SubtractionNode.ofNode(self);
+                assert(node != null);
+                return iter(node.result);
+            }
+        );
     }
 }
 
-@nogc nothrow unittest {
-    SubtractionNode tmp = void;
-    SubtractionNode.initialize(&tmp);
-    //
-    SubtractionNode sub = void;
-    moveEmplace(tmp, sub);
-    //
-    assert(sub == sub);
-    assert(sub.result.owner == sub.asNode);
-    //
-    SubtractionNode.dispose(&sub);
-    SubtractionNode.dispose(&sub);
-}
+@nogc nothrow unittest { nodeTest!SubtractionNode(); }
 
 /++
 Two's complement [no-overflow](gyre.nodes.html#no-overflow-operations) signed subtraction.
@@ -2335,25 +2678,35 @@ See_Also: [SubtractionNode]
         return this.lhs.toHash() - this.rhs.toHash();
     }
 
-    /// Post-move adjusts in-edge slots' internal pointer.
-    void opPostMove(ref const(SubtractionNoOverflowSignedNode) old) pure {
-        this.result.owner = this.asNode;
+    /// Provides an iterator over this node's out-edges.
+    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+        return OutEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = SubtractionNoOverflowSignedNode.ofNode(self);
+                assert(node != null);
+                int stop = 0;
+                if (!stop) stop = iter(node.lhs);
+                if (!stop) stop = iter(node.rhs);
+                return stop;
+            }
+        );
+    }
+
+    /// Provides an iterator over this node's in-edges.
+    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = SubtractionNoOverflowSignedNode.ofNode(self);
+                assert(node != null);
+                return iter(node.result);
+            }
+        );
     }
 }
 
-@nogc nothrow unittest {
-    SubtractionNoOverflowSignedNode tmp = void;
-    SubtractionNoOverflowSignedNode.initialize(&tmp);
-    //
-    SubtractionNoOverflowSignedNode subnos = void;
-    moveEmplace(tmp, subnos);
-    //
-    assert(subnos == subnos);
-    assert(subnos.result.owner == subnos.asNode);
-    //
-    SubtractionNoOverflowSignedNode.dispose(&subnos);
-    SubtractionNoOverflowSignedNode.dispose(&subnos);
-}
+@nogc nothrow unittest { nodeTest!SubtractionNoOverflowSignedNode(); }
 
 /++
 Two's complement multiplication operation.
@@ -2409,25 +2762,35 @@ See_Also: [MultiplicationNoOverflowSignedNode]
         return this.lhs.toHash() ^ this.rhs.toHash();
     }
 
-    /// Post-move adjusts in-edge slots' internal pointer.
-    void opPostMove(ref const(MultiplicationNode) old) pure {
-        this.result.owner = this.asNode;
+    /// Provides an iterator over this node's out-edges.
+    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+        return OutEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = MultiplicationNode.ofNode(self);
+                assert(node != null);
+                int stop = 0;
+                if (!stop) stop = iter(node.lhs);
+                if (!stop) stop = iter(node.rhs);
+                return stop;
+            }
+        );
+    }
+
+    /// Provides an iterator over this node's in-edges.
+    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = MultiplicationNode.ofNode(self);
+                assert(node != null);
+                return iter(node.result);
+            }
+        );
     }
 }
 
-@nogc nothrow unittest {
-    MultiplicationNode tmp = void;
-    MultiplicationNode.initialize(&tmp);
-    //
-    MultiplicationNode mul = void;
-    moveEmplace(tmp, mul);
-    //
-    assert(mul == mul);
-    assert(mul.result.owner == mul.asNode);
-    //
-    MultiplicationNode.dispose(&mul);
-    MultiplicationNode.dispose(&mul);
-}
+@nogc nothrow unittest { nodeTest!MultiplicationNode(); }
 
 /++
 Two's complement [no-overflow](gyre.nodes.html#no-overflow-operations) signed multiplication.
@@ -2482,25 +2845,35 @@ See_Also: [MultiplicationNode]
         return this.lhs.toHash() ^ this.rhs.toHash();
     }
 
-    /// Post-move adjusts in-edge slots' internal pointer.
-    void opPostMove(ref const(MultiplicationNoOverflowSignedNode) old) pure {
-        this.result.owner = this.asNode;
+    /// Provides an iterator over this node's out-edges.
+    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+        return OutEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = MultiplicationNoOverflowSignedNode.ofNode(self);
+                assert(node != null);
+                int stop = 0;
+                if (!stop) stop = iter(node.lhs);
+                if (!stop) stop = iter(node.rhs);
+                return stop;
+            }
+        );
+    }
+
+    /// Provides an iterator over this node's in-edges.
+    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = MultiplicationNoOverflowSignedNode.ofNode(self);
+                assert(node != null);
+                return iter(node.result);
+            }
+        );
     }
 }
 
-@nogc nothrow unittest {
-    MultiplicationNoOverflowSignedNode tmp = void;
-    MultiplicationNoOverflowSignedNode.initialize(&tmp);
-    //
-    MultiplicationNoOverflowSignedNode mulnos = void;
-    moveEmplace(tmp, mulnos);
-    //
-    assert(mulnos == mulnos);
-    assert(mulnos.result.owner == mulnos.asNode);
-    //
-    MultiplicationNoOverflowSignedNode.dispose(&mulnos);
-    MultiplicationNoOverflowSignedNode.dispose(&mulnos);
-}
+@nogc nothrow unittest { nodeTest!MultiplicationNoOverflowSignedNode(); }
 
 /++
 Two's complement division operation for unsigned operands, rounds towards zero.
@@ -2558,25 +2931,35 @@ See_Also: [SignedDivisionNode]
         return this.dividend.toHash() - this.divisor.toHash();
     }
 
-    /// Post-move adjusts in-edge slots' internal pointer.
-    void opPostMove(ref const(UnsignedDivisionNode) old) pure {
-        this.quotient.owner = this.asNode;
+    /// Provides an iterator over this node's out-edges.
+    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+        return OutEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = UnsignedDivisionNode.ofNode(self);
+                assert(node != null);
+                int stop = 0;
+                if (!stop) stop = iter(node.dividend);
+                if (!stop) stop = iter(node.divisor);
+                return stop;
+            }
+        );
+    }
+
+    /// Provides an iterator over this node's in-edges.
+    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = UnsignedDivisionNode.ofNode(self);
+                assert(node != null);
+                return iter(node.quotient);
+            }
+        );
     }
 }
 
-@nogc nothrow unittest {
-    UnsignedDivisionNode tmp = void;
-    UnsignedDivisionNode.initialize(&tmp);
-    //
-    UnsignedDivisionNode divu = void;
-    moveEmplace(tmp, divu);
-    //
-    assert(divu == divu);
-    assert(divu.quotient.owner == divu.asNode);
-    //
-    UnsignedDivisionNode.dispose(&divu);
-    UnsignedDivisionNode.dispose(&divu);
-}
+@nogc nothrow unittest { nodeTest!UnsignedDivisionNode(); }
 
 /++
 Two's complement division operation for signed operands, rounds towards zero.
@@ -2635,25 +3018,35 @@ See_Also: [UnsignedDivisionNode]
         return this.dividend.toHash() - this.divisor.toHash();
     }
 
-    /// Post-move adjusts in-edge slots' internal pointer.
-    void opPostMove(ref const(SignedDivisionNode) old) pure {
-        this.quotient.owner = this.asNode;
+    /// Provides an iterator over this node's out-edges.
+    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+        return OutEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = SignedDivisionNode.ofNode(self);
+                assert(node != null);
+                int stop = 0;
+                if (!stop) stop = iter(node.dividend);
+                if (!stop) stop = iter(node.divisor);
+                return stop;
+            }
+        );
+    }
+
+    /// Provides an iterator over this node's in-edges.
+    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = SignedDivisionNode.ofNode(self);
+                assert(node != null);
+                return iter(node.quotient);
+            }
+        );
     }
 }
 
-@nogc nothrow unittest {
-    SignedDivisionNode tmp = void;
-    SignedDivisionNode.initialize(&tmp);
-    //
-    SignedDivisionNode divs = void;
-    moveEmplace(tmp, divs);
-    //
-    assert(divs == divs);
-    assert(divs.quotient.owner == divs.asNode);
-    //
-    SignedDivisionNode.dispose(&divs);
-    SignedDivisionNode.dispose(&divs);
-}
+@nogc nothrow unittest { nodeTest!SignedDivisionNode(); }
 
 /++
 Two's complement remainder operation for unsigned operands, rounds towards zero.
@@ -2711,25 +3104,35 @@ See_Also: [SignedRemainderNode]
         return this.dividend.toHash() - this.divisor.toHash();
     }
 
-    /// Post-move adjusts in-edge slots' internal pointer.
-    void opPostMove(ref const(UnsignedRemainderNode) old) pure {
-        this.remainder.owner = this.asNode;
+    /// Provides an iterator over this node's out-edges.
+    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+        return OutEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = UnsignedRemainderNode.ofNode(self);
+                assert(node != null);
+                int stop = 0;
+                if (!stop) stop = iter(node.dividend);
+                if (!stop) stop = iter(node.divisor);
+                return stop;
+            }
+        );
+    }
+
+    /// Provides an iterator over this node's in-edges.
+    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = UnsignedRemainderNode.ofNode(self);
+                assert(node != null);
+                return iter(node.remainder);
+            }
+        );
     }
 }
 
-@nogc nothrow unittest {
-    UnsignedRemainderNode tmp = void;
-    UnsignedRemainderNode.initialize(&tmp);
-    //
-    UnsignedRemainderNode remu = void;
-    moveEmplace(tmp, remu);
-    //
-    assert(remu == remu);
-    assert(remu.remainder.owner == remu.asNode);
-    //
-    UnsignedRemainderNode.dispose(&remu);
-    UnsignedRemainderNode.dispose(&remu);
-}
+@nogc nothrow unittest { nodeTest!UnsignedRemainderNode(); }
 
 /++
 Two's complement remainder operation for signed operands, rounds towards zero.
@@ -2788,25 +3191,35 @@ See_Also: [UnsignedRemainderNode]
         return this.dividend.toHash() - this.divisor.toHash();
     }
 
-    /// Post-move adjusts in-edge slots' internal pointer.
-    void opPostMove(ref const(SignedRemainderNode) old) pure {
-        this.remainder.owner = this.asNode;
+    /// Provides an iterator over this node's out-edges.
+    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+        return OutEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = SignedRemainderNode.ofNode(self);
+                assert(node != null);
+                int stop = 0;
+                if (!stop) stop = iter(node.dividend);
+                if (!stop) stop = iter(node.divisor);
+                return stop;
+            }
+        );
+    }
+
+    /// Provides an iterator over this node's in-edges.
+    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = SignedRemainderNode.ofNode(self);
+                assert(node != null);
+                return iter(node.remainder);
+            }
+        );
     }
 }
 
-@nogc nothrow unittest {
-    SignedRemainderNode tmp = void;
-    SignedRemainderNode.initialize(&tmp);
-    //
-    SignedRemainderNode rems = void;
-    moveEmplace(tmp, rems);
-    //
-    assert(rems == rems);
-    assert(rems.remainder.owner == rems.asNode);
-    //
-    SignedRemainderNode.dispose(&rems);
-    SignedRemainderNode.dispose(&rems);
-}
+@nogc nothrow unittest { nodeTest!SignedRemainderNode(); }
 
 /// Compares two bit patterns for equality.
 @mnemonic("eq") struct EqualNode {
@@ -2855,25 +3268,35 @@ See_Also: [UnsignedRemainderNode]
         return this.lhs.toHash() ^ this.rhs.toHash();
     }
 
-    /// Post-move adjusts in-edge slots' internal pointer.
-    void opPostMove(ref const(EqualNode) old) pure {
-        this.result.owner = this.asNode;
+    /// Provides an iterator over this node's out-edges.
+    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+        return OutEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = EqualNode.ofNode(self);
+                assert(node != null);
+                int stop = 0;
+                if (!stop) stop = iter(node.lhs);
+                if (!stop) stop = iter(node.rhs);
+                return stop;
+            }
+        );
+    }
+
+    /// Provides an iterator over this node's in-edges.
+    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = EqualNode.ofNode(self);
+                assert(node != null);
+                return iter(node.result);
+            }
+        );
     }
 }
 
-@nogc nothrow unittest {
-    EqualNode tmp = void;
-    EqualNode.initialize(&tmp);
-    //
-    EqualNode eq = void;
-    moveEmplace(tmp, eq);
-    //
-    assert(eq == eq);
-    assert(eq.result.owner == eq.asNode);
-    //
-    EqualNode.dispose(&eq);
-    EqualNode.dispose(&eq);
-}
+@nogc nothrow unittest { nodeTest!EqualNode(); }
 
 /// Compares two bit patterns for inequality.
 @mnemonic("ne") struct NotEqualNode {
@@ -2922,25 +3345,35 @@ See_Also: [UnsignedRemainderNode]
         return this.lhs.toHash() ^ this.rhs.toHash();
     }
 
-    /// Post-move adjusts in-edge slots' internal pointer.
-    void opPostMove(ref const(NotEqualNode) old) pure {
-        this.result.owner = this.asNode;
+    /// Provides an iterator over this node's out-edges.
+    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+        return OutEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = NotEqualNode.ofNode(self);
+                assert(node != null);
+                int stop = 0;
+                if (!stop) stop = iter(node.lhs);
+                if (!stop) stop = iter(node.rhs);
+                return stop;
+            }
+        );
+    }
+
+    /// Provides an iterator over this node's in-edges.
+    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = NotEqualNode.ofNode(self);
+                assert(node != null);
+                return iter(node.result);
+            }
+        );
     }
 }
 
-@nogc nothrow unittest {
-    NotEqualNode tmp = void;
-    NotEqualNode.initialize(&tmp);
-    //
-    NotEqualNode ne = void;
-    moveEmplace(tmp, ne);
-    //
-    assert(ne == ne);
-    assert(ne.result.owner == ne.asNode);
-    //
-    NotEqualNode.dispose(&ne);
-    NotEqualNode.dispose(&ne);
-}
+@nogc nothrow unittest { nodeTest!NotEqualNode(); }
 
 /++
 Computes whether a (unsigned) two's complement integer is strictly less than another.
@@ -2996,25 +3429,35 @@ There is no equivalent for `>` because it suffices to swap this node's operands.
         return this.lhs.toHash() - this.rhs.toHash();
     }
 
-    /// Post-move adjusts in-edge slots' internal pointer.
-    void opPostMove(ref const(UnsignedLessThanNode) old) pure {
-        this.result.owner = this.asNode;
+    /// Provides an iterator over this node's out-edges.
+    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+        return OutEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = UnsignedLessThanNode.ofNode(self);
+                assert(node != null);
+                int stop = 0;
+                if (!stop) stop = iter(node.lhs);
+                if (!stop) stop = iter(node.rhs);
+                return stop;
+            }
+        );
+    }
+
+    /// Provides an iterator over this node's in-edges.
+    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = UnsignedLessThanNode.ofNode(self);
+                assert(node != null);
+                return iter(node.result);
+            }
+        );
     }
 }
 
-@nogc nothrow unittest {
-    UnsignedLessThanNode tmp = void;
-    UnsignedLessThanNode.initialize(&tmp);
-    //
-    UnsignedLessThanNode ltu = void;
-    moveEmplace(tmp, ltu);
-    //
-    assert(ltu == ltu);
-    assert(ltu.result.owner == ltu.asNode);
-    //
-    UnsignedLessThanNode.dispose(&ltu);
-    UnsignedLessThanNode.dispose(&ltu);
-}
+@nogc nothrow unittest { nodeTest!UnsignedLessThanNode(); }
 
 /++
 Computes whether a (signed) two's complement integer is strictly less than another.
@@ -3070,25 +3513,35 @@ There is no equivalent for `>` because it suffices to swap this node's operands.
         return this.lhs.toHash() - this.rhs.toHash();
     }
 
-    /// Post-move adjusts in-edge slots' internal pointer.
-    void opPostMove(ref const(SignedLessThanNode) old) pure {
-        this.result.owner = this.asNode;
+    /// Provides an iterator over this node's out-edges.
+    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+        return OutEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = SignedLessThanNode.ofNode(self);
+                assert(node != null);
+                int stop = 0;
+                if (!stop) stop = iter(node.lhs);
+                if (!stop) stop = iter(node.rhs);
+                return stop;
+            }
+        );
+    }
+
+    /// Provides an iterator over this node's in-edges.
+    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = SignedLessThanNode.ofNode(self);
+                assert(node != null);
+                return iter(node.result);
+            }
+        );
     }
 }
 
-@nogc nothrow unittest {
-    SignedLessThanNode tmp = void;
-    SignedLessThanNode.initialize(&tmp);
-    //
-    SignedLessThanNode lts = void;
-    moveEmplace(tmp, lts);
-    //
-    assert(lts == lts);
-    assert(lts.result.owner == lts.asNode);
-    //
-    SignedLessThanNode.dispose(&lts);
-    SignedLessThanNode.dispose(&lts);
-}
+@nogc nothrow unittest { nodeTest!SignedLessThanNode(); }
 
 /++
 Computes whether a (unsigned) two's complement integer is greater than or equal to another.
@@ -3144,25 +3597,35 @@ There is no equivalent for `<=` because it suffices to swap this node's operands
         return this.lhs.toHash() - this.rhs.toHash();
     }
 
-    /// Post-move adjusts in-edge slots' internal pointer.
-    void opPostMove(ref const(UnsignedGreaterOrEqualNode) old) pure {
-        this.result.owner = this.asNode;
+    /// Provides an iterator over this node's out-edges.
+    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+        return OutEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = UnsignedGreaterOrEqualNode.ofNode(self);
+                assert(node != null);
+                int stop = 0;
+                if (!stop) stop = iter(node.lhs);
+                if (!stop) stop = iter(node.rhs);
+                return stop;
+            }
+        );
+    }
+
+    /// Provides an iterator over this node's in-edges.
+    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = UnsignedGreaterOrEqualNode.ofNode(self);
+                assert(node != null);
+                return iter(node.result);
+            }
+        );
     }
 }
 
-@nogc nothrow unittest {
-    UnsignedGreaterOrEqualNode tmp = void;
-    UnsignedGreaterOrEqualNode.initialize(&tmp);
-    //
-    UnsignedGreaterOrEqualNode geu = void;
-    moveEmplace(tmp, geu);
-    //
-    assert(geu == geu);
-    assert(geu.result.owner == geu.asNode);
-    //
-    UnsignedGreaterOrEqualNode.dispose(&geu);
-    UnsignedGreaterOrEqualNode.dispose(&geu);
-}
+@nogc nothrow unittest { nodeTest!UnsignedGreaterOrEqualNode(); }
 
 /++
 Computes whether a (signed) two's complement integer is greater than or equal to another.
@@ -3218,25 +3681,35 @@ There is no equivalent for `<=` because it suffices to swap this node's operands
         return this.lhs.toHash() - this.rhs.toHash();
     }
 
-    /// Post-move adjusts in-edge slots' internal pointer.
-    void opPostMove(ref const(SignedGreaterOrEqualNode) old) pure {
-        this.result.owner = this.asNode;
+    /// Provides an iterator over this node's out-edges.
+    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+        return OutEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = SignedGreaterOrEqualNode.ofNode(self);
+                assert(node != null);
+                int stop = 0;
+                if (!stop) stop = iter(node.lhs);
+                if (!stop) stop = iter(node.rhs);
+                return stop;
+            }
+        );
+    }
+
+    /// Provides an iterator over this node's in-edges.
+    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
+            this.asNode,
+            (Node* self, scope Callable iter){
+                auto node = SignedGreaterOrEqualNode.ofNode(self);
+                assert(node != null);
+                return iter(node.result);
+            }
+        );
     }
 }
 
-@nogc nothrow unittest {
-    SignedGreaterOrEqualNode tmp = void;
-    SignedGreaterOrEqualNode.initialize(&tmp);
-    //
-    SignedGreaterOrEqualNode ges = void;
-    moveEmplace(tmp, ges);
-    //
-    assert(ges == ges);
-    assert(ges.result.owner == ges.asNode);
-    //
-    SignedGreaterOrEqualNode.dispose(&ges);
-    SignedGreaterOrEqualNode.dispose(&ges);
-}
+@nogc nothrow unittest { nodeTest!SignedGreaterOrEqualNode(); }
 
 
 // TODO: type ops

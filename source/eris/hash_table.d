@@ -292,10 +292,8 @@ struct UnsafeHashMap(Key, Value) {
         }
 
         // initialize bookkeeping state
-        foreach (ref bucket; this.buckets) {
-            bucket.isOccupied = false;
-            bucket.wasDeleted = false;
-        }
+        static assert(!Bucket.init.isOccupied && !Bucket.init.wasDeleted);
+        this.buckets[] = Bucket.init;
         this.occupied = 0;
         this.used = 0;
 
