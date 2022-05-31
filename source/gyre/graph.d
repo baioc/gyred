@@ -30,7 +30,7 @@ module gyre.graph;
 import core.stdc.errno : ENOMEM, EINVAL, EACCES;
 import core.lifetime : forward;
 import std.meta : AliasSeq, Filter;
-import std.traits : EnumMembers, Fields, Parameters, isFunction, isArray, Unconst, isPointer;
+import std.traits : EnumMembers, Fields, Parameters, isArray, Unconst, isPointer;
 
 import eris.core : err_t, allocate, deallocate;
 import eris.util : HashablePointer;
@@ -141,13 +141,13 @@ private { // step 3: profit
             assert(false, "unreachable");
         }
 
-        inout(Node)* asNode() inout pure
+        pragma(inline) inout(Node)* asNode() inout pure
         return // XXX: `return` annotation needed in DMD 2.100.0
         {
             return cast(inout(Node)*)&this.node;
         }
 
-        static inout(NodeStorage)* ofNode(inout(Node)* node) pure {
+        pragma(inline) static inout(NodeStorage)* ofNode(inout(Node)* node) pure {
             static assert(
                 NodeStorage.node.offsetof == 0,
                 "NodeStorage layout must allow casting from Node*"
@@ -178,7 +178,8 @@ private { // step 3: profit
             }
         }
 
-        OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+        @property OutEdgeIterator!Callable
+        outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
             final switch (this.tag) {
                 static foreach (kind; EnumMembers!NodeKind) {
                     case kind: {
@@ -189,7 +190,8 @@ private { // step 3: profit
             }
         }
 
-        InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        @property InEdgeIterator!Callable
+        inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
             final switch (this.tag) {
                 static foreach (kind; EnumMembers!NodeKind) {
                     case kind: {
@@ -198,25 +200,6 @@ private { // step 3: profit
                     }
                 }
             }
-        }
-
-        static void rewire(NodeStorage* inNeighbor, const(NodeStorage)* original, NodeStorage* newNode) {
-            // since we only track in-neighbor *nodes* (as opposed to edges),
-            // fixing an edge requires us to manually pattern-match on slots;
-            // despite the for loops, this takes "mostly-constant" time
-            // since the number of edges in most nodes is constant.
-            // 1) we're looking for out-edges which point to the old node
-            foreach (ref from; inNeighbor.outEdges) {
-                if (from.target.owner != original.asNode) continue;
-                // 2) we want to rewire to a precise slot in the new node
-                auto targetId = from.target.id;
-                foreach (ref to; newNode.inEdges) {
-                    if (to.id == targetId) {
-                        from.target = &to; // <- edge rewire
-                    }
-                }
-            }
-
         }
     }
 }
@@ -394,11 +377,9 @@ struct Transaction {
         bool, "began", 1
     ));
 
-    // temporary buffer for new nodes and their in-neighbors
+    // temporary buffer for new nodes
     NodeStorage[] nursery;
-    InNeighbors[] inNeighbors;
     size_t cursor;
-    alias InNeighbors = UnsafeHashSet!size_t;
 
  public @nogc nothrow:
     /// Creates a new transaction.
@@ -429,12 +410,6 @@ struct Transaction {
 
         this.nursery = allocate!NodeStorage(n);
         if (n > 0 && this.nursery == null) return ENOMEM;
-        this.inNeighbors = allocate!InNeighbors(n);
-        if (n > 0 && this.inNeighbors == null) {
-            this.nursery.deallocate();
-            this.nursery = null;
-            return ENOMEM;
-        }
         this.cursor = 0;
 
         this.began = true;
@@ -449,10 +424,8 @@ struct Transaction {
         if (!this.began) return;
 
         foreach_reverse (i; 0 .. this.cursor) {
-            this.inNeighbors[i].dispose();
             this.nursery[i].dispose();
         }
-        this.inNeighbors.deallocate();
         this.nursery.deallocate();
 
         this = Transaction(*this.graph);
@@ -483,7 +456,6 @@ struct Transaction {
         NodeStorage* storage = &this.nursery[this.cursor];
         auto error = NodeType.initialize(&storage.node.as!kind, forward!args);
         if (error) return nil;
-        this.inNeighbors[this.cursor] = InNeighbors.init;
 
         auto newNode = NodeHandle!kind(&this, this.cursor);
         this.cursor++;
@@ -575,18 +547,17 @@ struct Transaction {
         }
         if (error) return error;
 
-        // conservatively adjust in-neighbors by adding to the target node's set.
-        // removing neighbors which have lost their links to the target node would be
-        // more precise, but we'll assume this will be rare and deal with it on commit
-        error = this.inNeighbors[toField.handle.index].add(fromField.handle.index);
         return error;
     }
 
     /++
-    Finishes this transaction by applying its changes.
+    Finishes the transaction by applying its changes.
 
     Returns:
         Zero on success, non-zero otherwise (in which case the transaction must be [abort]ed).
+
+    Version:
+        NOTE: Technically speaking, this operation is not transactional; on OOM conditions the graph may be left in an incomplete/invalid state. This is OK under a ["worse is better"](https://www.dreamsongs.com/RiseOfWorseIsBetter.html) philosophy.
     +/
     err_t commit()
     in (this.began, "can't operate on an unstarted transaction")
@@ -606,100 +577,115 @@ struct Transaction {
         }
 
         // finds out whether a reference points into the nursery
-        bool inNursery(NodeStorage* ptr) {
+        NodeStorage* inNursery(Node* node) {
+            auto ptr = NodeStorage.ofNode(node);
             const min = &this.nursery[0];
             const max = &this.nursery[this.cursor - 1];
-            return min <= ptr && ptr <= max;
+            return min <= ptr && ptr <= max ? ptr : null;
         }
 
-        err_t depthFirstAdd(NodeStorage*[] transfers, size_t index) @nogc nothrow {
-            // this procedure is only supposed to be called on valid nursery indexes
-            NodeStorage* original = &this.nursery[index];
-            const typeTag = original.tag;
+        // rewires an out-edge to the right slot of a stored node
+        void rewire(ref OutEdge outEdge, NodeStorage* storage)
+        in (outEdge.target != null && storage != null)
+        out (; outEdge.target != null)
+        {
+            outEdge.target = storage.asNode.opIndex(outEdge.target.id);
+        }
 
-            // first, let's make sure we're not going in circles
-            if (transfers[index] != null) {
-                // PS: since we mutate in-neighbors as we visit their dependencies and
-                // we only call this on nursery nodes, we can check the cycle rule here
-                if (typeTag == NodeKind.JoinNode) return 0;
-                version (assert) assert(false, "detected an invalid cycle");
-                else return EINVAL;
-            }
-            transfers[index] = original; // temporary non-null value to mark visit
+        // registers the second node as an in-neighbor of the first
+        err_t registerInNeighbor(Node* node, Node* inNeighbor)
+        in (Graph.HashableNode(node) in this.graph.adjacencies)
+        {
+            auto outNeighbor = Graph.HashableNode(node);
+            Graph.HashableNode* found;
+            Graph.InNeighbors* inNeighbors;
+            this.graph.adjacencies.get(outNeighbor, found, inNeighbors);
+            assert(found);
+            const error = inNeighbors.add(inNeighbor);
+            return error;
+        }
+
+        // recursively adds nodes to the graph, assuming IR rules are respected
+        NodeStorage* depthFirstAdd(NodeStorage*[] transfers, size_t index) @nogc nothrow {
+            // first, let's make sure we never process the same node twice
+            if (transfers[index] != null) return transfers[index];
+            NodeStorage* original = &this.nursery[index];
+            const bool isJoinNode = JoinNode.ofNode(original.asNode) != null;
 
             // try to go deeper by visiting this node's out-neighbors
             // (except on join nodes, since they are allowed to induce cycles)
-            if (typeTag != NodeKind.JoinNode) {
-                foreach (outEdge; original.outEdges) {
-                    // an out-edge with a null target means the node is incomplete
-                    if (outEdge.target == null) {
-                        version (assert) assert(false, "detected an incomplete node");
-                        else return EINVAL;
-                    }
-                    // find out where's the next node we need to visit and recurse
-                    auto outNeighbor = outEdge.target.owner;
-                    auto nextStorage = NodeStorage.ofNode(outNeighbor);
-                    if (!inNursery(nextStorage)) continue;
-                    const nextIndex = nextStorage - &this.nursery[0];
-                    const error = depthFirstAdd(transfers, nextIndex);
-                    if (error) return error;
+            if (!isJoinNode) {
+                foreach (ref outEdge; original.outEdges) {
+                    Node* outNeighbor = outEdge.target.owner;
+                    auto nextStorage = inNursery(outNeighbor);
+                    // we'll only recurse if the out-neighbor's also in the nursery
+                    if (nextStorage == null) continue;
+                    const size_t nextIndex = nextStorage - &this.nursery[0];
+                    NodeStorage* newNeighbor = depthFirstAdd(transfers, nextIndex);
+                    if (newNeighbor == null) return null;
+                    // then, rewire this node's out-edge to its updated neighbor
+                    rewire(outEdge, newNeighbor);
                 }
             }
 
-            // now that its dependencies are ready, we can add the node to the graph
+            // this node is now stable, so we can hash it and add it to the graph
             original.asNode.updateHash();
-            Node* transferred = this.graph.add(original);
-            if (transferred == null) return ENOMEM;
-            transfers[index] = NodeStorage.ofNode(transferred);
+            Node* added = this.graph.add(original);
+            if (added == null) return null;
+            transfers[index] = NodeStorage.ofNode(added);
 
-            // now, we'll rewire its in-neighbors' pointers to the new address
-            foreach (j; this.inNeighbors[index].byKey) {
-                // most of the time, we'll be updating nursery nodes, but when
-                // the in-neighbor's a join node, it may have been moved already
-                auto newAddress = transfers[j];
-                bool wasMoved = newAddress != null && !inNursery(newAddress);
-                auto inNeighbor = wasMoved ? newAddress : &this.nursery[j];
-                assert(!wasMoved || inNeighbor.tag == NodeKind.JoinNode);
-                NodeStorage.rewire(inNeighbor, original, transfers[index]);
+            // since we now know this node's stable address in the graph, we can
+            // add it to the in-neighbor set of each of its out-neighbors
+            if (!isJoinNode) {
+                foreach (ref outEdge; transfers[index].outEdges) {
+                    auto outNeighbor = outEdge.target.owner;
+                    const error = registerInNeighbor(outNeighbor, added);
+                    if (error) return null;
+                }
             }
-            this.inNeighbors[index].dispose(); // <- no longer needed
 
-            return 0;
+            return transfers[index];
         }
 
         // set up DFS bookkeeping data structures
         NodeStorage*[] transfers = allocate!(NodeStorage*)(this.cursor);
         scope(exit) transfers.deallocate();
         if (this.cursor > 0 && transfers == null) return ENOMEM;
-        foreach (ref mapping; transfers) mapping = null;
+        foreach (ref forwardingPointer; transfers) forwardingPointer = null;
         // then trigger the recursions
         foreach (i; 0 .. this.cursor) {
-            if (transfers[i] != null) continue; // <- enables invalid cycle detection in DFS
-            const error = depthFirstAdd(transfers, i);
-            // I don't really know how to handle a mid-commit error in such
-            // a way as to make it an all-or-nothing operation. Thus, if this
-            // ever happens, the commited subgraph may be left in an incomplete
-            // state. This is probably not as bad as it sounds; because we
-            // check IR rules before starting this loop, mid-commit errors mean
-            // an OOM condition, where there's not much that can be done anyway
-            version (assert) assert(!error, "mid-commit error (out of memory)");
-            else return error;
+            auto added = depthFirstAdd(transfers, i);
+            if (!added) {
+                // I don't really know how to handle a mid-commit error in such
+                // a way as to make it an all-or-nothing operation. Thus, if this
+                // ever happens, the commited subgraph may be left in an incomplete
+                // state. This is probably not as bad as it sounds; because we
+                // check IR rules before starting this loop, mid-commit errors mean
+                // an OOM condition, where there's not much that can be done anyway
+                version (assert) assert(false, "mid-commit error (out of memory)");
+                else return ENOMEM;
+            }
         }
 
-        // in order to set up precise in-neighbor information in the graph, we'll
-        // run through the nodes again, but this time knowing everyone's address
-        foreach (NodeStorage* myself; transfers) {
-            assert(myself != null);
-            // "for each of my out-neighbors, add myself to their in-neighbor set"
-            foreach (outEdge; myself.outEdges) {
-                auto outNeighbor = Graph.HashableNode(outEdge.target.owner);
-                Graph.HashableNode* found;
-                Graph.InNeighbors* inNeighbors;
-                this.graph.adjacencies.get(outNeighbor, found, inNeighbors);
-                assert(found);
-                const error = inNeighbors.add(myself.asNode);
-                version (assert) assert(!error, "mid-commit error (out of memory)");
-                else return error;
+        // since we treat join nodes differently in the DFS, we now have to ensure that
+        // their edges were rewired and that they have been registered as in-neighbors
+        foreach (NodeStorage* storage; transfers) {
+            JoinNode* join = JoinNode.ofNode(storage.asNode);
+            if (join == null) continue;
+            foreach (ref outEdge; join.outEdges) {
+                Node* outNeighbor = outEdge.target.owner;
+                // pointers into the nursery need to be rewired
+                if (auto neighborInNusery = inNursery(outNeighbor)) {
+                    const size_t neighborIndex = neighborInNusery - &this.nursery[0];
+                    rewire(outEdge, transfers[neighborIndex]);
+                    outNeighbor = outEdge.target.owner;
+                }
+                // now we make sure the join is registered as an in-neighbor
+                const error = registerInNeighbor(outNeighbor, join.asNode);
+                if (error) {
+                    version (assert) assert(false, "mid-commit error (out of memory)");
+                    else return error;
+                }
             }
         }
 
@@ -785,7 +771,7 @@ struct Transaction {
                 auto ptr = operand.target; // exposes inner ptr
             }));
             static assert(!__traits(compiles, {
-                operand.kind = EdgeKind.control; // can't modify fixed kind
+                mul.updateHash(); // mutating methods can't be called
             }));
             auto mulp = mul.asNode(); // method on node
             auto h = operand.toHash(); // method on field
@@ -793,7 +779,7 @@ struct Transaction {
             auto mux = insert!mux(2);
             auto ins = mux.inputs; // single indexed access (hashtable)
             static assert(!__traits(compiles, {
-                ins[0].kind = EdgeKind.control; // also can't modify kind
+                ins[0].kind = EdgeKind.control; // can't modify fixed kind
             }));
 
             auto foo = insert!func(2);
@@ -899,22 +885,16 @@ struct NodeHandle(NodeKind _kind) {
     /// Indicates whether this is a valid node handle.
     bool isNull() const pure { return this.owner == null; }
 
-    auto ref opDispatch(string member, Args...)(auto ref Args args) inout
+    auto ref opDispatch(string member)() inout
     if (canAccess!(NodeType, member))
     in (!this.isNull, "can't use a null handle")
     {
-        static if (isFunction!(__traits(getMember, NodeType, member)) && Args.length > 0) {
-            // method calls work normally as long as they can operate with a const node
-            const constThis = &this;
-            return mixin(`(*constThis)._node.` ~ member)(forward!args);
-        } else {
-            // certain field/property members will need an extra wrapper
-            alias T = typeof(mixin(`this._node.` ~ member));
-            static if (needsWrapper!T)
-                return inout(DirectField!member)(this);
-            else
-                return mixin(`this._node.` ~ member);
-        }
+        // certain field/property members need an extra wrapper
+        alias T = typeof(mixin(`this._node.` ~ member));
+        static if (needsWrapper!T)
+            return inout(DirectField!member)(this);
+        else
+            return mixin(`this._node.` ~ member);
     }
 
  private:

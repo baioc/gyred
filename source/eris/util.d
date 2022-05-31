@@ -56,13 +56,6 @@ struct HashablePointer(T) if (!isPointer!T) {
         const HashablePointer other = rhs;
         return this == other;
     }
-
-    version (D_BetterC) {} else {
-        string toString() const {
-            import std.conv : to;
-            return this.ptr == null ? "null" : to!string(*this.ptr);
-        }
-    }
 }
 
 ///

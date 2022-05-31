@@ -263,6 +263,7 @@ struct Node {
      @nogc nothrow pure:
         bool function(const(Node)*, const(Node)*) opEquals;
         hash_t function(const(Node)*) toHash;
+        InEdge* function(Node*, InEdge.ID) opIndex;
     }
 
     struct CommonPrefix {
@@ -310,6 +311,21 @@ struct Node {
     hash_t toHash() const {
         return this.hash ^ this.vptr.hashOf;
     }
+
+    /++
+    Fetches a specific in-edge slot in this node.
+
+    NOTE: When nodes are initialized, they must identify each of their [InEdge]s with a unique id.
+
+    Params:
+        slot = Unique identifier for the in-edge slot within this node.
+
+    Returns:
+        A pointer to the identified in-edge, or `null` if it doesn't exist.
+    +/
+    InEdge* opIndex(InEdge.ID slot) {
+        return this.vptr.opIndex(&this, slot);
+    }
 }
 
 private mixin template NodeInheritance() {
@@ -337,6 +353,15 @@ private mixin template NodeInheritance() {
                 "all nodes must explicitly define a `toHash` function"
             );
             return self.toHash();
+        },
+        opIndex: (Node* node, InEdge.ID slot) @nogc nothrow pure {
+            This* self = This.ofNode(node);
+            assert(self != null);
+            static assert(
+                __traits(hasMember, This, "opIndex"),
+                "all nodes must explicitly define an `opIndex` function"
+            );
+            return self.opIndex(slot);
         },
     };
 
@@ -397,14 +422,20 @@ version (unittest) private { // for some reason, this needs to be in global scop
             return this.value;
         }
 
-        OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+        inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+            return null;
+        }
+
+        @property OutEdgeIterator!Callable
+        outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
             return OutEdgeIterator!Callable(
                 this.asNode,
                 (Node* self, scope Callable iter) => 0
             );
         }
 
-        InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        @property InEdgeIterator!Callable
+        inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
             return InEdgeIterator!Callable(
                 this.asNode,
                 (Node* self, scope Callable iter) => 0
@@ -489,8 +520,9 @@ private void nodeTest(NodeType)(
     moveEmplace(tmp, node);
     // check if everything is fine
     assert(node == node);
-    foreach (inEdge; node.inEdges) {
+    foreach (ref inEdge; node.inEdges) {
         assert(inEdge.owner == node.asNode);
+        assert(&inEdge == node[inEdge.id]);
     }
     test(node);
     // free it on scope exit (and the second free should be a no-op)
@@ -613,6 +645,7 @@ See_Also: [InstantiationNode], [JumpNode], [ForkNode]
         return this.asNode == rhs.asNode; // self-ptr
     }
 
+    ///
     hash_t toHash() const pure {
         hash_t hash = 0;
         foreach (parameters; channels) {
@@ -623,8 +656,30 @@ See_Also: [InstantiationNode], [JumpNode], [ForkNode]
         return hash;
     }
 
+    ///
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+        if (slot == 0) return &this.definition;
+
+        // fast path: single-channel join
+        if (this.channels.length == 1) {
+            const int i = slot - 1;
+            if (i >= this.channels[0].length) return null;
+            else return &this.channels[0][i];
+        }
+
+        // slow path: index a rigged array
+        foreach (parameters; this.channels) {
+            foreach (ref param; parameters) {
+                if (param.id == slot) return &param;
+            }
+        }
+
+        return null;
+    }
+
     /// Provides an iterator over this node's out-edges.
-    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+    @property OutEdgeIterator!Callable
+    outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
         return OutEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -636,7 +691,8 @@ See_Also: [InstantiationNode], [JumpNode], [ForkNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
         return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -733,12 +789,20 @@ See_Also: [JoinNode], [JumpNode]
         return this.asNode == rhs.asNode; // self-ptr
     }
 
+    ///
     hash_t toHash() const pure {
         return continuations.length.hashOf;
     }
 
+    ///
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+        if (slot >= this.continuations.length) return null;
+        return &this.continuations[slot];
+    }
+
     /// Provides an iterator over this node's out-edges.
-    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+    @property OutEdgeIterator!Callable
+    outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
         return OutEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -750,7 +814,8 @@ See_Also: [JoinNode], [JumpNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
         return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -849,14 +914,21 @@ See_Also: [JoinNode]
         return true;
     }
 
+    ///
     hash_t toHash() const pure {
         hash_t hash = this.continuation.toHash();
         foreach (arg; this.arguments) hash -= arg.toHash();
         return hash;
     }
 
+    ///
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+        return slot == 0 ? &this.control : null;
+    }
+
     /// Provides an iterator over this node's out-edges.
-    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+    @property OutEdgeIterator!Callable
+    outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
         return OutEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -874,7 +946,8 @@ See_Also: [JoinNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
         return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -962,14 +1035,21 @@ See_Also: [JoinNode], [JumpNode]
         return true;
     }
 
+    ///
     hash_t toHash() const pure {
         hash_t hash = 0;
         foreach (thread; this.threads) hash -= thread.toHash();
         return hash;
     }
 
+    ///
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+        return slot == 0 ? &this.control : null;
+    }
+
     /// Provides an iterator over this node's out-edges.
-    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+    @property OutEdgeIterator!Callable
+    outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
         return OutEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -985,7 +1065,8 @@ See_Also: [JoinNode], [JumpNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
         return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -1091,12 +1172,19 @@ See_Also: [MultiplexerNode]
         return true;
     }
 
+    ///
     hash_t toHash() const pure {
         return this.selector.toHash() ^ this.options.toHash();
     }
 
+    ///
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+        return slot == 0 ? &this.control : null;
+    }
+
     /// Provides an iterator over this node's out-edges.
-    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+    @property OutEdgeIterator!Callable
+    outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
         return OutEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -1114,7 +1202,8 @@ See_Also: [MultiplexerNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
         return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -1238,8 +1327,15 @@ It is this identification which allows the compiler to, later in the compilation
         return this.id.hashOf;
     }
 
+    ///
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+        if (slot >= this.inSlots.length) return null;
+        return &this.inSlots[slot];
+    }
+
     /// Provides an iterator over this node's out-edges.
-    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+    @property OutEdgeIterator!Callable
+    outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
         return OutEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -1255,7 +1351,8 @@ It is this identification which allows the compiler to, later in the compilation
     }
 
     /// Provides an iterator over this node's in-edges.
-    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
         return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -1331,12 +1428,19 @@ See_Also: [UndefinedNode]
         return this.literal == rhs.literal;
     }
 
+    ///
     hash_t toHash() const pure {
         return this.literal.hashOf;
     }
 
+    ///
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+        return slot == 0 ? &this.value : null;
+    }
+
     /// Provides an iterator over this node's out-edges.
-    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+    @property OutEdgeIterator!Callable
+    outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
         return OutEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter) => 0
@@ -1344,7 +1448,8 @@ See_Also: [UndefinedNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
         return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -1414,12 +1519,19 @@ See_Also: [ConstantNode]
         return this.asNode == rhs.asNode; // self-ptr
     }
 
+    ///
     hash_t toHash() const pure {
         return hash_t.max;
     }
 
+    ///
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+        return slot == 0 ? &this.value : null;
+    }
+
     /// Provides an iterator over this node's out-edges.
-    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+    @property OutEdgeIterator!Callable
+    outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
         return OutEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter) => 0
@@ -1427,7 +1539,8 @@ See_Also: [ConstantNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
         return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -1481,12 +1594,19 @@ See_Also: [ConstantNode]
         return this.input == rhs.input;
     }
 
+    ///
     hash_t toHash() const pure {
         return this.input.toHash();
     }
 
+    ///
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+        return slot == 0 ? &this.output : null;
+    }
+
     /// Provides an iterator over this node's out-edges.
-    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+    @property OutEdgeIterator!Callable
+    outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
         return OutEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -1498,7 +1618,8 @@ See_Also: [ConstantNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
         return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -1556,12 +1677,19 @@ See_Also: [SignedExtensionNode]
         return this.input == rhs.input;
     }
 
+    ///
     hash_t toHash() const pure {
         return this.input.toHash();
     }
 
+    ///
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+        return slot == 0 ? &this.output : null;
+    }
+
     /// Provides an iterator over this node's out-edges.
-    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+    @property OutEdgeIterator!Callable
+    outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
         return OutEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -1573,7 +1701,8 @@ See_Also: [SignedExtensionNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
         return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -1631,12 +1760,19 @@ See_Also: [UnsignedExtensionNode]
         return this.input == rhs.input;
     }
 
+    ///
     hash_t toHash() const pure {
         return this.input.toHash();
     }
 
+    ///
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+        return slot == 0 ? &this.output : null;
+    }
+
     /// Provides an iterator over this node's out-edges.
-    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+    @property OutEdgeIterator!Callable
+    outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
         return OutEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -1648,7 +1784,8 @@ See_Also: [UnsignedExtensionNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
         return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -1744,12 +1881,19 @@ See_Also: [ConditionalNode]
         return true;
     }
 
+    ///
     hash_t toHash() const pure {
         return this.selector.toHash() ^ this.inputs.toHash();
     }
 
+    ///
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+        return slot == 0 ? &this.output : null;
+    }
+
     /// Provides an iterator over this node's out-edges.
-    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+    @property OutEdgeIterator!Callable
+    outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
         return OutEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -1767,7 +1911,8 @@ See_Also: [ConditionalNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
         return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -1832,12 +1977,19 @@ See_Also: [ConditionalNode]
             || (this.lhs == other.rhs && this.rhs == other.lhs);
     }
 
+    ///
     hash_t toHash() const pure {
         return this.lhs.toHash() ^ this.rhs.toHash();
     }
 
+    ///
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+        return slot == 0 ? &this.result : null;
+    }
+
     /// Provides an iterator over this node's out-edges.
-    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+    @property OutEdgeIterator!Callable
+    outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
         return OutEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -1852,7 +2004,8 @@ See_Also: [ConditionalNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
         return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -1909,12 +2062,19 @@ See_Also: [ConditionalNode]
             || (this.lhs == other.rhs && this.rhs == other.lhs);
     }
 
+    ///
     hash_t toHash() const pure {
         return this.lhs.toHash() ^ this.rhs.toHash();
     }
 
+    ///
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+        return slot == 0 ? &this.result : null;
+    }
+
     /// Provides an iterator over this node's out-edges.
-    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+    @property OutEdgeIterator!Callable
+    outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
         return OutEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -1929,7 +2089,8 @@ See_Also: [ConditionalNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
         return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -1990,12 +2151,19 @@ Can be used as a unary `NOT` operation when one operand is an all-ones constant.
             || (this.lhs == other.rhs && this.rhs == other.lhs);
     }
 
+    ///
     hash_t toHash() const pure {
         return this.lhs.toHash() ^ this.rhs.toHash();
     }
 
+    ///
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+        return slot == 0 ? &this.result : null;
+    }
+
     /// Provides an iterator over this node's out-edges.
-    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+    @property OutEdgeIterator!Callable
+    outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
         return OutEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -2010,7 +2178,8 @@ Can be used as a unary `NOT` operation when one operand is an all-ones constant.
     }
 
     /// Provides an iterator over this node's in-edges.
-    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
         return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -2076,12 +2245,19 @@ See_Also: [LeftShiftNoOverflowNode]
         return true;
     }
 
+    ///
     hash_t toHash() const pure {
         return this.input.toHash() - this.shift.toHash();
     }
 
+    ///
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+        return slot == 0 ? &this.output : null;
+    }
+
     /// Provides an iterator over this node's out-edges.
-    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+    @property OutEdgeIterator!Callable
+    outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
         return OutEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -2096,7 +2272,8 @@ See_Also: [LeftShiftNoOverflowNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
         return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -2164,12 +2341,19 @@ See_Also: [LeftShiftNode]
         return true;
     }
 
+    ///
     hash_t toHash() const pure {
         return this.input.toHash() - this.shift.toHash();
     }
 
+    ///
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+        return slot == 0 ? &this.output : null;
+    }
+
     /// Provides an iterator over this node's out-edges.
-    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+    @property OutEdgeIterator!Callable
+    outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
         return OutEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -2184,7 +2368,8 @@ See_Also: [LeftShiftNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
         return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -2250,12 +2435,19 @@ See_Also: [SignedRightShiftNode]
         return true;
     }
 
+    ///
     hash_t toHash() const pure {
         return this.input.toHash() - this.shift.toHash();
     }
 
+    ///
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+        return slot == 0 ? &this.output : null;
+    }
+
     /// Provides an iterator over this node's out-edges.
-    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+    @property OutEdgeIterator!Callable
+    outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
         return OutEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -2270,7 +2462,8 @@ See_Also: [SignedRightShiftNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
         return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -2336,12 +2529,19 @@ See_Also: [UnsignedRightShiftNode]
         return true;
     }
 
+    ///
     hash_t toHash() const pure {
         return this.input.toHash() - this.shift.toHash();
     }
 
+    ///
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+        return slot == 0 ? &this.output : null;
+    }
+
     /// Provides an iterator over this node's out-edges.
-    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+    @property OutEdgeIterator!Callable
+    outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
         return OutEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -2356,7 +2556,8 @@ See_Also: [UnsignedRightShiftNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
         return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -2419,12 +2620,19 @@ See_Also: [AdditionNoOverflowSignedNode]
             || (this.lhs == other.rhs && this.rhs == other.lhs);
     }
 
+    ///
     hash_t toHash() const pure {
         return this.lhs.toHash() ^ this.rhs.toHash();
     }
 
+    ///
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+        return slot == 0 ? &this.result : null;
+    }
+
     /// Provides an iterator over this node's out-edges.
-    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+    @property OutEdgeIterator!Callable
+    outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
         return OutEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -2439,7 +2647,8 @@ See_Also: [AdditionNoOverflowSignedNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
         return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -2502,12 +2711,19 @@ See_Also: [AdditionNode]
             || (this.lhs == other.rhs && this.rhs == other.lhs);
     }
 
+    ///
     hash_t toHash() const pure {
         return this.lhs.toHash() ^ this.rhs.toHash();
     }
 
+    ///
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+        return slot == 0 ? &this.result : null;
+    }
+
     /// Provides an iterator over this node's out-edges.
-    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+    @property OutEdgeIterator!Callable
+    outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
         return OutEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -2522,7 +2738,8 @@ See_Also: [AdditionNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
         return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -2588,12 +2805,19 @@ See_Also: [SubtractionNoOverflowSignedNode]
         return true;
     }
 
+    ///
     hash_t toHash() const pure {
         return this.lhs.toHash() - this.rhs.toHash();
     }
 
+    ///
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+        return slot == 0 ? &this.result : null;
+    }
+
     /// Provides an iterator over this node's out-edges.
-    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+    @property OutEdgeIterator!Callable
+    outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
         return OutEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -2608,7 +2832,8 @@ See_Also: [SubtractionNoOverflowSignedNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
         return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -2674,12 +2899,19 @@ See_Also: [SubtractionNode]
         return true;
     }
 
+    ///
     hash_t toHash() const pure {
         return this.lhs.toHash() - this.rhs.toHash();
     }
 
+    ///
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+        return slot == 0 ? &this.result : null;
+    }
+
     /// Provides an iterator over this node's out-edges.
-    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+    @property OutEdgeIterator!Callable
+    outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
         return OutEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -2694,7 +2926,8 @@ See_Also: [SubtractionNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
         return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -2758,12 +2991,19 @@ See_Also: [MultiplicationNoOverflowSignedNode]
             || (this.lhs == other.rhs && this.rhs == other.lhs);
     }
 
+    ///
     hash_t toHash() const pure {
         return this.lhs.toHash() ^ this.rhs.toHash();
     }
 
+    ///
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+        return slot == 0 ? &this.result : null;
+    }
+
     /// Provides an iterator over this node's out-edges.
-    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+    @property OutEdgeIterator!Callable
+    outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
         return OutEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -2778,7 +3018,8 @@ See_Also: [MultiplicationNoOverflowSignedNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
         return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -2841,12 +3082,19 @@ See_Also: [MultiplicationNode]
             || (this.lhs == other.rhs && this.rhs == other.lhs);
     }
 
+    ///
     hash_t toHash() const pure {
         return this.lhs.toHash() ^ this.rhs.toHash();
     }
 
+    ///
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+        return slot == 0 ? &this.result : null;
+    }
+
     /// Provides an iterator over this node's out-edges.
-    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+    @property OutEdgeIterator!Callable
+    outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
         return OutEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -2861,7 +3109,8 @@ See_Also: [MultiplicationNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
         return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -2927,12 +3176,19 @@ See_Also: [SignedDivisionNode]
         return true;
     }
 
+    ///
     hash_t toHash() const pure {
         return this.dividend.toHash() - this.divisor.toHash();
     }
 
+    ///
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+        return slot == 0 ? &this.quotient : null;
+    }
+
     /// Provides an iterator over this node's out-edges.
-    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+    @property OutEdgeIterator!Callable
+    outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
         return OutEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -2947,7 +3203,8 @@ See_Also: [SignedDivisionNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
         return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -3014,12 +3271,19 @@ See_Also: [UnsignedDivisionNode]
         return true;
     }
 
+    ///
     hash_t toHash() const pure {
         return this.dividend.toHash() - this.divisor.toHash();
     }
 
+    ///
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+        return slot == 0 ? &this.quotient : null;
+    }
+
     /// Provides an iterator over this node's out-edges.
-    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+    @property OutEdgeIterator!Callable
+    outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
         return OutEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -3034,7 +3298,8 @@ See_Also: [UnsignedDivisionNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
         return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -3100,12 +3365,19 @@ See_Also: [SignedRemainderNode]
         return true;
     }
 
+    ///
     hash_t toHash() const pure {
         return this.dividend.toHash() - this.divisor.toHash();
     }
 
+    ///
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+        return slot == 0 ? &this.remainder : null;
+    }
+
     /// Provides an iterator over this node's out-edges.
-    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+    @property OutEdgeIterator!Callable
+    outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
         return OutEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -3120,7 +3392,8 @@ See_Also: [SignedRemainderNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
         return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -3187,12 +3460,19 @@ See_Also: [UnsignedRemainderNode]
         return true;
     }
 
+    ///
     hash_t toHash() const pure {
         return this.dividend.toHash() - this.divisor.toHash();
     }
 
+    ///
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+        return slot == 0 ? &this.remainder : null;
+    }
+
     /// Provides an iterator over this node's out-edges.
-    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+    @property OutEdgeIterator!Callable
+    outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
         return OutEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -3207,7 +3487,8 @@ See_Also: [UnsignedRemainderNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
         return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -3264,12 +3545,19 @@ See_Also: [UnsignedRemainderNode]
             || (this.lhs == other.rhs && this.rhs == other.lhs);
     }
 
+    ///
     hash_t toHash() const pure {
         return this.lhs.toHash() ^ this.rhs.toHash();
     }
 
+    ///
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+        return slot == 0 ? &this.result : null;
+    }
+
     /// Provides an iterator over this node's out-edges.
-    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+    @property OutEdgeIterator!Callable
+    outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
         return OutEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -3284,7 +3572,8 @@ See_Also: [UnsignedRemainderNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
         return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -3341,12 +3630,19 @@ See_Also: [UnsignedRemainderNode]
             || (this.lhs == other.rhs && this.rhs == other.lhs);
     }
 
+    ///
     hash_t toHash() const pure {
         return this.lhs.toHash() ^ this.rhs.toHash();
     }
 
+    ///
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+        return slot == 0 ? &this.result : null;
+    }
+
     /// Provides an iterator over this node's out-edges.
-    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+    @property OutEdgeIterator!Callable
+    outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
         return OutEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -3361,7 +3657,8 @@ See_Also: [UnsignedRemainderNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
         return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -3425,12 +3722,19 @@ There is no equivalent for `>` because it suffices to swap this node's operands.
         return true;
     }
 
+    ///
     hash_t toHash() const pure {
         return this.lhs.toHash() - this.rhs.toHash();
     }
 
+    ///
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+        return slot == 0 ? &this.result : null;
+    }
+
     /// Provides an iterator over this node's out-edges.
-    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+    @property OutEdgeIterator!Callable
+    outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
         return OutEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -3445,7 +3749,8 @@ There is no equivalent for `>` because it suffices to swap this node's operands.
     }
 
     /// Provides an iterator over this node's in-edges.
-    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
         return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -3509,12 +3814,19 @@ There is no equivalent for `>` because it suffices to swap this node's operands.
         return true;
     }
 
+    ///
     hash_t toHash() const pure {
         return this.lhs.toHash() - this.rhs.toHash();
     }
 
+    ///
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+        return slot == 0 ? &this.result : null;
+    }
+
     /// Provides an iterator over this node's out-edges.
-    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+    @property OutEdgeIterator!Callable
+    outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
         return OutEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -3529,7 +3841,8 @@ There is no equivalent for `>` because it suffices to swap this node's operands.
     }
 
     /// Provides an iterator over this node's in-edges.
-    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
         return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -3593,12 +3906,19 @@ There is no equivalent for `<=` because it suffices to swap this node's operands
         return true;
     }
 
+    ///
     hash_t toHash() const pure {
         return this.lhs.toHash() - this.rhs.toHash();
     }
 
+    ///
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+        return slot == 0 ? &this.result : null;
+    }
+
     /// Provides an iterator over this node's out-edges.
-    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+    @property OutEdgeIterator!Callable
+    outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
         return OutEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -3613,7 +3933,8 @@ There is no equivalent for `<=` because it suffices to swap this node's operands
     }
 
     /// Provides an iterator over this node's in-edges.
-    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
         return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -3677,12 +3998,19 @@ There is no equivalent for `<=` because it suffices to swap this node's operands
         return true;
     }
 
+    ///
     hash_t toHash() const pure {
         return this.lhs.toHash() - this.rhs.toHash();
     }
 
+    ///
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+        return slot == 0 ? &this.result : null;
+    }
+
     /// Provides an iterator over this node's out-edges.
-    OutEdgeIterator!Callable outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+    @property OutEdgeIterator!Callable
+    outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
         return OutEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
@@ -3697,7 +4025,8 @@ There is no equivalent for `<=` because it suffices to swap this node's operands
     }
 
     /// Provides an iterator over this node's in-edges.
-    InEdgeIterator!Callable inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
         return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
