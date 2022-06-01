@@ -27,16 +27,16 @@ We'll always manage memory like this in the context of a [Graph].
 +/
 module gyre.graph;
 
-import core.stdc.errno : ENOMEM, EINVAL, EACCES;
+import core.stdc.errno : ENOMEM, EINVAL, EACCES, EOVERFLOW;
 import core.lifetime : forward;
 import std.meta : AliasSeq, Filter;
-import std.traits : EnumMembers, Fields, Parameters, isArray, Unconst, isPointer;
+import std.traits : EnumMembers, Fields, Parameters;
 
 import eris.core : err_t, allocate, deallocate;
 import eris.util : HashablePointer;
 import eris.hash_table : UnsafeHashMap, UnsafeHashSet;
 
-import gyre.nodes;
+public import gyre.nodes;
 
 
 // XXX: I wanted to do some of this metaprogramming in the nodes module, but using
@@ -149,7 +149,7 @@ private { // step 3: profit
 
         pragma(inline) static inout(NodeStorage)* ofNode(inout(Node)* node) pure {
             static assert(
-                NodeStorage.node.offsetof == 0,
+                NodeStorage.node.offsetof == 0 && NodeStorage.sizeof == NodeUnion.sizeof,
                 "NodeStorage layout must allow casting from Node*"
             );
             return cast(inout(NodeStorage)*)node;
@@ -239,15 +239,28 @@ struct Graph {
     // corresponds to the notion of a "top-level". also used as a GC root:
     // any subgraph not reachable from this node's inteface is considered dead
     MacroNode topLevel;
+    uint _exported; // number of actually exported definitions
 
     // backing memory pool for this graph's nodes (all except the topLevel)
     NodeStorage[] arena;
-
-    // bump allocator index, either at the first free slot or `== arena.length`
-    // such that all in-use storage slots are to the left of the cursor
-    size_t cursor;
+    size_t cursor; // bump allocator index for the arena
 
  public @nogc nothrow:
+    /// This subgraph's unique identifier.
+    @property MacroNode.ID id() const pure {
+        return this.topLevel.id;
+    }
+
+    /// Number of definitions exported by this graph.
+    @property uint exported() const pure {
+        return this._exported;
+    }
+
+    /// Number of definitions imported by this graph.
+    @property uint imported() const pure {
+        return cast(uint)this.topLevel.inSlots.length;
+    }
+
     /// Number of unique nodes in the graph.
     @property size_t length() const pure {
         return this.adjacencies.length;
@@ -266,15 +279,13 @@ struct Graph {
         self = Graph being initialized.
         id = This graph's unique identifier.
         exports = Preallocated number of "exported" defs (or [InEdge|in-edge]s for [MacroNode|macro node] definitions).
-        imports = Preallocated number of "imported" defs (or [OutEdge|out-edge]s for [MacroNode|macro node] definitions).
+        imports = Maximum number of "imported" defs (or [OutEdge|out-edge]s for [MacroNode|macro node] definitions).
         capacity = Number of nodes to preallocate.
 
     Returns:
         Zero on success, non-zero on failure (OOM).
     +/
-    err_t initialize(MacroNode.ID id, uint exports = 1, uint imports = 0, size_t capacity = 256)
-    in (this is Graph.init, "detected memory leak caused by Graph re-initialization")
-    {
+    err_t initialize(MacroNode.ID id, uint exports = 1, uint imports = 0, size_t capacity = 256) {
         err_t error = 0;
         scope(exit) if (error) this = Graph.init;
 
@@ -299,6 +310,7 @@ struct Graph {
         scope(exit) if (error) MacroNode.dispose(&this.topLevel);
         if (error) return error;
         this.topLevel.updateHash();
+        this._exported = 0;
 
         assert(!error);
         return error;
@@ -323,12 +335,11 @@ struct Graph {
     }
 
  private:
-    // copies a node into the graph in case there's space for it, returning the internal pointer
-    // NOTE: node structure must be stable and its hash already cached (and it must not depend on the node's address)
-    Node* add(NodeStorage* temp)
-    in (temp != null && this.cursor < this.arena.length)
-    {
-        if (temp == null) return null;
+    // shallow copy a node into the graph in case there's space for it,
+    // returning the resulting internal pointer (stable until the next rehash)
+    // NOTE: node structure must be stable and its hash already cached, which
+    // implies its dependencies were already added (requires a topological sort)
+    NodeStorage* add(NodeStorage* temp) {
         if (this.cursor >= this.arena.length) return null;
 
         // abort the node in case an equivalent one already exists in the graph
@@ -339,7 +350,7 @@ struct Graph {
             const found = this.adjacencies.get(handle, existing, neighbors);
             if (found) {
                 assert(existing != null);
-                return *existing;
+                return NodeStorage.ofNode(existing.ptr);
             }
         }
 
@@ -347,18 +358,43 @@ struct Graph {
         NodeStorage* newStorage = &this.arena[this.cursor];
         *newStorage = *temp;
         newStorage.opPostMove(*temp);
-        Node* newNode = newStorage.asNode;
-        const error = (this.adjacencies[HashableNode(newNode)] = InNeighbors.init);
+        auto handle = HashableNode(newStorage.asNode);
+        const error = (this.adjacencies[handle] = InNeighbors.init);
         if (error) return null;
         this.cursor++;
 
-        // TODO: register imports/exports
+        return newStorage;
+    }
 
-        return newNode;
+    err_t export_(InEdge* definition) {
+        // expand the export array if needed. this does not cause rehashes and,
+        // since it's a dynamic array, pointers to the topLevel are kept stable
+        if (this.exported >= this.topLevel.outSlots.length) {
+            assert(this.exported == this.topLevel.outSlots.length);
+            // allocate a new array
+            uint n = this.exported * 2;
+            if (n == 0) n = 1;
+            else if (n <= this.exported) return EOVERFLOW;
+            auto newSlots = allocate!OutEdge(n);
+            if (newSlots == null) return ENOMEM;
+            // copy the old exports into it, then swap the old array out
+            foreach (i, outEdge; this.topLevel.outSlots) newSlots[i] = outEdge;
+            this.topLevel.outSlots.deallocate();
+            this.topLevel.outSlots = newSlots;
+        }
+
+        // wire up a free out-edge to the exported definition
+        this.topLevel.outSlots[this.exported] = OutEdge(definition.kind, definition);
+        this._exported++;
+        return 0;
+    }
+
+    @property ref inout(InEdge[]) imports() inout pure {
+        return this.topLevel.inSlots;
     }
 }
 
-// TODO: add (and test) more public functionality to Graphs
+// TODO: expose a pass API over Graphs (check LLVM for inspiration)
 
 
 /++
@@ -371,22 +407,15 @@ See_Also: [NodeHandle]
 +/
 struct Transaction {
  private:
-    import std.bitmanip : taggedPointer;
-    mixin(taggedPointer!(
-        Graph*, "graph",
-        bool, "began", 1
-    ));
+    Graph* graph;
 
-    // temporary buffer for new nodes
-    NodeStorage[] nursery;
-    size_t cursor;
+    // temporary buffer for new nodes. maps pointers to their ownership status
+    // (such that true indicates that they were allocated by this transaction)
+    UnsafeHashMap!(NodeStorage*, bool) nursery;
 
  public @nogc nothrow:
     /// Creates a new transaction.
-    this(ref Graph graph) pure {
-        this.graph = &graph;
-        this.began = false;
-    }
+    this(ref Graph graph) pure { this.graph = &graph; }
     @disable this();
 
     /++
@@ -395,75 +424,60 @@ struct Transaction {
     All transactions which have begun must explicitly finish (successfully or otherwise).
 
     Params:
-        n = Maximum number of added nodes (does not dynamically expand).
+        n = Expected number of inserted nodes.
 
     Returns:
         Zero on success, non-zero otherwise (in which case the transaction fails to begin).
 
     See_Also: [commit], [abort]
     +/
-    err_t begin(size_t n)
-    in (!this.began, "tried to start a transaction which was already ongoing")
-    out (error; error || this.began)
+    err_t begin(size_t n = 0)
+    in (this.nursery.capacity == 0, "can't begin a transaction twice")
     {
-        if (this.began) return EINVAL;
-
-        this.nursery = allocate!NodeStorage(n);
-        if (n > 0 && this.nursery == null) return ENOMEM;
-        this.cursor = 0;
-
-        this.began = true;
-        return 0;
+        if (this.nursery.capacity > 0) return EINVAL;
+        else return this.nursery.rehash(n);
     }
 
     /// Finishes the transaction by cancelling it.
-    void abort()
-    in (this.began, "can't operate on an unstarted transaction")
-    out (; !this.began)
-    {
-        if (!this.began) return;
-
-        foreach_reverse (i; 0 .. this.cursor) {
-            this.nursery[i].dispose();
+    void abort() {
+        foreach (entry; this.nursery.byKeyValue) {
+            if (entry.value) deallocate(entry.key);
         }
-        this.nursery.deallocate();
-
-        this = Transaction(*this.graph);
+        this.nursery.dispose();
     }
 
     private alias InitParams(NodeType) = Parameters!(NodeType.initialize)[1 .. $];
 
     /++
-    Inserts a node during an ongoing transaction.
+    Creates a node during an ongoing transaction.
+
+    The created node has a stable address as long as this transaction is ongoing.
 
     Returns:
-        A [NodeHandle|handle] to the inserted node, which `isNull` in case something went wrong (OOM).
+        A pointer to the new node, which is `null` in case something went wrong (OOM or the provided arguments were rejected by the node's initializer).
     +/
-    NodeHandle!kind insert(NodeKind kind)(auto ref InitParams!(AllNodes[kind]) args)
-    in (this.began, "can't operate on an unstarted transaction")
-    {
+    AllNodes[kind]* insert(NodeKind kind)(auto ref InitParams!(AllNodes[kind]) args) {
         alias NodeType = AllNodes[kind];
-        enum nil = NodeHandle!kind(null, -1);
-        static assert(nil.isNull);
+        err_t error = 0;
 
-        if (!this.began) return nil;
+        // allocate a node in the global heap
+        auto storage = allocate!NodeStorage;
+        if (storage == null) return null;
+        scope(exit) if (error) deallocate(storage);
+        auto newNode = &storage.node.as!kind;
 
-        // the nursery doesn't expand, so we give up if it would overflow
-        // TODO: actually, we could make it grow by packing node+slot indexes into pointers
-        if (this.cursor >= this.nursery.length) return nil;
+        // initialize and register the newly inserted node
+        error = NodeType.initialize(newNode, forward!args);
+        if (error) return null;
+        scope(exit) if (error) NodeType.dispose(newNode);
+        error = (this.nursery[storage] = true);
+        if (error) return null;
 
-        // grab the first available slot and in-place initialize the node there
-        NodeStorage* storage = &this.nursery[this.cursor];
-        auto error = NodeType.initialize(&storage.node.as!kind, forward!args);
-        if (error) return nil;
-
-        auto newNode = NodeHandle!kind(&this, this.cursor);
-        this.cursor++;
         return newNode;
     }
 
     /// ditto
-    NodeHandle!(NodeKind.JoinNode) insert(NodeSugar sugar : NodeSugar.JoinNodeSingleChannel)(
+    pragma(inline) JoinNode* insert(NodeSugar sugar : NodeSugar.JoinNodeSingleChannel)(
         uint argc
     ) {
         uint[1] ms = [argc];
@@ -471,83 +485,80 @@ struct Transaction {
     }
 
     /++
+    Inserts a user-initialized node in the transaction.
+
+    The unsafe prefix signals that correct usage of this method depends on how the node's memory is managed.
+    In particular, every unsafely-inserted node must still be alive by the time the transaction commits, and its contents must not be mutated after that happens.
+    Freeing memory that's backing the node itself (not its contents!) is still the user's responsibility.
+
+    Returns:
+        Zero on success, non-zero on failure (OOM).
+    +/
+    pragma(inline) err_t unsafeInsert(Node* node) in (node != null) {
+        return (this.nursery[NodeStorage.ofNode(node)] = false);
+    }
+
+    /++
     Links two edge slots during a transaction.
 
-    Pointers in our safe [NodeHandle|handles] can only be updated through this method.
-    NOTE: `from`'s edge kind will be automatically set to match `to`'s', so slot kind mismatches are not cheked here.
+    Nodes which existed prior to this transaction can ONLY be updated through this method.
+    NOTE: The updated out-edge's slot kind will be automatically set to match `to`'s'.
 
     Params:
-        from = Out-edge slot being updated.
+        node = Node being updated.
+        index = Required when the field is only accessible through an indirection.
         to = Target in-edge slot.
 
     Returns:
-        Zero on success, non-zero on failure (e.g. invalid parent transaction).
+        Non-zero in case of failure (e.g. OOM or detected U.B. such as updating nodes from another transaction).
     +/
-    err_t update(A, B)(A from, B to)
-    if (is(A.FieldType == OutEdge) && is(B.FieldType == InEdge))
-    in (this.began, "can't operate on an unstarted transaction")
+    err_t update(string member, NodeType)(NodeType* node, InEdge* to)
+    if (is(typeof(mixin(`node.` ~ member)) == OutEdge))
     {
-        if (!this.began) return EINVAL;
-
-        // yet another wrapper type, this time to provide a unified field interface
-        struct UnifiedField(T) {
-            enum kind = T.HandleType.kind;
-            enum string name = T.field;
-
-            T wrapper;
-
-            static if (is(T == NodeHandle!kind.DirectField!name)) {
-                @property auto handle() inout { return wrapper.handle; }
-                template get(string self) {
-                    enum get =
-                        self ~ ".node." ~ name;
-                }
-            } else static if (is(T == NodeHandle!kind.SingleIndexedField!name)) {
-                @property auto handle() inout { return wrapper.base.handle; }
-                template get(string self) {
-                    enum get =
-                        self ~ ".node." ~ name
-                        ~ "[" ~ self ~ ".wrapper.index]";
-                }
-            } else {
-                static assert(is(T == NodeHandle!kind.DoubleIndexedField!name));
-                @property auto handle() inout { return wrapper.base.base.handle; }
-                template get(string self) {
-                    enum get =
-                        self ~ ".node." ~ name
-                        ~ "[" ~ self ~ ".wrapper.base.index]"
-                        ~ "[" ~ self ~ ".wrapper.index]";
-                }
-            }
-
-            @property auto ref node() {
-                return this.handle.owner.nursery[this.handle.index].node.as!kind;
-            }
-        }
-
-        auto fromField = UnifiedField!A(from);
-        enum outSlot = UnifiedField!A.get!q{fromField};
-        auto toField = UnifiedField!B(to);
-        enum inSlot = UnifiedField!B.get!q{toField};
-
         // safety check: a transaction can only update its own nodes
-        if (fromField.handle.owner != &this || toField.handle.owner != &this) {
+        if (NodeStorage.ofNode(node.asNode) !in this.nursery
+         || NodeStorage.ofNode(to.owner) !in this.nursery
+        ) {
             version (assert) assert(false, "tried to update a node from another transaction");
             else return EACCES;
         }
-        // TODO: how do we update edges linking to/from outside the nursery?
+        // TCC: how do we update edges linking to/from outside the nursery?
 
-        // do the actual edge slot linking (which may fail in case of a hashmap insert)
-        auto link = OutEdge(to.kind, &mixin(inSlot));
-        static if (is(A.HandleType == UnsafeHashMap!(ulong, OutEdge))) {
-            err_t error = (mixin(outSlot ~ `= link`));
-        } else {
-            mixin(outSlot ~ `= link;`);
-            err_t error = 0;
+        auto link = OutEdge(to.kind, to);
+        mixin(`node.` ~ member ~ ` = link;`);
+        return 0;
+    }
+
+    /// ditto
+    pragma(inline) err_t update(string member, NodeType)(NodeType* node, ref InEdge to) {
+        return update!member(node, &to);
+    }
+
+    /// ditto
+    err_t update(string member, NodeType)(NodeType* node, size_t index, InEdge* to)
+    if (__traits(compiles, mixin(`node.` ~ member ~ `[index] = OutEdge.init`)))
+    {
+        if (NodeStorage.ofNode(node.asNode) !in this.nursery
+         || NodeStorage.ofNode(to.owner) !in this.nursery
+        ) {
+            version (assert) assert(false, "tried to update a node from another transaction");
+            else return EACCES;
         }
-        if (error) return error;
 
-        return error;
+        auto link = OutEdge(to.kind, to);
+        alias FieldType = typeof(mixin(`node.` ~ member));
+        static if (is(FieldType == UnsafeHashMap!(ulong, OutEdge))) {
+            return mixin(`node.` ~ member ~ `[index] = link`);
+        } else {
+            static assert(is(FieldType == OutEdge[]));
+            mixin(`node.` ~ member ~ `[index] = link;`);
+            return 0;
+        }
+    }
+
+    /// ditto
+    pragma(inline) err_t update(string member, NodeType)(NodeType* node, size_t index, ref InEdge to) {
+        return update!member(node, index, &to);
     }
 
     /++
@@ -559,69 +570,53 @@ struct Transaction {
     Version:
         NOTE: Technically speaking, this operation is not transactional; on OOM conditions the graph may be left in an incomplete/invalid state. This is OK under a ["worse is better"](https://www.dreamsongs.com/RiseOfWorseIsBetter.html) philosophy.
     +/
-    err_t commit()
-    in (this.began, "can't operate on an unstarted transaction")
-    out (error; error || !this.began)
-    {
-        if (!this.began) return EINVAL;
-        // TODO: validate nodes and check IR rules BEFORE mutating anything
+    err_t commit() {
+        // TCC: validate nodes and check IR rules BEFORE mutating anything
 
         // compute how much space we need and how much we have available
-        assert(this.cursor <= this.nursery.length);
-        const neededSpace = this.cursor;
+        const neededSpace = this.nursery.length;
         assert(this.graph.cursor <= this.graph.arena.length);
         const freeSpace = this.graph.arena.length - this.graph.cursor;
         if (freeSpace < neededSpace) {
-            version (assert) assert(false, "TODO: implement garbage collection");
+            version (assert) assert(false, "TCC: implement garbage collection");
             else return ENOMEM;
         }
 
-        // finds out whether a reference points into the nursery
-        NodeStorage* inNursery(Node* node) {
-            auto ptr = NodeStorage.ofNode(node);
-            const min = &this.nursery[0];
-            const max = &this.nursery[this.cursor - 1];
-            return min <= ptr && ptr <= max ? ptr : null;
-        }
-
-        // rewires an out-edge to the right slot of a stored node
+        // rewires an out-edge to the right slot of another stored node
         void rewire(ref OutEdge outEdge, NodeStorage* storage)
-        in (outEdge.target != null && storage != null)
         out (; outEdge.target != null)
         {
             outEdge.target = storage.asNode.opIndex(outEdge.target.id);
         }
 
         // registers the second node as an in-neighbor of the first
-        err_t registerInNeighbor(Node* node, Node* inNeighbor)
-        in (Graph.HashableNode(node) in this.graph.adjacencies)
-        {
+        err_t registerInNeighbor(Node* node, Node* inNeighbor) {
             auto outNeighbor = Graph.HashableNode(node);
             Graph.HashableNode* found;
             Graph.InNeighbors* inNeighbors;
             this.graph.adjacencies.get(outNeighbor, found, inNeighbors);
             assert(found);
-            const error = inNeighbors.add(inNeighbor);
-            return error;
+            return inNeighbors.add(inNeighbor);
         }
 
+        // mapping of transaction-owned addresses to graph-owned addresses
+        alias TLB = UnsafeHashMap!(NodeStorage*, NodeStorage*);
+
         // recursively adds nodes to the graph, assuming IR rules are respected
-        NodeStorage* depthFirstAdd(NodeStorage*[] transfers, size_t index) @nogc nothrow {
+        NodeStorage* depthFirstAdd(ref TLB transfers, NodeStorage* original) @nogc nothrow {
             // first, let's make sure we never process the same node twice
-            if (transfers[index] != null) return transfers[index];
-            NodeStorage* original = &this.nursery[index];
+            auto mapping = transfers[original];
+            if (mapping != null) return mapping;
             const bool isJoinNode = JoinNode.ofNode(original.asNode) != null;
 
             // try to go deeper by visiting this node's out-neighbors
             // (except on join nodes, since they are allowed to induce cycles)
             if (!isJoinNode) {
                 foreach (ref outEdge; original.outEdges) {
-                    Node* outNeighbor = outEdge.target.owner;
-                    auto nextStorage = inNursery(outNeighbor);
+                    auto outNeighbor = NodeStorage.ofNode(outEdge.target.owner);
                     // we'll only recurse if the out-neighbor's also in the nursery
-                    if (nextStorage == null) continue;
-                    const size_t nextIndex = nextStorage - &this.nursery[0];
-                    NodeStorage* newNeighbor = depthFirstAdd(transfers, nextIndex);
+                    if (outNeighbor !in this.nursery) continue;
+                    auto newNeighbor = depthFirstAdd(transfers, outNeighbor);
                     if (newNeighbor == null) return null;
                     // then, rewire this node's out-edge to its updated neighbor
                     rewire(outEdge, newNeighbor);
@@ -630,31 +625,31 @@ struct Transaction {
 
             // this node is now stable, so we can hash it and add it to the graph
             original.asNode.updateHash();
-            Node* added = this.graph.add(original);
-            if (added == null) return null;
-            transfers[index] = NodeStorage.ofNode(added);
+            auto transferred = this.graph.add(original);
+            if (transferred == null) return null;
+            transfers[original] = transferred;
 
             // since we now know this node's stable address in the graph, we can
             // add it to the in-neighbor set of each of its out-neighbors
             if (!isJoinNode) {
-                foreach (ref outEdge; transfers[index].outEdges) {
+                foreach (ref outEdge; transferred.outEdges) {
                     auto outNeighbor = outEdge.target.owner;
-                    const error = registerInNeighbor(outNeighbor, added);
+                    const error = registerInNeighbor(outNeighbor, transferred.asNode);
                     if (error) return null;
                 }
             }
 
-            return transfers[index];
+            return transferred;
         }
 
         // set up DFS bookkeeping data structures
-        NodeStorage*[] transfers = allocate!(NodeStorage*)(this.cursor);
-        scope(exit) transfers.deallocate();
-        if (this.cursor > 0 && transfers == null) return ENOMEM;
-        foreach (ref forwardingPointer; transfers) forwardingPointer = null;
+        TLB transfers;
+        auto error = transfers.rehash(this.nursery.length);
+        scope(exit) transfers.dispose();
+        if (error) return ENOMEM;
         // then trigger the recursions
-        foreach (i; 0 .. this.cursor) {
-            auto added = depthFirstAdd(transfers, i);
+        foreach (storage; this.nursery.byKey) {
+            auto added = depthFirstAdd(transfers, storage);
             if (!added) {
                 // I don't really know how to handle a mid-commit error in such
                 // a way as to make it an all-or-nothing operation. Thus, if this
@@ -669,19 +664,18 @@ struct Transaction {
 
         // since we treat join nodes differently in the DFS, we now have to ensure that
         // their edges were rewired and that they have been registered as in-neighbors
-        foreach (NodeStorage* storage; transfers) {
+        foreach (NodeStorage* storage; transfers.byValue) {
             JoinNode* join = JoinNode.ofNode(storage.asNode);
             if (join == null) continue;
             foreach (ref outEdge; join.outEdges) {
                 Node* outNeighbor = outEdge.target.owner;
                 // pointers into the nursery need to be rewired
-                if (auto neighborInNusery = inNursery(outNeighbor)) {
-                    const size_t neighborIndex = neighborInNusery - &this.nursery[0];
-                    rewire(outEdge, transfers[neighborIndex]);
+                if (auto key = NodeStorage.ofNode(outNeighbor) in this.nursery) {
+                    rewire(outEdge, transfers[*key]);
                     outNeighbor = outEdge.target.owner;
                 }
                 // now we make sure the join is registered as an in-neighbor
-                const error = registerInNeighbor(outNeighbor, join.asNode);
+                error = registerInNeighbor(outNeighbor, join.asNode);
                 if (error) {
                     version (assert) assert(false, "mid-commit error (out of memory)");
                     else return error;
@@ -689,10 +683,9 @@ struct Transaction {
             }
         }
 
-        // TODO: peephole optimizations
+        // TCC: peephole optimizations
 
         // after this transaction's contents have been copied, we can finish it
-        this.cursor = 0;
         this.abort();
         return 0;
     }
@@ -703,10 +696,17 @@ struct Transaction {
     import gyre.mnemonics;
 
     Graph graph;
-    graph.initialize(42);
+    graph.initialize(MacroNode.ID(42));
     scope(exit) graph.dispose();
 
+    assert(graph.id == 42);
     assert(graph.length == 0);
+    assert(graph.exported == 0);
+    assert(graph.imported == 0);
+
+    // manual memory management is still possible
+    auto a = allocate!AdditionNode;
+    scope(exit) deallocate(a);
 
     // while compiling something like
     //    foo(return, x) {
@@ -715,271 +715,41 @@ struct Transaction {
     //        y = a / b
     //        return(y)
     //    }
-    with (Transaction(graph)) {
-        begin(6);
-        {
-            // insertion order does not matter ...
-            auto a = insert!add;
-            auto b = insert!add;
-            auto foo = insert!func(2);
-            auto c1 = insert!const_(1);
-            auto y = insert!divu;
-            auto jump = insert!jump(1);
+    with (Transaction(graph))
+    {
+        begin;
 
-            // ... as long as the graph is set up correctly
-            auto params = foo.channels[0];
-            auto ret = params[0];
-            auto x = params[1];
+        auto foo = insert!func(2);
+        auto jump = insert!jump(1);
+        auto y = insert!divu;
+        AdditionNode.initialize(a);
+        unsafeInsert(a.asNode);
+        auto b = insert!add;
+        auto c1 = insert!const_(1);
 
-            update(a.lhs, x);
-            update(a.rhs, c1.value);
+        auto params = foo.channels[0];
+        auto ret = &params[0];
+        auto x = &params[1];
 
-            update(b.lhs, c1.value);
-            update(b.rhs, x);
+        // export_(foo.definition);
+        update!"control"(foo, jump.control);
 
-            update(foo.control, jump.control);
+        update!"continuation"(jump, ret);
+        update!"arguments"(jump, 0, y.quotient);
 
-            update(y.dividend, a.result);
-            update(y.divisor, b.result);
+        update!"dividend"(y, a.result);
+        update!"divisor"(y, b.result);
 
-            update(jump.continuation, ret);
-            update(jump.arguments[0], y.quotient);
-        }
+        update!"lhs"(a, x);
+        update!"rhs"(a, c1.value);
+
+        update!"lhs"(b, c1.value);
+        update!"rhs"(b, x);
+
         commit;
     }
 
-    // b computes the same value as a, so it gets optimized away!
+    // one of the additions was optimized away
     assert(graph.length == 5);
-}
-
-@nogc nothrow unittest {
-    import gyre.mnemonics;
-    import gyre.nodes : Node, EdgeKind;
-
-    Graph graph;
-    graph.initialize(42);
-    scope(exit) graph.dispose();
-
-    NodeHandle!(NodeKind.MultiplicationNode).DirectField!"lhs" laterInvalid;
-    with (Transaction(graph)) {
-        begin(10);
-        {
-            auto mul = insert!mul;
-            auto operand = mul.lhs;
-            laterInvalid = operand;
-            static assert(!__traits(compiles, {
-                auto ptr = operand.target; // exposes inner ptr
-            }));
-            static assert(!__traits(compiles, {
-                mul.updateHash(); // mutating methods can't be called
-            }));
-            auto mulp = mul.asNode(); // method on node
-            auto h = operand.toHash(); // method on field
-
-            auto mux = insert!mux(2);
-            auto ins = mux.inputs; // single indexed access (hashtable)
-            static assert(!__traits(compiles, {
-                ins[0].kind = EdgeKind.control; // can't modify fixed kind
-            }));
-
-            auto foo = insert!func(2);
-            auto params = foo.channels[0];
-            auto x = params[0]; // double indexed access
-            static assert(!__traits(compiles, {
-                const cx = x;
-                cx.kind = EdgeKind.data; // just because of the `const`
-            }));
-
-            auto jump = insert!jump(2);
-            auto args = jump.arguments; // single indexed access (array)
-            assert(args[0].kind == EdgeKind.data);
-            args[0].kind = EdgeKind.memory; // jumps have mutable kind slots
-            assert(args[0].kind == EdgeKind.memory);
-
-            auto inst = insert!inst(1);
-            update(inst.definition, foo.definition); // direct x direct
-            update(jump.continuation, inst.continuations[0]); // direct x single
-            update(mul.lhs, x); // direct x doubly-indexed
-
-            update(args[1], mul.result); // single x direct
-            update(ins[0], inst.continuations[0]); // single x single
-            update(args[0], x); // single x double
-
-            // this should have worked even if the outedge sits in a hashmap
-            assert(ins._field[0].target == &inst.continuations._field[0]);
-        }
-        abort();
-    }
-
-    with (Transaction(graph)) {
-        begin(1);
-        {
-            auto div = insert!divu;
-            // update(laterInvalid, div.quotient); // runtime error
-
-            auto oom = insert!divs;
-            assert(oom.isNull);
-        }
-        abort();
-    }
-}
-
-
-// our transactions need to track modification to any nodes they control (new or otherwise),
-// in particular for the purpose of in-neighbor bookkeeping. in order to expose a safe API
-// that's also fast & nice (it's an EDSL, really), we'll make heavy (ab)use of metaprogramming
-
-private { // helper templates used below
-    // whether we want to expose a member of a certain type
-    // XXX: for some reason, `package` members (e.g. vptr) also pass this check
-    template canAccess(Type, string member) {
-        enum canAccess =
-            __traits(hasMember, Type, member)
-            && __traits(getVisibility, __traits(getMember, Type, member)) == "public"
-            && !isPointer!(typeof(__traits(getMember, Type, member)));
-    }
-
-    // whether we want to wrap a given type for the purposes of our EDSL
-    // NOTE: template must be kept in sync with fields exposed in gyre.nodes
-    template needsWrapper(Type) {
-        enum needsWrapper =
-            is(Type : const(OutEdge))
-            || is(Type : const(OutEdge[]))
-            || is(Type : const(UnsafeHashMap!(ulong, OutEdge)))
-            || is(Type : const(InEdge))
-            || is(Type : const(InEdge[]))
-            || is(Type : const(InEdge[][]));
-    }
-
-    // whether user code can mutate the kind of a certain edge slot field
-    template canMutateSlotKind(NodeType, SlotType) {
-        enum canMutateSlotKind =
-            (is(NodeType == JoinNode) && is(SlotType == InEdge))
-            || (is(NodeType == JumpNode) && is(SlotType == OutEdge))
-            || is(NodeType == MacroNode);
-    }
-}
-
-/++
-Ephemeral node handle.
-
-Instead of giving out pointers to nodes they manage, [Transaction]s use safer handles.
-These allow users to address node fields in a type-safe manner, while prohibiting direct mutation.
-Like pointers, handles are nullable to indicate the possibility of a missing value or failure case.
-+/
-struct NodeHandle(NodeKind _kind) {
- private:
-    Transaction* owner;
-    size_t index;
-
- @nogc nothrow:
-    @property ref inout(NodeType) _node() inout pure {
-        return this.owner.nursery[index].node.as!kind;
-    }
-
- public:
-    /// This handle's underlying node type.
-    alias NodeType = AllNodes[kind];
-    private enum kind = _kind;
-
-    /// Indicates whether this is a valid node handle.
-    bool isNull() const pure { return this.owner == null; }
-
-    auto ref opDispatch(string member)() inout
-    if (canAccess!(NodeType, member))
-    in (!this.isNull, "can't use a null handle")
-    {
-        // certain field/property members need an extra wrapper
-        alias T = typeof(mixin(`this._node.` ~ member));
-        static if (needsWrapper!T)
-            return inout(DirectField!member)(this);
-        else
-            return mixin(`this._node.` ~ member);
-    }
-
- private:
-    // first-class field handles help transactions when mutating actual fields
-    struct DirectField(string name) {
-     private:
-        // every field wrapper needs these
-        alias HandleType = NodeHandle;
-        enum field = name;
-        alias FieldType = Unconst!(typeof(this._field));
-
-        NodeHandle handle;
-
-     @nogc nothrow:
-        @property auto ref _field() inout pure {
-            return mixin(`this.handle._node.` ~ name);
-        }
-
-     public:
-        // most, but not all, const member accesses work normally for field handles
-        auto ref opDispatch(string member, Args...)(auto ref Args args) const
-        if (canAccess!(FieldType, member) && member != "opIndex")
-        {
-            return mixin(`this._field.` ~ member)(forward!args);
-        }
-
-        // but indexing (if present on this field) may require extra work
-        static if (isArray!FieldType || canAccess!(FieldType, "opIndex")) {
-            auto ref opIndex(size_t index) inout pure {
-                alias T = typeof(this._field[index]);
-                static if (needsWrapper!T)
-                    return inout(SingleIndexedField!name)(this, index);
-                else
-                    return this._field[index];
-            }
-        }
-    }
-
-    // indexed fields behave very much like direct fields, but with an extra indirection
-    struct SingleIndexedField(string name) {
-        mixin IndexedFieldBoilerplate!(DirectField!name);
-        static if (isArray!FieldType || canAccess!(FieldType, "opIndex")) {
-            auto ref opIndex(size_t index) inout pure {
-                alias T = typeof(this._field[index]);
-                static if (needsWrapper!T)
-                    return inout(DoubleIndexedField!name)(this, index);
-                else
-                    return this._field[index];
-            }
-        }
-    }
-
-    // we only (need to) go two levels deep, so this is the last one, I promise
-    struct DoubleIndexedField(string name) {
-        mixin IndexedFieldBoilerplate!(SingleIndexedField!name);
-    }
-
-    // boilerplate for the comptime interface and dispatching of indexed fields
-    mixin template IndexedFieldBoilerplate(BaseWrapper) {
-     private:
-        alias HandleType = NodeHandle;
-        enum field = name;
-        alias FieldType = Unconst!(typeof(this._field));
-
-        BaseWrapper base;
-        size_t index;
-
-     @nogc nothrow:
-        @property auto ref _field() inout pure {
-            return mixin(`this.base._field`)[this.index];
-        }
-
-     public:
-        // we *mostly* only allow const acces ...
-        auto ref opDispatch(string member, Args...)(auto ref Args args) const
-        if (canAccess!(FieldType, member) && member != "opIndex")
-        {
-            return mixin(`this._field.` ~ member)(forward!args);
-        }
-
-        // .. except for kind assignment on some edge slots
-        auto ref opDispatch(string member)(EdgeKind kind)
-        if (canAccess!(FieldType, member) && canMutateSlotKind!(HandleType.NodeType, FieldType))
-        {
-            return mixin(`this._field.` ~ member)(kind);
-        }
-    }
+    // assert(graph.exported == 1);
 }

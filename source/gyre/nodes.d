@@ -1387,7 +1387,7 @@ See_Also: [UndefinedNode]
 @mnemonic("const_") struct ConstantNode {
     mixin NodeInheritance;
 
-    // FIXME: temporary assumption that all types are i64
+    // TCC: temporary assumption that all types are i64
     ulong literal;
 
     /// The constant's (run-time) value.
@@ -1555,7 +1555,7 @@ See_Also: [ConstantNode]
 @nogc nothrow unittest { nodeTest!UndefinedNode(); }
 
 /// Yields the lowermost bits of its input.
-@mnemonic("trunc") struct TruncationNode { // FIXME: doesn't make sense without type info
+@mnemonic("trunc") struct TruncationNode { // TCC: doesn't make sense without type info
     mixin NodeInheritance;
 
     /// Bit pattern being truncated.
@@ -1638,7 +1638,7 @@ Yields a wider version of its input, with added bits set to zero.
 
 See_Also: [SignedExtensionNode]
 +/
-@mnemonic("extu") struct UnsignedExtensionNode { // FIXME: doesn't make sense without type info
+@mnemonic("extu") struct UnsignedExtensionNode { // TCC: doesn't make sense without type info
     mixin NodeInheritance;
 
     /// Bit pattern being extended.
@@ -1721,7 +1721,7 @@ Yields a wider version of its input, with added bits equal to the input's sign b
 
 See_Also: [UnsignedExtensionNode]
 +/
-@mnemonic("exts") struct SignedExtensionNode { // FIXME: doesn't make sense without type info
+@mnemonic("exts") struct SignedExtensionNode { // TCC: doesn't make sense without type info
     mixin NodeInheritance;
 
     /// Bit pattern being extended.
@@ -4041,6 +4041,6 @@ There is no equivalent for `<=` because it suffices to swap this node's operands
 @nogc nothrow unittest { nodeTest!SignedGreaterOrEqualNode(); }
 
 
-// TODO: type ops
+// TCC: type ops
 
-// TODO: mem ops
+// TCC: mem ops

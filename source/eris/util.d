@@ -130,7 +130,7 @@ if (!is(T == class) && !(is(T == interface)))
             this.store = null;
         }
 
-        void initialize(A...)(auto ref A args) nothrow out (; this.isInitialized) {
+        void initialize(A...)(auto ref A args) nothrow {
             import core.lifetime : emplace, forward;
             this.allocateStore();
             emplace(&this.store.payload, forward!args);
