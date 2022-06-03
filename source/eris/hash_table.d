@@ -12,7 +12,7 @@ module eris.hash_table;
 import core.stdc.errno : ENOMEM, EINVAL, EOVERFLOW;
 import std.algorithm.mutation : moveEmplace, swap;
 import std.math.traits : isPowerOf2;
-import std.traits : Parameters, ReturnType;
+import std.traits : Parameters, ReturnType, hasElaborateDestructor;
 
 import eris.core : allocate, deallocate, err_t, hash_t, Unit;
 import eris.rational : Rational;
@@ -140,6 +140,9 @@ struct UnsafeHashMap(Key, Value) {
     }
 
  public:
+    /// Initializes a new table with a certain preallocated capacity.
+    this(size_t capacity) { this.initialize(capacity); }
+
     version (D_BetterC) {} else {
         string toString() const {
             import std.array : appender;
@@ -306,7 +309,7 @@ struct UnsafeHashMap(Key, Value) {
     void dispose() nothrow @system
     out (; this.capacity == 0)
     {
-        this.clear();
+        static if (hasElaborateDestructor!Key || hasElaborateDestructor!Value) this.clear();
         static if (Value.sizeof > 0) deallocate(this.values[0 .. this.allocated]);
         this.buckets.deallocate();
         this = UnsafeHashMap.init;
@@ -701,9 +704,8 @@ struct UnsafeHashMap(Key, Value) {
 @nogc nothrow unittest {
     UnsafeHashMap!(char, long) outer;
     {
-        UnsafeHashMap!(char, long) inner;
+        auto inner = UnsafeHashMap!(char, long)(42);
         scope(exit) inner.dispose();
-        inner.rehash(42);
         outer = inner; // but be careful with shallow copies
     }
     // outer.dispose(); // would have caused a double free: `dispose` is unsafe!
@@ -786,7 +788,8 @@ alias UnsafeHashSet(T) = UnsafeHashMap!(T, Unit);
     static immutable long[6] list = [0, 1, 42, 32_767, -32_768, 0];
     enum N = list.length;
 
-    HashSet!long a, b;
+    auto a = HashSet!long(N);
+    auto b = HashSet!long();
     a.rehash(N);
     assert(a.capacity == N);
     foreach (n; list) a.add(n);
@@ -867,6 +870,11 @@ struct HashMap(Key, Value) {
     }
 
  public:
+    this(size_t capacity) {
+        this.ensureInitialized();
+        this.impl.initialize(capacity);
+    }
+
     void opAssign(HashMap other) {
         this.rc = other.rc;
     }

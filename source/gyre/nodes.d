@@ -41,8 +41,11 @@ If we assume that `<<` can overflow (i.e. `x` has a non-zero MSB which is being 
 +/
 module gyre.nodes;
 
+// yes, this is a big file. but notice that that's because we have a bunch of
+// nodes with a certain interface and each one takes about 100 LoC to implement
+
 import core.stdc.errno : EINVAL, ENOMEM;
-import std.algorithm.mutation : moveEmplace;
+import core.lifetime : forward, emplace;
 import std.bitmanip : taggedPointer;
 import std.traits :
     EnumMembers, Parameters,
@@ -84,7 +87,6 @@ private mixin template StaticEdgeFactories() {
         mixin(
             `@nogc nothrow pure
             static typeof(this) ` ~ __traits(identifier, EnumMembers!EdgeKind[kind]) ~ `(Args...)(auto ref Args args) {
-                import core.lifetime : forward;
                 return typeof(this)(
                     EdgeKind.` ~ __traits(identifier, EnumMembers!EdgeKind[kind]) ~ `,
                     forward!args
@@ -213,9 +215,7 @@ struct InEdge {
     hash_t toHash() const
     in (this.owner != null, "can't use an uninitialized in-edge")
     {
-        hash_t hash = this.kind.hashOf ^ this.id.hashOf;
-        hash ^= this.owner.toHash();
-        return hash;
+        return this.id.hashOf ^ this.owner.toHash();
     }
 }
 
@@ -267,8 +267,22 @@ struct Node {
     }
 
     struct CommonPrefix {
-        immutable(VTable)* vptr;
+        mixin(taggedPointer!(
+            immutable(VTable)*, "vptr",
+            // GC bits
+            bool, "isForwarding", 1,
+            bool, "wasVisited", 1,
+        ));
         hash_t hash;
+
+     @nogc nothrow pure:
+        @property inout(Node)* forwardingPointer() inout in (this.isForwarding) {
+            return cast(inout(Node)*)this.vptr;
+        }
+
+        @property void forwardingPointer(Node* newAddress) in (this.isForwarding) {
+            this.vptr = cast(immutable(VTable)*)newAddress;
+        }
     }
 
     CommonPrefix _node;
@@ -315,7 +329,7 @@ struct Node {
     /++
     Fetches a specific in-edge slot in this node.
 
-    NOTE: When nodes are initialized, they must identify each of their [InEdge]s with a unique id.
+    NOTE: When nodes are initialized, they must identify each of their [InEdge]s with a unique ID.
 
     Params:
         slot = Unique identifier for the in-edge slot within this node.
@@ -323,7 +337,9 @@ struct Node {
     Returns:
         A pointer to the identified in-edge, or `null` if it doesn't exist.
     +/
-    InEdge* opIndex(InEdge.ID slot) {
+    InEdge* opIndex(InEdge.ID slot)
+    return // XXX: fuck v2.100.0
+    {
         return this.vptr.opIndex(&this, slot);
     }
 }
@@ -331,7 +347,9 @@ struct Node {
 private mixin template NodeInheritance() {
     private alias This = typeof(this);
 
-    package Node.CommonPrefix _node = { vptr: &vtbl };
+    // XXX: since we can't statically initialize a taggedPointer, a stack-allocated
+    // node cannot be safely used before it is explicitly initialized ...
+    package Node.CommonPrefix _node;
     alias _node this;
 
     package static immutable(Node.VTable) vtbl = {
@@ -376,7 +394,8 @@ private mixin template NodeInheritance() {
         );
 
         inout(Node)* asNode() inout
-        return // XXX: `return` annotation needed in DMD 2.100.0
+        return // XXX: fuck v2.100.0
+        in (!this.isForwarding, "can't upcast a broken heart")
         in (this.vptr == &vtbl, "can't upcast an uninitialized node")
         {
             return cast(inout(Node)*)&this._node;
@@ -410,7 +429,10 @@ version (unittest) private { // for some reason, this needs to be in global scop
         int value;
 
      @nogc nothrow pure:
-        this(int value) { this.value = value; }
+        this(int value) {
+            this.vptr = &UnittestNode.vtbl;
+            this.value = value;
+        }
 
         bool opEquals(ref const(UnittestNode) rhs) const {
             debug usingCustomEquals = true;
@@ -422,7 +444,9 @@ version (unittest) private { // for some reason, this needs to be in global scop
             return this.value;
         }
 
-        inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+        inout(InEdge)* opIndex(InEdge.ID slot) inout pure
+        return // XXX: fuck v2.100.0
+        {
             return null;
         }
 
@@ -512,12 +536,20 @@ private void nodeTest(NodeType)(
     Parameters!(NodeType.initialize)[1 .. $] args,
     scope void delegate(ref NodeType node) @nogc nothrow test = (ref NodeType node){}
 ) @nogc nothrow {
+    import std.algorithm.mutation : moveEmplace;
+
     // initialize one guy
     NodeType tmp = void;
     NodeType.initialize(&tmp, args);
+
+    // sanity check: after initialization, GC bits are unset
+    assert(!tmp.wasVisited);
+    assert(!tmp.isForwarding);
+
     // move it
     NodeType node = void;
     moveEmplace(tmp, node);
+
     // check if everything is fine
     assert(node == node);
     foreach (ref inEdge; node.inEdges) {
@@ -525,6 +557,7 @@ private void nodeTest(NodeType)(
         assert(&inEdge == node[inEdge.id]);
     }
     test(node);
+
     // free it on scope exit (and the second free should be a no-op)
     scope(exit) {
         NodeType.dispose(&node);
@@ -657,7 +690,9 @@ See_Also: [InstantiationNode], [JumpNode], [ForkNode]
     }
 
     ///
-    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
+    return // XXX: fuck v2.100.0
+    {
         if (slot == 0) return &this.definition;
 
         // fast path: single-channel join
@@ -795,7 +830,9 @@ See_Also: [JoinNode], [JumpNode]
     }
 
     ///
-    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
+    return // XXX: fuck v2.100.0
+    {
         if (slot >= this.continuations.length) return null;
         return &this.continuations[slot];
     }
@@ -922,7 +959,9 @@ See_Also: [JoinNode]
     }
 
     ///
-    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
+    return // XXX: fuck v2.100.0
+    {
         return slot == 0 ? &this.control : null;
     }
 
@@ -1043,7 +1082,9 @@ See_Also: [JoinNode], [JumpNode]
     }
 
     ///
-    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
+    return // XXX: fuck v2.100.0
+    {
         return slot == 0 ? &this.control : null;
     }
 
@@ -1143,9 +1184,8 @@ See_Also: [MultiplexerNode]
 
         self._options = allocate!(UnsafeHashMap!(ulong, OutEdge));
         if (self._options == null) return ENOMEM;
-        self.options = UnsafeHashMap!(ulong, OutEdge).init;
-        const error = self.options.rehash(n);
-        if (error) {
+        emplace(self._options, n);
+        if (self.options.capacity < n) {
             deallocate(self._options);
             self._options = null;
             return ENOMEM;
@@ -1178,7 +1218,9 @@ See_Also: [MultiplexerNode]
     }
 
     ///
-    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
+    return // XXX: fuck v2.100.0
+    {
         return slot == 0 ? &this.control : null;
     }
 
@@ -1328,7 +1370,9 @@ It is this identification which allows the compiler to, later in the compilation
     }
 
     ///
-    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
+    return // XXX: fuck v2.100.0
+    {
         if (slot >= this.inSlots.length) return null;
         return &this.inSlots[slot];
     }
@@ -1434,7 +1478,9 @@ See_Also: [UndefinedNode]
     }
 
     ///
-    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
+    return // XXX: fuck v2.100.0
+    {
         return slot == 0 ? &this.value : null;
     }
 
@@ -1525,7 +1571,9 @@ See_Also: [ConstantNode]
     }
 
     ///
-    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
+    return // XXX: fuck v2.100.0
+    {
         return slot == 0 ? &this.value : null;
     }
 
@@ -1600,7 +1648,9 @@ See_Also: [ConstantNode]
     }
 
     ///
-    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
+    return // XXX: fuck v2.100.0
+    {
         return slot == 0 ? &this.output : null;
     }
 
@@ -1683,7 +1733,9 @@ See_Also: [SignedExtensionNode]
     }
 
     ///
-    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
+    return // XXX: fuck v2.100.0
+    {
         return slot == 0 ? &this.output : null;
     }
 
@@ -1766,7 +1818,9 @@ See_Also: [UnsignedExtensionNode]
     }
 
     ///
-    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
+    return // XXX: fuck v2.100.0
+    {
         return slot == 0 ? &this.output : null;
     }
 
@@ -1856,9 +1910,8 @@ See_Also: [ConditionalNode]
 
         self._inputs = allocate!(UnsafeHashMap!(ulong, OutEdge));
         if (self._inputs == null) return ENOMEM;
-        self.inputs = UnsafeHashMap!(ulong, OutEdge).init;
-        const error = self.inputs.rehash(n);
-        if (error) {
+        emplace(self._inputs, n);
+        if (self.inputs.capacity < n) {
             deallocate(self._inputs);
             self._inputs = null;
             return ENOMEM;
@@ -1887,7 +1940,9 @@ See_Also: [ConditionalNode]
     }
 
     ///
-    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
+    return // XXX: fuck v2.100.0
+    {
         return slot == 0 ? &this.output : null;
     }
 
@@ -1983,7 +2038,9 @@ See_Also: [ConditionalNode]
     }
 
     ///
-    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
+    return // XXX: fuck v2.100.0
+    {
         return slot == 0 ? &this.result : null;
     }
 
@@ -2068,7 +2125,9 @@ See_Also: [ConditionalNode]
     }
 
     ///
-    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
+    return // XXX: fuck v2.100.0
+    {
         return slot == 0 ? &this.result : null;
     }
 
@@ -2157,7 +2216,9 @@ Can be used as a unary `NOT` operation when one operand is an all-ones constant.
     }
 
     ///
-    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
+    return // XXX: fuck v2.100.0
+    {
         return slot == 0 ? &this.result : null;
     }
 
@@ -2251,7 +2312,9 @@ See_Also: [LeftShiftNoOverflowNode]
     }
 
     ///
-    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
+    return // XXX: fuck v2.100.0
+    {
         return slot == 0 ? &this.output : null;
     }
 
@@ -2347,7 +2410,9 @@ See_Also: [LeftShiftNode]
     }
 
     ///
-    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
+    return // XXX: fuck v2.100.0
+    {
         return slot == 0 ? &this.output : null;
     }
 
@@ -2441,7 +2506,9 @@ See_Also: [SignedRightShiftNode]
     }
 
     ///
-    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
+    return // XXX: fuck v2.100.0
+    {
         return slot == 0 ? &this.output : null;
     }
 
@@ -2535,7 +2602,9 @@ See_Also: [UnsignedRightShiftNode]
     }
 
     ///
-    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
+    return // XXX: fuck v2.100.0
+    {
         return slot == 0 ? &this.output : null;
     }
 
@@ -2626,7 +2695,9 @@ See_Also: [AdditionNoOverflowSignedNode]
     }
 
     ///
-    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
+    return // XXX: fuck v2.100.0
+    {
         return slot == 0 ? &this.result : null;
     }
 
@@ -2717,7 +2788,9 @@ See_Also: [AdditionNode]
     }
 
     ///
-    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
+    return // XXX: fuck v2.100.0
+    {
         return slot == 0 ? &this.result : null;
     }
 
@@ -2811,7 +2884,9 @@ See_Also: [SubtractionNoOverflowSignedNode]
     }
 
     ///
-    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
+    return // XXX: fuck v2.100.0
+    {
         return slot == 0 ? &this.result : null;
     }
 
@@ -2905,7 +2980,9 @@ See_Also: [SubtractionNode]
     }
 
     ///
-    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
+    return // XXX: fuck v2.100.0
+    {
         return slot == 0 ? &this.result : null;
     }
 
@@ -2997,7 +3074,9 @@ See_Also: [MultiplicationNoOverflowSignedNode]
     }
 
     ///
-    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
+    return // XXX: fuck v2.100.0
+    {
         return slot == 0 ? &this.result : null;
     }
 
@@ -3088,7 +3167,9 @@ See_Also: [MultiplicationNode]
     }
 
     ///
-    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
+    return // XXX: fuck v2.100.0
+    {
         return slot == 0 ? &this.result : null;
     }
 
@@ -3182,7 +3263,9 @@ See_Also: [SignedDivisionNode]
     }
 
     ///
-    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
+    return // XXX: fuck v2.100.0
+    {
         return slot == 0 ? &this.quotient : null;
     }
 
@@ -3277,7 +3360,9 @@ See_Also: [UnsignedDivisionNode]
     }
 
     ///
-    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
+    return // XXX: fuck v2.100.0
+    {
         return slot == 0 ? &this.quotient : null;
     }
 
@@ -3371,7 +3456,9 @@ See_Also: [SignedRemainderNode]
     }
 
     ///
-    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
+    return // XXX: fuck v2.100.0
+    {
         return slot == 0 ? &this.remainder : null;
     }
 
@@ -3466,7 +3553,9 @@ See_Also: [UnsignedRemainderNode]
     }
 
     ///
-    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
+    return // XXX: fuck v2.100.0
+    {
         return slot == 0 ? &this.remainder : null;
     }
 
@@ -3551,7 +3640,9 @@ See_Also: [UnsignedRemainderNode]
     }
 
     ///
-    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
+    return // XXX: fuck v2.100.0
+    {
         return slot == 0 ? &this.result : null;
     }
 
@@ -3636,7 +3727,9 @@ See_Also: [UnsignedRemainderNode]
     }
 
     ///
-    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
+    return // XXX: fuck v2.100.0
+    {
         return slot == 0 ? &this.result : null;
     }
 
@@ -3728,7 +3821,9 @@ There is no equivalent for `>` because it suffices to swap this node's operands.
     }
 
     ///
-    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
+    return // XXX: fuck v2.100.0
+    {
         return slot == 0 ? &this.result : null;
     }
 
@@ -3820,7 +3915,9 @@ There is no equivalent for `>` because it suffices to swap this node's operands.
     }
 
     ///
-    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
+    return // XXX: fuck v2.100.0
+    {
         return slot == 0 ? &this.result : null;
     }
 
@@ -3912,7 +4009,9 @@ There is no equivalent for `<=` because it suffices to swap this node's operands
     }
 
     ///
-    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
+    return // XXX: fuck v2.100.0
+    {
         return slot == 0 ? &this.result : null;
     }
 
@@ -4004,7 +4103,9 @@ There is no equivalent for `<=` because it suffices to swap this node's operands
     }
 
     ///
-    inout(InEdge)* opIndex(InEdge.ID slot) inout pure {
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
+    return // XXX: fuck v2.100.0
+    {
         return slot == 0 ? &this.result : null;
     }
 
