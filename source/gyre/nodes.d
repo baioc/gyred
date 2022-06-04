@@ -42,10 +42,10 @@ If we assume that `<<` can overflow (i.e. `x` has a non-zero MSB which is being 
 module gyre.nodes;
 
 // yes, this is a big file. but notice that that's because we have a bunch of
-// nodes with a certain interface and each one takes about 100 LoC to implement
+// nodes with a certain interface and each one takes about 100 lines to implement
 
 import core.stdc.errno : EINVAL, ENOMEM;
-import core.lifetime : forward, emplace;
+import core.lifetime : forward, emplace, moveEmplace;
 import std.bitmanip : taggedPointer;
 import std.traits :
     EnumMembers, Parameters,
@@ -127,17 +127,21 @@ struct OutEdge {
     An out-edge slot is only equivalent to another if they point to equal [InEdge] slots.
     +/
     bool opEquals(const(OutEdge) other) const
-    in (this.target == null || this.target.kind == this.kind, "edge slot kind mismatch")
+    in (this.validateUse() && other.validateUse())
     {
         if (this is other) return true;
-        if (this.kind != other.kind) return false;
-        if (this.target == null || other.target == null) return false;
         return *this.target == *other.target;
     }
 
-    hash_t toHash() const {
-        if (this.target == null) return this.kind.hashOf;
+    /// Forwards to the target [InEdge].
+    hash_t toHash() const in (this.validateUse()) {
         return this.target.toHash();
+    }
+
+    private bool validateUse() const {
+        assert(this.target != null, "can't traverse a null out-edge");
+        assert(this.target.kind == this.kind, "edge slot kind mismatch");
+        return true;
     }
 }
 
@@ -149,10 +153,8 @@ struct OutEdge {
     // data edges are directed from uses to defs
     use1.target = &def;
     use2.target = &def;
-    assert(use1 == use2);
 }
 
-/// Out-edges are essentially pointers:
 @nogc nothrow pure unittest {
     static assert(OutEdge.sizeof <= (InEdge*).sizeof);
 }
@@ -174,7 +176,7 @@ struct InEdge {
     ));
 
     ID _id;
-    alias ID = ushort;
+    alias ID = ushort; ///
 
  pragma(inline) @nogc nothrow pure:
     @property ID id() const { return this._id; }
@@ -205,17 +207,21 @@ struct InEdge {
     We approximate this by checking that the slots' owner nodes are equal AND the slots are in a corresponding position in their respective owner (i.e. they stand for the same thing inside that node).
     +/
     bool opEquals(ref const(InEdge) other) const
-    in (this.owner != null && other.owner != null, "can't use an uninitialized in-edge")
+    in (this.validateUse() && other.validateUse())
     {
         if (this.kind != other.kind) return false;
         if (this.id != other.id) return false;
         return *this.owner == *other.owner;
     }
 
-    hash_t toHash() const
-    in (this.owner != null, "can't use an uninitialized in-edge")
-    {
+    /// Mixes edge slot id and its owner node's hash.
+    hash_t toHash() const in (this.validateUse()) {
         return this.id.hashOf ^ this.owner.toHash();
+    }
+
+    private bool validateUse() const {
+        assert(this.owner != null, "can't use an uninitialized in-edge");
+        return true;
     }
 }
 
@@ -250,10 +256,10 @@ Therefore, a node's hash value better reflect its semantic structure: having equ
 Now, computing a node's hash value becomes an expensive operation as well, but fortunately it can be cached once a node's structure has stabilized.
 
 $(SMALL_TABLE
-    Name        | Type              | Description
+    Member      | Type              | Description
     ------------|-------------------|------------
     `hash`      | `hash_t`          | A node's cached hash value. This is what gets returned when `toHash` is called on a generic [Node], so it should be updated (see [updateHash]) whenever a node's semantic structure stabilizes.
-    `asNode`    | `ref T -> Node*`  | Method which upcasts (and this always works) a concrete node `ref` to a generic `Node*`.
+    `asNode`    | `ref T -> Node*`  | Method which upcasts a concrete node `ref` to a generic `Node*`. Always works for initialized nodes.
     `ofNode`    | `Node* -> T*`     | Static method which tries to downcast a generic `Node*` to a pointer to a concrete type, returning `null` when the cast would have resulted in an invalid reference (so this is technically type-safe).
 )
 +/
@@ -268,7 +274,7 @@ struct Node {
 
     struct CommonPrefix {
         mixin(taggedPointer!(
-            immutable(VTable)*, "vptr",
+            immutable(VTable)*, "_vptr",
             // GC bits
             bool, "isForwarding", 1,
             bool, "wasVisited", 1,
@@ -276,12 +282,22 @@ struct Node {
         hash_t hash;
 
      @nogc nothrow pure:
-        @property inout(Node)* forwardingPointer() inout in (this.isForwarding) {
-            return cast(inout(Node)*)this.vptr;
+        @property immutable(VTable)* vptr() inout in (!this.isForwarding) {
+            return this._vptr;
         }
 
-        @property void forwardingPointer(Node* newAddress) in (this.isForwarding) {
-            this.vptr = cast(immutable(VTable)*)newAddress;
+        @property void vptr(immutable(VTable)* vptr) out (; !this.isForwarding) {
+            this.isForwarding = false;
+            this._vptr = vptr;
+        }
+
+        @property inout(Node)* forwardingPointer() inout in (this.isForwarding) {
+            return cast(inout(Node)*)this._vptr;
+        }
+
+        @property void forwardingPointer(Node* newAddress) out (; this.isForwarding) {
+            this.isForwarding = true;
+            this._vptr = cast(immutable(VTable)*)newAddress;
         }
     }
 
@@ -291,7 +307,7 @@ struct Node {
     static assert(
         Node.sizeof == Node.CommonPrefix.sizeof && Node.alignof == Node.CommonPrefix.alignof &&
         is(typeof(Node._node) == Node.CommonPrefix) && Node._node.offsetof == 0,
-        "`Node` and `Node.CommonPrefix` must be binary-interchangeable"
+        "`Node` and `Node.CommonPrefix` must be completely interchangeable in memory"
     );
 
  public pragma(inline) @nogc nothrow pure:
@@ -330,6 +346,7 @@ struct Node {
     Fetches a specific in-edge slot in this node.
 
     NOTE: When nodes are initialized, they must identify each of their [InEdge]s with a unique ID.
+    Our graph takes advantage of this method when rewiring edges between different nodes.
 
     Params:
         slot = Unique identifier for the in-edge slot within this node.
@@ -411,9 +428,10 @@ private mixin template NodeInheritance() {
             "all nodes must provide iterators for their out-edge and in-edge slots"
         );
 
-        /// Post-move adjusts in-edge slots' self-pointer.
+        /// Post-move adjusts in-edge slots' owner pointer.
         void opPostMove(ref const(This) old) pure {
-            foreach (ref slot; this.inEdges!(int delegate(ref InEdge) @nogc nothrow pure)) {
+            alias pureCallable = int delegate(ref InEdge) @nogc nothrow pure;
+            foreach (ref slot; this.inEdges!pureCallable) {
                 slot.owner = this.asNode;
             }
         }
@@ -444,6 +462,7 @@ version (unittest) private { // for some reason, this needs to be in global scop
             return this.value;
         }
 
+        /// See [Node.opIndex].
         inout(InEdge)* opIndex(InEdge.ID slot) inout pure
         return // XXX: fuck v2.100.0
         {
@@ -501,71 +520,68 @@ version (unittest) private { // for some reason, this needs to be in global scop
 }
 
 
-/// Iterates (with `foreach`) over a node's out-edges.
-struct OutEdgeIterator(Callable) if (is(Parameters!Callable[0] : const(OutEdge))) {
-    private alias Dispatch = SetFunctionAttributes!(
-        int delegate(Node*, scope Callable),
-        functionLinkage!Callable,
-        functionAttributes!Callable
-    );
-    private Node* _node;
-    private Dispatch _opApply;
-    ///
-    int opApply(scope Callable iter) {
-        return this._opApply(this._node, iter);
+// boilerplate reducers
+private {
+    mixin template EdgeSlotIterator(Callable) {
+        private alias Dispatch = SetFunctionAttributes!(
+            int function(Node*, scope Callable),
+            functionLinkage!Callable,
+            functionAttributes!Callable
+        );
+        private Node* _node;
+        private Dispatch _opApply;
+        ///
+        int opApply(scope Callable iter) {
+            return this._opApply(this._node, iter);
+        }
     }
+
+    private void nodeTest(NodeType)(
+        Parameters!(NodeType.initialize)[1 .. $] args,
+        scope void delegate(ref NodeType node) @nogc nothrow test = (ref NodeType node){}
+    ) @nogc nothrow {
+        // initialize one guy
+        NodeType tmp = void;
+        NodeType.initialize(&tmp, args);
+
+        // sanity check: after initialization, GC bits are unset
+        assert(!tmp.wasVisited);
+        assert(!tmp.isForwarding);
+
+        // move it
+        NodeType node = void;
+        moveEmplace(tmp, node);
+
+        // check if everything is fine
+        foreach (ref inEdge; node.inEdges) {
+            assert(inEdge.owner == node.asNode);
+            assert(&inEdge == node[inEdge.id]);
+        }
+        test(node);
+
+        // free it on scope exit (and the second free should be a no-op)
+        scope(exit) {
+            NodeType.dispose(&node);
+            NodeType.dispose(&node);
+        }
+    }
+}
+
+/// Iterates (with `foreach`) over a node's out-edges.
+struct OutEdgeIterator(Callable)
+if (is(Parameters!Callable[0] : const(OutEdge)))
+{
+    mixin EdgeSlotIterator!Callable;
 }
 
 /// Iterates (with `foreach`) over a node's in-edges.
-struct InEdgeIterator(Callable) if (is(Parameters!Callable[0] : const(InEdge))) {
-    private alias Dispatch = SetFunctionAttributes!(
-        int delegate(Node*, scope Callable),
-        functionLinkage!Callable,
-        functionAttributes!Callable
-    );
-    private Node* _node;
-    private Dispatch _opApply;
-    ///
-    int opApply(scope Callable iter) {
-        return this._opApply(this._node, iter);
-    }
+struct InEdgeIterator(Callable)
+if (is(Parameters!Callable[0] : const(InEdge)))
+{
+    mixin EdgeSlotIterator!Callable;
 }
 
-// common boilerplate for node unittest
-private void nodeTest(NodeType)(
-    Parameters!(NodeType.initialize)[1 .. $] args,
-    scope void delegate(ref NodeType node) @nogc nothrow test = (ref NodeType node){}
-) @nogc nothrow {
-    import std.algorithm.mutation : moveEmplace;
-
-    // initialize one guy
-    NodeType tmp = void;
-    NodeType.initialize(&tmp, args);
-
-    // sanity check: after initialization, GC bits are unset
-    assert(!tmp.wasVisited);
-    assert(!tmp.isForwarding);
-
-    // move it
-    NodeType node = void;
-    moveEmplace(tmp, node);
-
-    // check if everything is fine
-    assert(node == node);
-    foreach (ref inEdge; node.inEdges) {
-        assert(inEdge.owner == node.asNode);
-        assert(&inEdge == node[inEdge.id]);
-    }
-    test(node);
-
-    // free it on scope exit (and the second free should be a no-op)
-    scope(exit) {
-        NodeType.dispose(&node);
-        NodeType.dispose(&node);
-    }
-}
-
-
+/// See [gyre.mnemonics].
 package struct mnemonic { string shorthand; }
 
 
@@ -582,7 +598,7 @@ Therefore, a join node behaves like the entry block of a CFG, but with a collect
 RULE: Gyre graphs can be cyclic, but only if every cycle goes through a join node.
 This is similar to having a DFG with SSA phis, in which data-flow can still be considered causal as long as every cycle goes through one or more phi nodes to indicate a "temporal" control-flow dependency.
 
-Since join nodes define subprocedures, one may want to know where such a definitions begins and ends.
+Since join nodes define blocks/subprocedures, one may want to know where such a definitions begins and ends.
 A join node's scope begins with all of its parameters and control flow edges.
 Furthermore, whenever another node is connected to part of a join node's scope, it also becomes part of that scope.
 In other words: a join node's scope is implicitly defined by the set of nodes which (a) are transitively reachable by control flow in its body or (b) have a transitive dependency on any one of its parameters.
@@ -675,10 +691,10 @@ See_Also: [InstantiationNode], [JumpNode], [ForkNode]
     NOTE: We use join nodes as cycle breakers when doing structural comparison (since that's a cheap way to avoid infinite recursion), therefore the cycle rule MUST be maintained by container graphs.
     +/
     bool opEquals(ref const(JoinNode) rhs) const pure {
-        return this.asNode == rhs.asNode; // self-ptr
+        return this is rhs; // "I'm only equal to myself"
     }
 
-    ///
+    /// Semantic hash. Depends only on channel slot kinds.
     hash_t toHash() const pure {
         hash_t hash = 0;
         foreach (parameters; channels) {
@@ -689,7 +705,7 @@ See_Also: [InstantiationNode], [JumpNode], [ForkNode]
         return hash;
     }
 
-    ///
+    /// See [Node.opIndex].
     inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
@@ -702,7 +718,7 @@ See_Also: [InstantiationNode], [JumpNode], [ForkNode]
             else return &this.channels[0][i];
         }
 
-        // slow path: index a rigged array
+        // slow path: linear index on a rigged array
         foreach (parameters; this.channels) {
             foreach (ref param; parameters) {
                 if (param.id == slot) return &param;
@@ -821,15 +837,15 @@ See_Also: [JoinNode], [JumpNode]
     If this weren't the case, there would be no way to instantiate a join pattern twice and use the two instances independently.
     +/
     bool opEquals(ref const(InstantiationNode) rhs) const pure {
-        return this.asNode == rhs.asNode; // self-ptr
+        return this is rhs; // "I'm only equal to myself"
     }
 
-    ///
+    /// Semantic hash. Depends on the number of continuations instantiated by this node.
     hash_t toHash() const pure {
         return continuations.length.hashOf;
     }
 
-    ///
+    /// See [Node.opIndex].
     inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
@@ -890,7 +906,7 @@ This is not unlike what we (implicitly) assume of normal functions: their return
 Jumps synchronize with each other when they cause a multiple-channel join pattern to trigger.
 Imagine a set of concurrent processes, each carrying a continuation corresponding to a different channel of some join pattern; once they've all jumped into their respective continuations, the join triggers and its body executes.
 Then, every event in those processes which happens before the jump, also happens before all events in the triggered join pattern's body.
-Note that this does not apply to single-channel join patterns.
+Notice that this does not necessarily apply to single-channel join patterns.
 
 See_Also: [JoinNode]
 +/
@@ -951,14 +967,14 @@ See_Also: [JoinNode]
         return true;
     }
 
-    ///
+    /// Semantic hash.
     hash_t toHash() const pure {
         hash_t hash = this.continuation.toHash();
         foreach (arg; this.arguments) hash -= arg.toHash();
         return hash;
     }
 
-    ///
+    /// See [Node.opIndex].
     inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
@@ -1074,14 +1090,14 @@ See_Also: [JoinNode], [JumpNode]
         return true;
     }
 
-    ///
+    /// Semantic hash.
     hash_t toHash() const pure {
         hash_t hash = 0;
         foreach (thread; this.threads) hash -= thread.toHash();
         return hash;
     }
 
-    ///
+    /// See [Node.opIndex].
     inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
@@ -1212,12 +1228,12 @@ See_Also: [MultiplexerNode]
         return true;
     }
 
-    ///
+    /// Semantic hash.
     hash_t toHash() const pure {
         return this.selector.toHash() ^ this.options.toHash();
     }
 
-    ///
+    /// See [Node.opIndex].
     inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
@@ -1296,7 +1312,7 @@ It is this identification which allows the compiler to, later in the compilation
 
     /// Links this macro node to its external definition.
     ID id;
-    alias ID = ushort; /// ditto
+    alias ID = ushort; ///
 
     /// Edges (any kind) which point out from this node.
     OutEdge[] outSlots;
@@ -1357,19 +1373,19 @@ It is this identification which allows the compiler to, later in the compilation
     Since macro nodes can expand into arbitrary subgraphs, we treat each one individually.
     +/
     bool opEquals(ref const(MacroNode) rhs) const pure {
-        return this.id == rhs.id && this.asNode == rhs.asNode; // self-ptr
+        return this is rhs; // "I'm only equal to myself"
     }
 
-    /++
-    Hash function.
-
-    Depends only on this macro node's identifier.
-    +/
+    /// Semantic hash. Depends on this macro node's identifier and its in-slots' kinds.
     hash_t toHash() const pure {
-        return this.id.hashOf;
+        hash_t hash = 0;
+        foreach (inEdge; this.inSlots) {
+            hash -= inEdge.kind.hashOf;
+        }
+        return hash ^ this.id.hashOf;
     }
 
-    ///
+    /// See [Node.opIndex].
     inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
@@ -1472,12 +1488,12 @@ See_Also: [UndefinedNode]
         return this.literal == rhs.literal;
     }
 
-    ///
+    /// Semantic hash.
     hash_t toHash() const pure {
         return this.literal.hashOf;
     }
 
-    ///
+    /// See [Node.opIndex].
     inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
@@ -1565,12 +1581,12 @@ See_Also: [ConstantNode]
         return this.asNode == rhs.asNode; // self-ptr
     }
 
-    ///
+    /// Semantic hash.
     hash_t toHash() const pure {
         return hash_t.max;
     }
 
-    ///
+    /// See [Node.opIndex].
     inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
@@ -1642,12 +1658,12 @@ See_Also: [ConstantNode]
         return this.input == rhs.input;
     }
 
-    ///
+    /// Semantic hash.
     hash_t toHash() const pure {
         return this.input.toHash();
     }
 
-    ///
+    /// See [Node.opIndex].
     inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
@@ -1727,12 +1743,12 @@ See_Also: [SignedExtensionNode]
         return this.input == rhs.input;
     }
 
-    ///
+    /// Semantic hash.
     hash_t toHash() const pure {
         return this.input.toHash();
     }
 
-    ///
+    /// See [Node.opIndex].
     inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
@@ -1812,12 +1828,12 @@ See_Also: [UnsignedExtensionNode]
         return this.input == rhs.input;
     }
 
-    ///
+    /// Semantic hash.
     hash_t toHash() const pure {
         return this.input.toHash();
     }
 
-    ///
+    /// See [Node.opIndex].
     inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
@@ -1934,12 +1950,12 @@ See_Also: [ConditionalNode]
         return true;
     }
 
-    ///
+    /// Semantic hash.
     hash_t toHash() const pure {
         return this.selector.toHash() ^ this.inputs.toHash();
     }
 
-    ///
+    /// See [Node.opIndex].
     inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
@@ -2032,12 +2048,12 @@ See_Also: [ConditionalNode]
             || (this.lhs == other.rhs && this.rhs == other.lhs);
     }
 
-    ///
+    /// Semantic hash.
     hash_t toHash() const pure {
         return this.lhs.toHash() ^ this.rhs.toHash();
     }
 
-    ///
+    /// See [Node.opIndex].
     inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
@@ -2119,12 +2135,12 @@ See_Also: [ConditionalNode]
             || (this.lhs == other.rhs && this.rhs == other.lhs);
     }
 
-    ///
+    /// Semantic hash.
     hash_t toHash() const pure {
         return this.lhs.toHash() ^ this.rhs.toHash();
     }
 
-    ///
+    /// See [Node.opIndex].
     inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
@@ -2210,12 +2226,12 @@ Can be used as a unary `NOT` operation when one operand is an all-ones constant.
             || (this.lhs == other.rhs && this.rhs == other.lhs);
     }
 
-    ///
+    /// Semantic hash.
     hash_t toHash() const pure {
         return this.lhs.toHash() ^ this.rhs.toHash();
     }
 
-    ///
+    /// See [Node.opIndex].
     inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
@@ -2306,12 +2322,12 @@ See_Also: [LeftShiftNoOverflowNode]
         return true;
     }
 
-    ///
+    /// Semantic hash.
     hash_t toHash() const pure {
         return this.input.toHash() - this.shift.toHash();
     }
 
-    ///
+    /// See [Node.opIndex].
     inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
@@ -2404,12 +2420,12 @@ See_Also: [LeftShiftNode]
         return true;
     }
 
-    ///
+    /// Semantic hash.
     hash_t toHash() const pure {
         return this.input.toHash() - this.shift.toHash();
     }
 
-    ///
+    /// See [Node.opIndex].
     inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
@@ -2500,12 +2516,12 @@ See_Also: [SignedRightShiftNode]
         return true;
     }
 
-    ///
+    /// Semantic hash.
     hash_t toHash() const pure {
         return this.input.toHash() - this.shift.toHash();
     }
 
-    ///
+    /// See [Node.opIndex].
     inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
@@ -2596,12 +2612,12 @@ See_Also: [UnsignedRightShiftNode]
         return true;
     }
 
-    ///
+    /// Semantic hash.
     hash_t toHash() const pure {
         return this.input.toHash() - this.shift.toHash();
     }
 
-    ///
+    /// See [Node.opIndex].
     inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
@@ -2689,12 +2705,12 @@ See_Also: [AdditionNoOverflowSignedNode]
             || (this.lhs == other.rhs && this.rhs == other.lhs);
     }
 
-    ///
+    /// Semantic hash.
     hash_t toHash() const pure {
         return this.lhs.toHash() ^ this.rhs.toHash();
     }
 
-    ///
+    /// See [Node.opIndex].
     inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
@@ -2782,12 +2798,12 @@ See_Also: [AdditionNode]
             || (this.lhs == other.rhs && this.rhs == other.lhs);
     }
 
-    ///
+    /// Semantic hash.
     hash_t toHash() const pure {
         return this.lhs.toHash() ^ this.rhs.toHash();
     }
 
-    ///
+    /// See [Node.opIndex].
     inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
@@ -2878,12 +2894,12 @@ See_Also: [SubtractionNoOverflowSignedNode]
         return true;
     }
 
-    ///
+    /// Semantic hash.
     hash_t toHash() const pure {
         return this.lhs.toHash() - this.rhs.toHash();
     }
 
-    ///
+    /// See [Node.opIndex].
     inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
@@ -2974,12 +2990,12 @@ See_Also: [SubtractionNode]
         return true;
     }
 
-    ///
+    /// Semantic hash.
     hash_t toHash() const pure {
         return this.lhs.toHash() - this.rhs.toHash();
     }
 
-    ///
+    /// See [Node.opIndex].
     inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
@@ -3068,12 +3084,12 @@ See_Also: [MultiplicationNoOverflowSignedNode]
             || (this.lhs == other.rhs && this.rhs == other.lhs);
     }
 
-    ///
+    /// Semantic hash.
     hash_t toHash() const pure {
         return this.lhs.toHash() ^ this.rhs.toHash();
     }
 
-    ///
+    /// See [Node.opIndex].
     inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
@@ -3161,12 +3177,12 @@ See_Also: [MultiplicationNode]
             || (this.lhs == other.rhs && this.rhs == other.lhs);
     }
 
-    ///
+    /// Semantic hash.
     hash_t toHash() const pure {
         return this.lhs.toHash() ^ this.rhs.toHash();
     }
 
-    ///
+    /// See [Node.opIndex].
     inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
@@ -3257,12 +3273,12 @@ See_Also: [SignedDivisionNode]
         return true;
     }
 
-    ///
+    /// Semantic hash.
     hash_t toHash() const pure {
         return this.dividend.toHash() - this.divisor.toHash();
     }
 
-    ///
+    /// See [Node.opIndex].
     inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
@@ -3354,12 +3370,12 @@ See_Also: [UnsignedDivisionNode]
         return true;
     }
 
-    ///
+    /// Semantic hash.
     hash_t toHash() const pure {
         return this.dividend.toHash() - this.divisor.toHash();
     }
 
-    ///
+    /// See [Node.opIndex].
     inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
@@ -3450,12 +3466,12 @@ See_Also: [SignedRemainderNode]
         return true;
     }
 
-    ///
+    /// Semantic hash.
     hash_t toHash() const pure {
         return this.dividend.toHash() - this.divisor.toHash();
     }
 
-    ///
+    /// See [Node.opIndex].
     inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
@@ -3547,12 +3563,12 @@ See_Also: [UnsignedRemainderNode]
         return true;
     }
 
-    ///
+    /// Semantic hash.
     hash_t toHash() const pure {
         return this.dividend.toHash() - this.divisor.toHash();
     }
 
-    ///
+    /// See [Node.opIndex].
     inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
@@ -3634,12 +3650,12 @@ See_Also: [UnsignedRemainderNode]
             || (this.lhs == other.rhs && this.rhs == other.lhs);
     }
 
-    ///
+    /// Semantic hash.
     hash_t toHash() const pure {
         return this.lhs.toHash() ^ this.rhs.toHash();
     }
 
-    ///
+    /// See [Node.opIndex].
     inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
@@ -3721,12 +3737,12 @@ See_Also: [UnsignedRemainderNode]
             || (this.lhs == other.rhs && this.rhs == other.lhs);
     }
 
-    ///
+    /// Semantic hash.
     hash_t toHash() const pure {
         return this.lhs.toHash() ^ this.rhs.toHash();
     }
 
-    ///
+    /// See [Node.opIndex].
     inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
@@ -3815,12 +3831,12 @@ There is no equivalent for `>` because it suffices to swap this node's operands.
         return true;
     }
 
-    ///
+    /// Semantic hash.
     hash_t toHash() const pure {
         return this.lhs.toHash() - this.rhs.toHash();
     }
 
-    ///
+    /// See [Node.opIndex].
     inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
@@ -3909,12 +3925,12 @@ There is no equivalent for `>` because it suffices to swap this node's operands.
         return true;
     }
 
-    ///
+    /// Semantic hash.
     hash_t toHash() const pure {
         return this.lhs.toHash() - this.rhs.toHash();
     }
 
-    ///
+    /// See [Node.opIndex].
     inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
@@ -4003,12 +4019,12 @@ There is no equivalent for `<=` because it suffices to swap this node's operands
         return true;
     }
 
-    ///
+    /// Semantic hash.
     hash_t toHash() const pure {
         return this.lhs.toHash() - this.rhs.toHash();
     }
 
-    ///
+    /// See [Node.opIndex].
     inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
@@ -4097,12 +4113,12 @@ There is no equivalent for `<=` because it suffices to swap this node's operands
         return true;
     }
 
-    ///
+    /// Semantic hash.
     hash_t toHash() const pure {
         return this.lhs.toHash() - this.rhs.toHash();
     }
 
-    ///
+    /// See [Node.opIndex].
     inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
