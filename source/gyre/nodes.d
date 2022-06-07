@@ -107,6 +107,18 @@ struct OutEdge {
         EdgeKind, "kind", 2
     ));
 
+    version (D_BetterC) {} else {
+        string toString() const {
+            import std.format : format;
+            if (this.target == null) {
+                return "(%s -> NULL)".format(this.kind);
+            } else {
+                assert(this.validateUse);
+                return "(%s -> %s)".format(this.kind, this.target.toString);
+            }
+        }
+    }
+
  pragma(inline) @nogc nothrow pure:
     /++
     Params:
@@ -127,14 +139,14 @@ struct OutEdge {
     An out-edge slot is only equivalent to another if they point to equal [InEdge] slots.
     +/
     bool opEquals(const(OutEdge) other) const
-    in (this.validateUse() && other.validateUse())
+    in (this.validateUse && other.validateUse)
     {
         if (this is other) return true;
         return *this.target == *other.target;
     }
 
     /// Forwards to the target [InEdge].
-    hash_t toHash() const in (this.validateUse()) {
+    hash_t toHash() const in (this.validateUse) {
         return this.target.toHash();
     }
 
@@ -178,6 +190,13 @@ struct InEdge {
     ID _id;
     alias ID = ushort; ///
 
+    version (D_BetterC) {} else {
+        string toString() const {
+            import std.format : format;
+            return "%s[%d]".format(this.owner, this.id);
+        }
+    }
+
  pragma(inline) @nogc nothrow pure:
     @property ID id() const { return this._id; }
     private @property void id(ID id) { this._id = id; }
@@ -207,7 +226,7 @@ struct InEdge {
     We approximate this by checking that the slots' owner nodes are equal AND the slots are in a corresponding position in their respective owner (i.e. they stand for the same thing inside that node).
     +/
     bool opEquals(ref const(InEdge) other) const
-    in (this.validateUse() && other.validateUse())
+    in (this.validateUse && other.validateUse)
     {
         if (this.kind != other.kind) return false;
         if (this.id != other.id) return false;
@@ -215,7 +234,7 @@ struct InEdge {
     }
 
     /// Mixes edge slot id and its owner node's hash.
-    hash_t toHash() const in (this.validateUse()) {
+    hash_t toHash() const in (this.validateUse) {
         return this.id.hashOf ^ this.owner.toHash();
     }
 
@@ -259,7 +278,7 @@ $(SMALL_TABLE
     Member      | Type              | Description
     ------------|-------------------|------------
     `hash`      | `hash_t`          | A node's cached hash value. This is what gets returned when `toHash` is called on a generic [Node], so it should be updated (see [updateHash]) whenever a node's semantic structure stabilizes.
-    `asNode`    | `ref T -> Node*`  | Method which upcasts a concrete node `ref` to a generic `Node*`. Always works for initialized nodes.
+    `asNode`    | `ref T -> Node*`  | Method which upcasts (and this never fails) a concrete node `ref` to a generic `Node*`.
     `ofNode`    | `Node* -> T*`     | Static method which tries to downcast a generic `Node*` to a pointer to a concrete type, returning `null` when the cast would have resulted in an invalid reference (so this is technically type-safe).
 )
 +/
@@ -311,6 +330,8 @@ struct Node {
     );
 
  public pragma(inline) @nogc nothrow pure:
+    @disable this(this); // just to make it harder to use this type on the stack
+
     /++
     Updates a node's cached hash value.
 
@@ -365,9 +386,11 @@ private mixin template NodeInheritance() {
     private alias This = typeof(this);
 
     // XXX: since we can't statically initialize a taggedPointer, a stack-allocated
-    // node cannot be safely used before it is explicitly initialized ...
+    // node can't really be safely used before it is explicitly initialized ...
     package Node.CommonPrefix _node;
     alias _node this;
+
+    @disable this(this); // because copying these guys around is unsafe
 
     package static immutable(Node.VTable) vtbl = {
         opEquals: (const(Node)* lhs, const(Node)* rhs) @nogc nothrow pure {
@@ -412,14 +435,12 @@ private mixin template NodeInheritance() {
 
         inout(Node)* asNode() inout
         return // XXX: fuck v2.100.0
-        in (!this.isForwarding, "can't upcast a broken heart")
-        in (this.vptr == &vtbl, "can't upcast an uninitialized node")
         {
             return cast(inout(Node)*)&this._node;
         }
 
         static inout(This)* ofNode(inout(Node)* node) {
-            if (node == null || node.vptr != &vtbl) return null;
+            if (node == null || node._vptr != &vtbl) return null;
             return cast(inout(This)*)node;
         }
 
@@ -430,8 +451,8 @@ private mixin template NodeInheritance() {
 
         /// Post-move adjusts in-edge slots' owner pointer.
         void opPostMove(ref const(This) old) pure {
-            alias pureCallable = int delegate(ref InEdge) @nogc nothrow pure;
-            foreach (ref slot; this.inEdges!pureCallable) {
+            alias Callable = int delegate(ref InEdge) @nogc nothrow pure;
+            foreach (ref slot; this.inEdges!Callable) {
                 slot.owner = this.asNode;
             }
         }
@@ -631,7 +652,7 @@ See_Also: [InstantiationNode], [JumpNode], [ForkNode]
     Initializes a join node, must be later [dispose]d.
 
     This procedure initializes the collection of channels and sets up unique indexes for each in-edge slot.
-    Edge slot kinds default to `data`; this can be changed later but requires a rehash.
+    Edge slot kinds default to `data`; this can be changed later.
 
     Params:
         self = Address of node being initialized.
@@ -694,13 +715,11 @@ See_Also: [InstantiationNode], [JumpNode], [ForkNode]
         return this is rhs; // "I'm only equal to myself"
     }
 
-    /// Semantic hash. Depends only on channel slot kinds.
+    /// Semantic hash. Depends only on channel lengths.
     hash_t toHash() const pure {
         hash_t hash = 0;
         foreach (parameters; channels) {
-            foreach (param; parameters) {
-                hash -= param.kind.hashOf;
-            }
+            hash -= parameters.length.hashOf;
         }
         return hash;
     }
@@ -926,7 +945,7 @@ See_Also: [JoinNode]
     /++
     Initializes a jump node, must be later [dispose]d.
 
-    Argument kinds default to `data`; this can be changed later but requires a rehash.
+    Argument kinds default to `data`; this can be changed later.
 
     Params:
         self = Address of node being initialized.
@@ -1325,7 +1344,7 @@ It is this identification which allows the compiler to, later in the compilation
     Initializes a macro node, must be later [dispose]d.
 
     This procedure sets up unique indexes for each in-edge slot.
-    All slot kinds default to `data`; this can be changed later and does not require a rehash.
+    All slot kinds default to `data`; this can be changed later.
 
     Params:
         self = Address of node being initialized.
@@ -1376,13 +1395,9 @@ It is this identification which allows the compiler to, later in the compilation
         return this is rhs; // "I'm only equal to myself"
     }
 
-    /// Semantic hash. Depends on this macro node's identifier and its in-slots' kinds.
+    /// Semantic hash. Depends only on this macro node's id.
     hash_t toHash() const pure {
-        hash_t hash = 0;
-        foreach (inEdge; this.inSlots) {
-            hash -= inEdge.kind.hashOf;
-        }
-        return hash ^ this.id.hashOf;
+        return this.id.hashOf;
     }
 
     /// See [Node.opIndex].

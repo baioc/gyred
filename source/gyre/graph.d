@@ -54,9 +54,7 @@ private { // step 1: implement conversions AliasSeq of symbols <-> AliasSeq of t
             enum JoinArgs = Args[0] ~ `, ` ~ JoinArgs!(Args[1 .. $]);
     }
 
-    template Unquote(Symbols...) {
-        alias Unquote = mixin(`AliasSeq!(` ~ JoinArgs!Symbols ~ `)`);
-    }
+    alias Unquote(Symbols...) = mixin(`AliasSeq!(` ~ JoinArgs!Symbols ~ `)`);
 
     template Quote(Types...) {
         static if (Types.length == 0)
@@ -82,16 +80,12 @@ private { // step 1: implement conversions AliasSeq of symbols <-> AliasSeq of t
 }
 
 private { // step 2: collect all symbols/types corresponding to concrete nodes
-    template isGyreNode(Type) {
-        enum isGyreNode =
-            is(Type == struct)
-            && __traits(hasMember, Type, "_node") && is(typeof(Type._node) == Node.CommonPrefix)
-            && !is(Type == Node);
-    }
+    enum isGyreNode(Type) =
+        is(Type == struct)
+        && __traits(hasMember, Type, "_node") && is(typeof(Type._node) == Node.CommonPrefix)
+        && !is(Type == Node);
 
-    template isGyreNode(string symbol) {
-        enum isGyreNode = is(mixin(symbol)) && isGyreNode!(mixin(symbol));
-    }
+    enum isGyreNode(string symbol) = is(mixin(symbol)) && isGyreNode!(mixin(symbol));
 
     enum nodeNames = Filter!(isGyreNode, __traits(allMembers, gyre.nodes)); // symbols
     package alias AllNodes = Unquote!nodeNames; // types
@@ -219,12 +213,12 @@ enum NodeSugar {
     @mnemonic("sel") MultiplexerNodeBinary, /// A binary [MultiplexerNode|mux] (but remember that inputs are ordered, unlike LLVM's `select` instruction).
 }
 
-// rewires an out-edge to the right slot of another stored node
-private @nogc nothrow pure
-void rewire(ref OutEdge outEdge, NodeStorage* storage)
+// rewires an out-edge to a specific in-slot of a given stored node
+// NOTE: the current pointed-to node must still be valid (not-freed) memory
+private void rewire(ref OutEdge outEdge, NodeStorage* storage, InEdge.ID id) @nogc nothrow pure
 out (; outEdge.target != null)
 {
-    outEdge.target = storage.asNode.opIndex(outEdge.target.id);
+    outEdge.target = storage.asNode.opIndex(id);
 }
 
 
@@ -253,35 +247,41 @@ struct Graph {
 
     // corresponds to the notion of a "top-level". also used as a GC root:
     // any subgraph not reachable from this node's inteface is considered dead
-    NodeStorage _topLevel = {{ asMacroNode: MacroNode.init }};
+    NodeStorage* _topLevel;
     List!OutEdge _exported; // actually exported definitions
 
-    // backing memory pool for this graph's nodes (all except the topLevel)
+    // backing memory pool for this graph's nodes (including the top-level)
     NodeStorage[] arena;
     size_t cursor; // bump allocator index for the arena
 
  @nogc nothrow:
+    bool assertInitialized() const pure {
+        assert(this._topLevel != null, "can't use an uninitialized graph");
+        return true;
+    }
+
     @property inout(MacroNode)* topLevel() inout pure
     return // XXX: fuck v2.100.0
+    in (this.assertInitialized)
     {
         return &this._topLevel.node.asMacroNode;
     }
 
  public:
+    @disable this(this);
+
     /// This graph's unique identifier.
-    @property MacroNode.ID id() const pure {
+    @property MacroNode.ID id() const pure in (this.assertInitialized) {
         return this.topLevel.id;
     }
 
     /// Number of definitions exported by this graph.
-    @property uint exported() const pure
-    out (n; n == this.topLevel.outSlots.length)
-    {
-        return cast(uint)this._exported.length;
+    @property uint exported() const pure in (this.assertInitialized) {
+        return cast(uint)this.topLevel.outSlots.length;
     }
 
     /// Number of definitions imported by this graph.
-    @property uint imported() const pure {
+    @property uint imported() const pure in (this.assertInitialized) {
         return cast(uint)this.topLevel.inSlots.length;
     }
 
@@ -309,16 +309,20 @@ struct Graph {
         capacity = Number of nodes to preallocate.
 
     Returns:
-        Zero on success, non-zero on failure (OOM).
+        Zero on success, non-zero on failure (in which case the graph can't be safely used).
     +/
     err_t initialize(MacroNode.ID id, uint exports = 1, uint imports = 0, size_t capacity = 256) {
         err_t error = 0;
         scope(exit) if (error) this = Graph.init;
 
+        // we need 1 extra slot in the arena for the top-level
+        if (capacity == capacity.max) return EOVERFLOW;
+        capacity += 1;
+
         // allocate backing memory pool and set up free index
         this.arena = allocate!NodeStorage(capacity);
         scope(exit) if (error) this.arena.deallocate();
-        if (capacity > 0 && this.arena == null) return (error = ENOMEM);
+        if (this.arena == null) return (error = ENOMEM);
         this.cursor = 0;
 
         // reserve some space for node handles
@@ -330,6 +334,8 @@ struct Graph {
         // our edges are directed. we'll essentially have our top-level work
         // as a pointer forwarding mechanism. eg: (def A) <-- [Graph(def B)] <-- (use B)
         // internally is ... [InEdge(import A) <- B <- OutEdge(export B)] ...
+        this._topLevel = &this.arena[0];
+        this.cursor = 1;
         error = MacroNode.initialize(this.topLevel, id, imports, 0);
         scope(exit) if (error) MacroNode.dispose(this.topLevel);
         if (error) return error;
@@ -352,8 +358,7 @@ struct Graph {
     /// Frees all resources allocated by this graph and sets it to an uninitialized state.
     void dispose() {
         this._exported.array.deallocate();
-        this.topLevel.outSlots = null;
-        MacroNode.dispose(this.topLevel);
+        if (this._topLevel != null) this.topLevel.outSlots = null;
 
         foreach (ref inNeighbors; this.adjacencies.byValue) {
             inNeighbors.dispose();
@@ -369,16 +374,6 @@ struct Graph {
         this = Graph.init;
     }
 
-    /// Returns a pointer to the definition currently exported in the given index.
-    const(InEdge)* getExport(uint index) const pure in (index < this.exported) {
-        return this._exported[index].target;
-    }
-
-    /// Returns a pointer to a specific import slot.
-    const(InEdge)* getImport(uint index) const pure in (index < this.imported) {
-        return &this.topLevel.inSlots[index];
-    }
-
     /++
     Registers a new exported definition.
 
@@ -386,15 +381,18 @@ struct Graph {
 
     Returns: An index which identifies this export, or a negative error code.
     +/
-    int export_(ref InEdge definition)
-    out (index; index < 0 || this.getExport(index) == &definition)
+    int export_(ref const(InEdge) definition)
+    in (this.assertInitialized)
+    out (index; index < 0 || this.topLevel.outSlots[index].target == &definition)
     {
-        // safety check
+        // safety check before getting a mutable alias
         auto node = definition.owner;
-        if (!this.inArena(node)) {
+        auto storage = this.inArena(node);
+        if (storage == null) {
             version (assert) assert(false, "can't export definition from outside the graph");
             else return -EACCES;
         }
+        InEdge* def = storage.asNode.opIndex(definition.id);
 
         // grow the export array if needed (does not cause any rehashing)
         if (this._exported.full) {
@@ -403,39 +401,20 @@ struct Graph {
             auto newExports = allocate!OutEdge(n);
             if (newExports == null) return -ENOMEM;
             // copy, then replace old exports array
-            foreach (i, outEdge; this._exported) {
-                newExports[i] = outEdge;
-            }
+            foreach (i, outEdge; this._exported) newExports[i] = outEdge;
             this._exported.array.deallocate();
             this._exported.array = newExports;
         }
 
         // push the new export and only then update the "public" view
-        this._exported.push(OutEdge(definition.kind, &definition));
+        const failed = this._exported.push(OutEdge(def.kind, def));
+        assert(!failed);
         this.topLevel.outSlots = this._exported.usedSlice;
 
         // remember to register the top-level as an in-neighbor before returning
-        this.registerInNeighbor(node, this.topLevel.asNode);
+        this.getInNeighbors(node).add(this.topLevel.asNode);
         int index = this.exported - 1;
-        assert(this._exported[index].target == &definition);
         return index;
-    }
-
-    /++
-    Updates a specific export's definition.
-
-    One can only export definitions already within the graph.
-
-    Returns: A pointer to the previously exported definition, or `null` in case of invalid access.
-    +/
-    const(InEdge)* setExport(uint index, ref InEdge definition) in (index < this.exported) {
-        auto node = definition.owner;
-        if (!this.inArena(node)) {
-            version (assert) assert(false, "can't export definition from outside the graph");
-            else return null;
-        }
-
-        return relink(this.topLevel.asNode, this._exported[index], definition);
     }
 
     /++
@@ -445,46 +424,122 @@ struct Graph {
     Therefore, graph merging is not a commutative operation with respect to import/export interfaces, even if it is when considering only their internals.
 
     Returns: Zero on success, non-zero on failure.
+
+    Version:
+        TODO: Add a "merge spec" parameter which controls how imports/exports are merged.
     +/
-    err_t merge(ref Graph consumed) {
+    err_t merge(ref Graph consumed)
+    in (this.assertInitialized && consumed.assertInitialized)
+    {
         if (consumed is this) return 0; // #noAlias
 
         // TCC: what if one graph is a macro node in the other?
         // TCC: implement macro expansion
 
-        // this total is actually a conservative estimate due to hash consing
-        const total = this.length + consumed.length;
-        if (total < this.length) return EOVERFLOW;
-
-        // unhappy case: the arena can't fit both graphs, which we handle by
-        // creating a bigger third graph and merging the other two into it
-        if (this.arena.length < total) {
+        // in case the arena can't fit both graphs, we'll create a bigger third
+        // graph and merge the other two into it (in the right order)
+        if (this.arena.length - this.cursor < consumed.length) {
             // the new graph has the sum of the previous' capacities, and then some
             size_t newCapacity = this.arena.length + consumed.arena.length;
             newCapacity = cast(size_t)(newCapacity * 1.618);
-            if (newCapacity < total) return EOVERFLOW;
+            if (newCapacity < this.cursor + consumed.length) return EOVERFLOW;
             Graph newGraph;
             auto error = newGraph.initialize(this.id, 0, 0, newCapacity);
-            // we must also substitute this graph for the bigger one
-            error |= newGraph.merge(this);
+            if (error) return error;
+            // merge this graph into the new one, then tail-merge the other
+            error = newGraph.merge(this);
             if (error) {
                 newGraph.dispose();
                 return error;
             }
-            move(newGraph, this);
+            move(newGraph, this); // `this` was destroyed in the previous merge
             return this.merge(consumed);
         }
+
+        // we begin by reallocating this graph's import and export arrays
+        const ins = this.imported + consumed.imported;
+        const outs = this.exported + consumed.exported;
+        auto newImports = allocate!InEdge(ins);
+        auto newExports = allocate!OutEdge(outs);
+        if ((ins > 0 && newImports == null) || (outs > 0 && newExports == null)) {
+            newImports.deallocate();
+            newExports.deallocate();
+            return ENOMEM;
+        }
+        foreach (i, inEdge; this.topLevel.inSlots) newImports[i] = inEdge;
+        foreach (i, outEdge; this.topLevel.outSlots) newExports[i] = outEdge;
+
+        // we still need to rewire in-neighbors of this graph's top-level, so
+        // we do that before deallocating its current import array. since a macro
+        // node's hash depends only on its ID, we don't need to invalidate caches
+        auto oldImports = this.topLevel.inSlots;
+        const oldImportCount = oldImports.length;
+        this.topLevel.inSlots = newImports;
+        foreach (inNeighbor; this.getInNeighbors(this.topLevel.asNode).byKey) {
+            foreach (ref edge; NodeStorage.ofNode(inNeighbor).outEdges) {
+                if (edge.target.owner == this.topLevel.asNode) {
+                    edge.rewire(this._topLevel, edge.target.id);
+                }
+            }
+        }
+        oldImports.deallocate(); // ok to free now that there are no refs to it
+        this._exported.array.deallocate();
+        this._exported.array = newExports;
+        this.topLevel.outSlots = this._exported.usedSlice;
+
+        // changing import slots will trigger cache invalidations in the CONSUMED
+        // graph, so before mutating anything we'll save its in-neighbor set
+        UnsafeHashSet!(Node*) invalidationFrontier;
+        scope(exit) invalidationFrontier.dispose();
+        err_t error = 0;
+        invalidationFrontier = consumed.getInNeighbors(consumed.topLevel.asNode).dup(error);
+        assert(!error);
+
+        // now we do the actual merge of imports & exports. once this happens,
+        // our two graphs are interwined: this graph's top-level has edges into
+        // the consumed graph, which in turn has edges into this graph's top-level
+        const beginGcRoots = this.exported;
+        foreach (ref outEdge; consumed.topLevel.outSlots) {
+            const failed = this._exported.push(outEdge);
+            assert(!failed);
+        }
+        this.topLevel.outSlots = this._exported.usedSlice;
+        const endGcRoots = this.exported;
+        foreach (offset, inEdge; consumed.topLevel.inSlots) {
+            assert(inEdge.id == offset);
+            const newIndex = oldImportCount + offset;
+            assert(newIndex >= oldImportCount);
+            this.topLevel.inSlots[newIndex] = InEdge(
+                inEdge.kind, // same kind
+                this.topLevel.asNode, // different owner
+                cast(uint)newIndex // ID with offset
+            );
+        }
+        // after this next loop, the consumed graph's top-level is no longer
+        // reachable, which means the GC will never move it into this graph
+        foreach (inNeighbor; invalidationFrontier.byKey) {
+            foreach (ref edge; NodeStorage.ofNode(inNeighbor).outEdges) {
+                if (edge.target.owner == consumed.topLevel.asNode) {
+                    const offset = edge.target.id;
+                    assert(edge.target == &consumed.topLevel.inSlots[offset]);
+                    const newIndex = oldImportCount + offset;
+                    assert(newIndex <= InEdge.ID.max);
+                    edge.rewire(this._topLevel, cast(InEdge.ID)newIndex);
+                }
+            }
+        }
+
+        // before the GC moves the consumed graph, we'll refresh its cached hashes
+        consumed.refreshHashes(invalidationFrontier);
 
         // the GC itself does precise mark & sweep, where we use the forwading bit
         // on every node to signal whether its been visited already or not.
         // after visiting a node, we'll set that bit and leave the node with a
         // "broken heart", a forwarding pointer which leads us to its new place.
-        //
         // also, since we're moving nodes, we might as well improve locality of
         // future traversals, so we do them in "root-first-depth-second" order
 
         // since we're going depth-first, we'll use a stack to hold grey objects
-        // also, we assert that OOM doesn't happen because we can't deal with it
         alias Stack = List!(NodeStorage*);
         void grow(T)(ref List!T list) {
             size_t newCapacity = list.capacity == 0 ? 8 : list.capacity * 2;
@@ -510,14 +565,13 @@ struct Graph {
             return popped;
         }
 
-        // step 0: when we begin, all objects are white
-        auto stack = Stack(allocate!(NodeStorage*)(consumed.exported));
+        // step 0: at first, all objects are white
+        Stack stack;
         scope(exit) stack.array.deallocate();
-        assert(consumed.exported == 0 || stack.capacity > 0);
 
-        // step 1: color all roots grey
-        foreach (outEdge; consumed.topLevel.outSlots[0 .. consumed.exported]) {
-            auto root = outEdge.target.owner;
+        // step 1: we begin by greying out roots, i.e. the merged exports
+        foreach (edge; this._exported[beginGcRoots .. endGcRoots]) {
+            auto root = edge.target.owner;
             assert(!root.wasVisited && !root.isForwarding);
             root.wasVisited = true;
             forcePush(stack, NodeStorage.ofNode(root));
@@ -525,45 +579,47 @@ struct Graph {
 
         // step 2: mark phase darkens all grey objects and what they can reach
         auto addedBegin = this.cursor;
+        UnsafeHashSet!(Node*) hitList;
+        scope(exit) hitList.dispose();
         while (!stack.empty) {
-            // we always pop a grey object from the stack
+            // we always pop a grey object which is in the CONSUMED graph
             auto oldStorage = pop(stack);
             auto oldNode = oldStorage.asNode;
             assert(oldNode.wasVisited && !oldNode.isForwarding);
+            assert(consumed.inArena(oldNode));
 
-            // TCC: we can't transfer the consumed toplevel!
-
-            // darkening it means it goes black, which translates to
-            // moving it into the graph and setting up its forwading pointer
+            // darkening it means it goes black, which translates to moving it
+            // into the new graph and setting up its forwading pointer
             bool wasRedundant = false;
             auto newStorage = this.add(oldStorage, wasRedundant);
             assert(newStorage != null);
-            // avoid leaking dynamic node payloads when hash consing kicks in.
-            // this does not lead to double frees because of the GC move mark
+            // in order to avoid leaking memory when hash consing kicks in, we need
+            // to remember this node and free it later (when it is safe to do so)
             if (wasRedundant) {
-                oldStorage.dispose();
-                copyEmplace(*newStorage, *oldStorage);
+                error = hitList.add(oldNode);
+                assert(!error);
             }
             oldNode.forwardingPointer = newStorage.asNode;
 
-            // now, we only mark *white* neighbors as grey, so as to avoid loops
+            // now, we darken this node's neighbors, but only if they're white
+            // (ensures no grey nodes are repeated) and they're in the CONSUMED
+            // graph (so that we never stack nodes from THIS graph, which would
+            // have been possible in the case of a hash consed node)
             foreach (outEdge; newStorage.outEdges) {
                 auto neighbor = outEdge.target.owner;
                 if (neighbor.wasVisited) continue;
+                if (!consumed.inArena(neighbor)) continue;
                 neighbor.wasVisited = true;
                 forcePush(stack, NodeStorage.ofNode(neighbor));
             }
         }
         auto addedEnd = this.cursor;
 
-        // step 3: extra pass through transferred nodes to adjust pointers
-        foreach (i; addedBegin .. addedEnd) {
-            auto storage = &this.arena[i];
-
-            // when we add nodes to the graph, their grey bit is copied.
-            // we know it must be set, and we use this moment to unset it
+        // step 3: extra pass through just-transferred nodes to fix pointers
+        void fixPointers(NodeStorage* storage) {
+            // added nodes had their grey bit copied, so let's unset it
             auto node = storage.asNode;
-            assert(node.wasVisited && !node.isForwarding);
+            assert(node.wasVisited || storage == this._topLevel);
             node.wasVisited = false;
 
             // all of its out-neighbors were transfered as well, so we chase
@@ -572,40 +628,67 @@ struct Graph {
                 auto outNeighbor = outEdge.target.owner;
                 if (outNeighbor.isForwarding) {
                     outNeighbor = outNeighbor.forwardingPointer;
-                    rewire(outEdge, NodeStorage.ofNode(outNeighbor));
+                    outEdge.rewire(NodeStorage.ofNode(outNeighbor), outEdge.target.id);
                 }
-                const error = this.registerInNeighbor(outNeighbor, node);
+                error = this.getInNeighbors(outNeighbor).add(node);
                 assert(!error);
             }
-        }
 
-        // TCC: before sweeping, we need to adjust imports and exports...
+        }
+        foreach (i; addedBegin .. addedEnd) fixPointers(&this.arena[i]);
+        fixPointers(this._topLevel); // <- has edges into the old graph as well
 
         // step 4: the "sweep" phase happens when we free the consumed graph
         // (notice that NodeStorage.dispose() takes moved nodes into account)
+        // but before that we need to restore type info for hash consed nodes
+        foreach (ref redundantNode; hitList.byKey) {
+            assert(consumed.inArena(redundantNode));
+            assert(redundantNode.isForwarding);
+            auto vptr = redundantNode.forwardingPointer.vptr;
+            redundantNode.vptr = vptr;
+            assert(!redundantNode.isForwarding);
+        }
         consumed.dispose();
         return 0;
     }
 
  private:
+    inout(InNeighbors)* getInNeighbors(const(Node)* node) inout pure {
+        auto key = const(HashConsedNode)(node);
+        inout(HashConsedNode)* found;
+        inout(InNeighbors)* inNeighbors;
+        this.adjacencies.get(key, found, inNeighbors);
+        return found ? inNeighbors : null;
+    }
+
+    inout(NodeStorage)* inArena(inout(Node)* node) inout pure
+    out (result; result == null || result.asNode == node)
+    {
+        auto ptr = NodeStorage.ofNode(node);
+        const min = &this.arena[0];
+        const max = &this.arena[$ - 1];
+        if (min <= ptr && ptr <= max) {
+            const size_t index = ptr - min;
+            return &this.arena[index];
+        } else {
+            return null;
+        }
+    }
+
     // shallow copy a node into the graph assuming there's space for it,
     // returning the resulting internal pointer (stable until the next GC)
     // NOTE: node structure must be stable and its hash already cached, which
-    // implies its dependencies were already added (requires a topological sort)
+    // implies its dependencies were also hashed (may need a topological sort)
     NodeStorage* add(NodeStorage* temp, out bool redundant)
     in (this.cursor < this.arena.length, "no space in the graph")
     in (!temp.asNode.isForwarding, "nodes added to the graph must be valid")
+    in (!inArena(temp.asNode), "can't add a node to the arena twice")
     {
         // abort the node in case an equivalent one already exists in the graph
-        {
-            auto handle = const(HashConsedNode)(temp.asNode);
-            HashConsedNode* found;
-            InNeighbors* neighbors;
-            this.adjacencies.get(handle, found, neighbors);
-            if (found) {
-                redundant = true;
-                return NodeStorage.ofNode(found.ptr);
-            }
+        auto found = const(HashConsedNode)(temp.asNode) in this.adjacencies;
+        if (found) {
+            redundant = true;
+            return NodeStorage.ofNode(found.ptr);
         }
 
         // add the new node to the graph, with an empty set of in-neighbors
@@ -620,51 +703,42 @@ struct Graph {
         return newStorage;
     }
 
-    // registers the second node as an in-neighbor of the first
-    err_t registerInNeighbor(Node* node, Node* inNeighbor)
-    in (HashConsedNode(node) in this.adjacencies)
-    {
-        auto outNeighbor = HashConsedNode(node);
-        HashConsedNode* found;
-        InNeighbors* inNeighbors;
-        this.adjacencies.get(outNeighbor, found, inNeighbors);
-        return inNeighbors.add(inNeighbor);
-    }
-
-    inout(NodeStorage)* inArena(inout(Node)* node) inout pure {
-        auto ptr = NodeStorage.ofNode(node);
-        const min = &this.arena[0];
-        const max = &this.arena[$ - 1];
-        return min <= ptr && ptr <= max ? ptr : null;
-    }
-
-    // changes a node's out-edge target while maintaining in-neighbor sets
-    // precise. returns the previous target slot of the updated edge
-    InEdge* relink(Node* node, ref OutEdge from, ref InEdge to)
-    in (this.inArena(node) && this.inArena(to.owner))
-    out (; from.target == &to)
-    {
-        // first, we do the actual update
-        auto previous = from.target;
-        if (previous == &to) return previous; // nothing to do here
-        from.target = &to;
-        this.registerInNeighbor(to.owner, node);
-
-        // we want to remove this node from its previous target's in-neighbor
-        // set, but only if this edge was the last reference which linked them
-        // OPT: there is a time-space tradeoff here, and right now we're increasing
-        // time because we search for other references, instead of keeping count
-        foreach (outEdge; NodeStorage.ofNode(node).outEdges) {
-            if (outEdge.target.owner == previous.owner) return previous;
+    // updates invalidated hashes in this graph, starting from the given set
+    void refreshHashes(ref UnsafeHashSet!(Node*) workSet) {
+        Node* popAny(ref UnsafeHashSet!(Node*) set) {
+            auto popped = set.byKey.front;
+            assert(popped != null);
+            set.remove(popped);
+            return popped;
         }
 
-        // if we got here, it's because the refcount dropped to zero
-        auto oldNeighbor = HashConsedNode(previous.owner);
-        HashConsedNode* found;
-        InNeighbors* inNeighbors;
-        this.adjacencies.get(oldNeighbor, found, inNeighbors);
-        inNeighbors.remove(node);
-        return previous;
+        // we refresh invalidated hashes in breadth-first fashion, traversing
+        // edges backwards through in-neighbor sets. we do this "until it runs out"
+        // and without worrying about cycles, which is ok because IR rules imply
+        // the absence of cyclic hash dependencies (e.g. see how a join hashes)
+        while (workSet.length > 0) {
+            // before refreshing a node, we remove it from the hash table
+            // (notice that its backing memory in the arena isn't moved)
+            auto node = popAny(workSet);
+            auto inNeighbors = this.adjacencies[HashConsedNode(node)];
+            this.adjacencies.remove(HashConsedNode(node));
+
+            // check whether its cached hash was actually invalidated
+            const oldHash = node.toHash();
+            node.updateHash();
+            const newHash = node.toHash();
+
+            // if it did change, its in-neighbors need to be refreshed as well
+            if (newHash != oldHash) {
+                foreach (inNeighbor; inNeighbors.byKey) {
+                    const error = workSet.add(inNeighbor);
+                    assert(!error);
+                }
+            }
+
+            // now that this node's up to date, we put it back in the table
+            this.adjacencies[HashConsedNode(node)] = inNeighbors;
+        }
     }
 }
 
@@ -696,17 +770,13 @@ struct Subgraph {
 
     /// This type's resources get automatically deallocated on scope exit (also, it is not copyable).
     ~this() {
-        this.clearNursery!true;
+        foreach (storage; this.nursery.byKey) {
+            storage.dispose();
+            deallocate(storage);
+        }
         this.nursery.dispose();
     }
     @disable this(this);
-
-    private void clearNursery(bool deep)() {
-        foreach (storage; this.nursery.byKey) {
-            static if (deep) storage.dispose();
-            deallocate(storage);
-        }
-    }
 
     private alias InitParams(NodeType) = Parameters!(NodeType.initialize)[1 .. $];
 
@@ -722,8 +792,7 @@ struct Subgraph {
         err_t error = 0;
 
         // allocate a node in the global heap. its address is stable
-        // OPT: performance-wise, we could do better with a pool chain; right now
-        // we're hoping that malloc's implementation allocates small objects fast
+        // OPT: performance-wise, we could do better with a chain of pools
         auto storage = allocate!NodeStorage;
         if (storage == null) return null;
         scope(exit) if (error) deallocate(storage);
@@ -812,32 +881,51 @@ struct Subgraph {
     }
 
     /++
+    Post-hook callback delegate.
+
+    This callback is invoked on every successfully [commit]ed node.
+    Its first argument is a pointer matching one of the nodes [insert]ed in this subgraph.
+    However, that node's contents have since been moved into the graph, so it can no longer be safely used as a concrete node type.
+    The second argument is a pointer to the corresponding in-graph node.
+
+    Holding onto these pointers is not safe, much less mutating them.
+    In fact, the only thing users can do in the post-hook is to use the first argument to choose whether or not to call [Graph] methods on the second argument.
+    +/
+    alias PostHook = void delegate(const(Node)*, const(Node)*) @nogc nothrow;
+
+    /++
     Commits this subgraph into a parent graph.
 
     This is a destructive copy which empties the subgraph being commited.
+    After all nodes have been moved, user code can use a [PostHook] to export new definitions.
 
     Returns: Zero on success, non-zero otherwise.
     +/
-    err_t commit(ref Graph graph) {
+    err_t commit(ref Graph graph, scope PostHook postHook) {
         // TCC: validate nodes and check IR rules BEFORE mutating anything
 
         // compute how much space we need and how much we have available
         const neededSpace = this.nursery.length;
         const freeSpace = graph.arena.length - graph.cursor;
 
-        // if the graph's private memory pool needs to grow, we'll trigger the GC
+        // if the graph's private memory pool needs to grow, trigger the GC
         if (freeSpace < neededSpace) {
             auto newCapacity = cast(size_t)((graph.cursor + neededSpace) * 1.618);
             if (newCapacity < graph.cursor + neededSpace) return EOVERFLOW;
             Graph newGraph;
             auto error = newGraph.initialize(graph.id, 0, 0, newCapacity);
-            error |= newGraph.merge(graph);
+            if (error) return error;
+            error = newGraph.merge(graph);
             if (error) {
                 newGraph.dispose();
                 return error;
             }
             move(newGraph, graph);
         }
+
+        // set of nodes which were hash-consed and therefore need to be deallocated
+        UnsafeHashSet!(Node*) hitList;
+        scope(exit) hitList.dispose();
 
         // set of nodes which still need fixing after the depth-first traversal
         UnsafeHashSet!(JoinNode*) joinNodes;
@@ -860,7 +948,7 @@ struct Subgraph {
                     auto newNeighbor = depthFirstAdd(outNeighbor);
                     assert(newNeighbor != null);
                     // then, rewire this node's out-edge to its updated neighbor
-                    rewire(outEdge, newNeighbor);
+                    outEdge.rewire(newNeighbor, outEdge.target.id);
                 }
             }
 
@@ -871,12 +959,12 @@ struct Subgraph {
             assert(transferred != null);
             Node* newNode = transferred.asNode;
             // small detail: if hash consing reveals that this node is redundant,
-            // we have to deallocate its payload here to avoid leaks and then
-            // shallow-copy the existing node into it. this does NOT lead to payload
-            // double frees, but only because we're marking the node as moved
+            // we need to deallocate its payload (if any) to avoid leaks. however,
+            // since there may still be pointers into it, we need to defer this
+            // until after edges are adjusted to avoid use-after free bugs
             if (wasRedundant) {
-                original.dispose();
-                copyEmplace(*transferred, *original);
+                const error = hitList.add(oldNode);
+                assert(!error);
             }
             // sanity check: the old node has a broken heart, not the new one
             oldNode.forwardingPointer = newNode;
@@ -887,7 +975,8 @@ struct Subgraph {
             if (!isJoinNode) {
                 foreach (ref outEdge; transferred.outEdges) {
                     auto outNeighbor = outEdge.target.owner;
-                    const error = graph.registerInNeighbor(outNeighbor, newNode);
+                    assert(!outNeighbor.isForwarding);
+                    const error = graph.getInNeighbors(outNeighbor).add(newNode);
                     assert(!error);
                 }
             } else {
@@ -900,43 +989,46 @@ struct Subgraph {
             return transferred;
         }
 
-        // this loops triggers the recursions
-        foreach (storage; this.nursery.byKey) {
-            auto added = depthFirstAdd(storage);
-            // I don't really know how to handle a mid-commit error in such
-            // a way as to make it an all-or-nothing operation. Thus, if this
-            // ever happens, the commited subgraph may be left in an incomplete
-            // state. This is probably not as bad as it sounds; because we
-            // check IR rules before starting this loop, mid-commit errors mean
-            // an OOM condition, where there's not much that can be done anyway
-            assert(added != null);
-        }
+        // this loops starts the recursion(s)
+        foreach (storage; this.nursery.byKey) depthFirstAdd(storage);
 
         // since we treated join nodes differently before, we now have to ensure that
         // their edges were rewired and that they have been registered as in-neighbors
         foreach (join; joinNodes.byKey) {
             foreach (ref outEdge; join.outEdges) {
                 Node* outNeighbor = outEdge.target.owner;
-                // some pf their pointers may still need to be rewired
+                // some of their pointers may still need to be rewired
                 if (outNeighbor.isForwarding) {
                     outNeighbor = outNeighbor.forwardingPointer;
-                    rewire(outEdge, NodeStorage.ofNode(outNeighbor));
+                    outEdge.rewire(NodeStorage.ofNode(outNeighbor), outEdge.target.id);
                 }
                 // and we must ensure the join is registered as an in-neighbor
-                const error = graph.registerInNeighbor(outNeighbor, join.asNode);
+                const error = graph.getInNeighbors(outNeighbor).add(join.asNode);
                 assert(!error);
             }
         }
 
-        // if nodes were transferred successfully, we can free the nursery. but we
-        // only free node storage, not payloads (which are being reused by the graph)
-        this.clearNursery!false;
-        this.nursery.clear();
+        // run post-commit hooks
+        foreach (storage; this.nursery.byKey) {
+            auto oldNode = storage.asNode;
+            assert(oldNode.isForwarding);
+            auto newNode = oldNode.forwardingPointer;
+            postHook(oldNode, newNode);
+        }
 
-        // TCC: pre-hook to connect from/to external nodes
-        // TCC: post-hook to register imports/exports
+        // no one should still have pointers to hash-consed nodes, so we can
+        // restore their type info to let the destructor free their payloads
+        foreach (ref redundantNode; hitList.byKey) {
+            assert(redundantNode.isForwarding);
+            auto vptr = redundantNode.forwardingPointer.vptr;
+            redundantNode.vptr = vptr;
+            assert(!redundantNode.isForwarding);
+        }
+
+        // TCC: pre-hook to connect TO external nodes (e.g. imports)
         // TCC: peephole optimizations
 
+        destroy(this);
         return 0;
     }
 }
@@ -946,36 +1038,33 @@ struct Subgraph {
     import gyre.mnemonics;
 
     Graph graph;
-    graph.initialize(MacroNode.ID(42), 1, 1);
+    graph.initialize(MacroNode.ID(42));
     scope(exit) graph.dispose();
 
-    assert(graph.id == 42);
     assert(graph.exported == 0);
-    assert(graph.imported == 1);
     assert(graph.length == 0);
 
-    // while compiling something like
-    //    foo(return, x) {
+    // imagine we're compiling something like
+    //    foo(ret, x) {
     //        a = x + 1
     //        b = 1 + x
     //        y = a / b
-    //        return(y)
+    //        ret(y)
     //    }
     with (Subgraph.init) {
-        reserve(8);
+        reserve(6);
 
         auto foo = insert!func(2);
         auto jmp = insert!jump(1);
         auto y = insert!divu;
-        auto a = insert!add;
-        auto b = insert!add;
+        auto a = insert!addnos;
+        auto b = insert!addnos;
         auto c1 = insert!const_(1);
 
         auto params = foo.channels[0];
         auto ret = &params[0];
         auto x = &params[1];
 
-        // export_(foo.definition);
         link!"control"(foo, jmp.control);
 
         link!"continuation"(jmp, ret);
@@ -990,22 +1079,85 @@ struct Subgraph {
         link!"lhs"(b, c1.value);
         link!"rhs"(b, x);
 
-        // these have a dynamic payload, but are subject to hash consing, so ...
-        // do both payloads get deallocated correctly after structural sharing?
-        auto deadCode1 = insert!sel;
-        link!"selector"(deadCode1, c1.value);
-        link!"inputs"(deadCode1, 0, x);
-        link!"inputs"(deadCode1, 1, c1.value);
-        auto deadCode2 = insert!sel;
-        link!"selector"(deadCode2, c1.value);
-        link!"inputs"(deadCode2, 0, x);
-        link!"inputs"(deadCode2, 1, c1.value);
-
-        commit(graph);
+        commit(graph, (node, inGraph){
+            if (node is foo.asNode) {
+                auto fooInGraph = JoinNode.ofNode(inGraph);
+                graph.export_(fooInGraph.definition);
+            }
+        });
     }
 
-    // one of the additions was optimized away, one mux as well
-    assert(graph.length == 6);
+    // since `a` and `b` compute the same value, one was CSE'd away
+    assert(graph.length == 5);
+    assert(graph.exported == 1);
+}
 
-    // assert(graph.exported == 1);
+@nogc nothrow unittest {
+    import gyre.mnemonics;
+
+    Graph g1;
+    g1.initialize(MacroNode.ID(1), 1, 1, 0);
+    scope(exit) g1.dispose();
+    with (Subgraph.init) {
+        reserve(4);
+
+        auto c1 = insert!const_(1);
+        auto y = insert!add;
+
+        link!"lhs"(y, c1.value);
+        link!"rhs"(y, c1.value);
+
+        // these have a dynamic payload, but are subject to hash consing, so
+        // this helps us test that both payloads get deallocated correctly
+        auto deadCode2 = insert!sel;
+        link!"selector"(deadCode2, c1.value);
+        link!"inputs"(deadCode2, 0, y.result);
+        link!"inputs"(deadCode2, 1, c1.value);
+        auto deadCode1 = insert!sel;
+        link!"selector"(deadCode1, c1.value);
+        link!"inputs"(deadCode1, 0, y.result);
+        link!"inputs"(deadCode1, 1, c1.value);
+
+        commit(g1, (node, inGraph){
+            if (node is y.asNode) {
+                auto yInGraph = AdditionNode.ofNode(inGraph);
+                assert(yInGraph);
+                g1.export_(yInGraph.result);
+            }
+        });
+    }
+    assert(g1.length == 3);
+    assert(g1.exported == 1);
+    assert(g1.imported == 1);
+
+
+    Graph g2;
+    g2.initialize(MacroNode.ID(2), 1, 1, 2);
+    scope(exit) g2.dispose();
+    with (Subgraph.init) {
+        reserve(2);
+
+        auto c1 = insert!const_(1);
+        auto y = insert!add;
+
+        link!"lhs"(y, c1.value);
+        link!"rhs"(y, c1.value);
+
+        commit(g2, (node, inGraph){
+            if (node is y.asNode) {
+                auto incInGraph = AdditionNode.ofNode(inGraph);
+                assert(incInGraph);
+                g2.export_(incInGraph.result);
+            }
+        });
+    }
+    assert(g2.length == 2);
+    assert(g2.exported == 1);
+    assert(g2.imported == 1);
+
+
+    g2.merge(g1);
+    assert(g2.length == 2); // mux DCE'd, g1 CSE'd
+    assert(g2.exported == 2);
+    assert(g2.imported == 2);
 }
