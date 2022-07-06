@@ -1,5 +1,5 @@
 /++
-Gyre is a compiler IR designed as a practical "linguistic switchbox", or [UNCOL](https://www.osdata.com/topic/language/uncol.htm).
+Gyre is a compiler IR designed as a practical "linguistic switchbox", or [UNCOL](https://en.wikipedia.org/wiki/UNCOL).
 
 Gyre is not particularly innovative, aiming instead to consolidate various existing techniques under a unified design.
 It's a graph-based IR, heavily influenced by [Click's sea of nodes](https://www.oracle.com/technetwork/java/javase/tech/c2-ir95-150110.pdf), although we take a more functional approach to SSA form by mixing Extended Basic Blocks with [Thorin-style-CPS](https://anydsl.github.io/Thorin.html).
