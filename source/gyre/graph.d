@@ -4,7 +4,7 @@ Program construction and manipulation API.
 Recommended Reading Order:
 $(NUMBERED_LIST
     * [EdgeKind|Edge slots] and their different kinds
-    * [Node|Generic nodes] and [structural sharing optimizations](gyre.nodes.Node.html#details)
+    * [Node|Generic nodes] and [structural sharing](gyre.nodes.Node.html#details)
     * Primitive control operations: [JoinNode|join], [InstantiationNode|inst.], [JumpNode|jump], [ForkNode|fork] and [ConditionalNode|cond.]
     * [Poison values and undefined behavior](gyre.nodes.html#poison-values-and-ub)
     * Other [primitive](gyre.nodes.html#prim-ops-rationale) and [MacroNode|non-primitive] nodes
@@ -16,7 +16,7 @@ Although theoretically quadratic in the worst case, we expect the number of edge
 Therefore, we want to keep [Node|node]s as slim as possible (and [EdgeKind|edge]s even more so), while still being able to transform subgraphs in an efficient manner.
 
 As seen in [libFIRM](http://beza1e1.tuxen.de/pdfs/braun11wir.pdf), some optimizations can become inherent to the IR if we're able to identify common substructures in the graph.
-In order to make this as efficient as possible, we'll use hash tables and specially crafted hash functions for each node, leveraging [SSA form](https://en.wikipedia.org/wiki/Static_single_assignment_form) to approximate semantic equality from structural equality.
+In order to make this as efficient as possible, we'll use hash tables and specially crafted hash functions for each node, leveraging [SSA form](https://en.wikipedia.org/wiki/Static_single_assignment_form) to approximate semantic equivalence from structural equality.
 This means that hashing a node or comparing two nodes won't be trivial operations, so we better (a) cache hash values; and (b) be careful during structural comparisons, since Gyre graphs can be cyclic.
 More details [here](gyre.nodes.Node.html#details).
 
@@ -42,7 +42,7 @@ public import gyre.nodes;
 
 
 // XXX: I wanted to do some of this metaprogramming in the nodes module, but using
-// `__traits(allMembers, ...)` there while defining new symbols is hard, so...
+// `__traits(allMembers, ...)` there while defining new symbols is tricky, so...
 
 private { // step 1: implement conversions AliasSeq of symbols <-> AliasSeq of types
     template JoinArgs(Args...) {
@@ -164,17 +164,6 @@ private { // step 3: profit
             }
         }
 
-        void opPostMove(ref const(NodeStorage) old) pure {
-            final switch (this.tag) {
-                static foreach (kind; EnumMembers!NodeKind) {
-                    case kind: {
-                        this.node.as!kind.opPostMove(old.node.as!kind);
-                        return;
-                    }
-                }
-            }
-        }
-
         @property OutEdgeIterator!Callable
         outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
             final switch (this.tag) {
@@ -182,18 +171,6 @@ private { // step 3: profit
                     case kind: {
                         auto node = &this.node.as!kind;
                         return node.outEdges!Callable;
-                    }
-                }
-            }
-        }
-
-        @property InEdgeIterator!Callable
-        inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
-            final switch (this.tag) {
-                static foreach (kind; EnumMembers!NodeKind) {
-                    case kind: {
-                        auto node = &this.node.as!kind;
-                        return node.inEdges!Callable;
                     }
                 }
             }
@@ -213,14 +190,6 @@ enum NodeSugar {
     @mnemonic("sel") MultiplexerNodeBinary, /// A binary [MultiplexerNode|mux] (but remember that inputs are ordered, unlike LLVM's `select` instruction).
 }
 
-// rewires an out-edge to a specific in-slot of a given stored node
-// NOTE: the current pointed-to node must still be valid (not-freed) memory
-private void rewire(ref OutEdge outEdge, NodeStorage* storage, InEdge.ID id) @nogc nothrow pure
-out (; outEdge.target != null)
-{
-    outEdge.target = storage.asNode.opIndex(id);
-}
-
 
 /++
 Graph structure storing a Gyre (sub)program.
@@ -233,7 +202,7 @@ Version:
     Due to our representation, internal graph storage will probably resemble a spaghetti of pointers, and if a node (or edge slot!) ever moves in memory, we'll need to fix every pointer which referenced it.
     As a result, relocations are expensive, and in the worst case we could be moving the entire graph (e.g. if we need to expand our backing memory arena).
     Since references may need to be adjusted anyway, we might as well keep related nodes close to each other, improving locality while we're at it.
-    In the end, we'll implement something similar to a moving mark-and-sweep GC over a private memory pool.
+    In the end, we'll have something similar to a copying GC over a private memory pool.
 
 See_Also: [Subgraph]
 +/
@@ -248,7 +217,7 @@ struct Graph {
     // corresponds to the notion of a "top-level". also used as a GC root:
     // any subgraph not reachable from this node's inteface is considered dead
     NodeStorage* _topLevel;
-    List!OutEdge _exported; // actually exported definitions
+    List!OutEdge _exported; // contains backing memory for exported definitions
 
     // backing memory pool for this graph's nodes (including the top-level)
     NodeStorage[] arena;
@@ -287,7 +256,6 @@ struct Graph {
 
     /// Number of unique nodes in the graph.
     @property size_t length() const pure
-    out (used; used <= this.arena.length)
     {
         if (this.adjacencies.length == 0) return 0;
         return this.adjacencies.length - 1; // minus the toplevel
@@ -297,21 +265,20 @@ struct Graph {
     Initializes an empty Gyre graph, must be later [dispose]d to avoid leaking memory.
 
     Our graphs eliminate dead code automatically.
-    Therefore, every top-level function (represented by a [JoinNode|join node]) must be "anchored" to the graph by having their `definition` slot linked to one of the graph's in-edge slots.
-    Conceptually, this is as if these functions were being "exported" to code outside of this graph.
+    Therefore, every static top-level definition must be "anchored" to the graph, as if it was being "exported" to code outside of this graph.
     Nodes which are not directly exported and aren't reachable by an exported node may be marked as dead code and silently eliminated.
-    Similarly, a graph may also depend on external information (`type` parameters, for instance), in which case it needs to point to these "imported" definitions with its out-edge slots.
+    Similarly, a graph may also depend on external information (`type` parameters, for instance), in which case it needs to point to these imported definitions.
 
     Params:
         id = This graph's unique identifier.
-        exports = Preallocated number of "exported" defs (or [InEdge|in-edge]s for [MacroNode|macro node] definitions).
+        exports = Preallocated number of "exported" defs (or [InSlot|in-edge]s for [MacroNode|macro node] definitions).
         imports = Maximum number of "imported" defs (or [OutEdge|out-edge]s for [MacroNode|macro node] definitions).
         capacity = Number of nodes to preallocate.
 
     Returns:
         Zero on success, non-zero on failure (in which case the graph can't be safely used).
     +/
-    err_t initialize(MacroNode.ID id, uint exports = 1, uint imports = 0, size_t capacity = 256) {
+    err_t initialize(MacroNode.ID id, uint exports = 1, uint imports = 0, size_t capacity = 64) {
         err_t error = 0;
         scope(exit) if (error) this = Graph.init;
 
@@ -323,19 +290,13 @@ struct Graph {
         this.arena = allocate!NodeStorage(capacity);
         scope(exit) if (error) this.arena.deallocate();
         if (this.arena == null) return (error = ENOMEM);
-        this.cursor = 0;
-
-        // reserve some space for node handles
-        error = this.adjacencies.rehash(1 + capacity/2);
-        scope(exit) if (error) this.adjacencies.dispose();
-        if (error) return error;
+        this.cursor = 1;
 
         // initialize top-level, but with swapped "ins" and "outs" due to how
         // our edges are directed. we'll essentially have our top-level work
         // as a pointer forwarding mechanism. eg: (def A) <-- [Graph(def B)] <-- (use B)
-        // internally is ... [InEdge(import A) <- B <- OutEdge(export B)] ...
+        // internally is ... [InSlot(import A) <- B <- OutEdge(export B)] ...
         this._topLevel = &this.arena[0];
-        this.cursor = 1;
         error = MacroNode.initialize(this.topLevel, id, imports, 0);
         scope(exit) if (error) MacroNode.dispose(this.topLevel);
         if (error) return error;
@@ -380,19 +341,25 @@ struct Graph {
     One can only export definitions already within the graph.
 
     Returns: An index which identifies this export, or a negative error code.
+
+    Version:
+        TODO: import/export API needs to be worked on
     +/
-    int export_(ref const(InEdge) definition)
+    int export_(const(Node)* node, InSlot slot)
     in (this.assertInitialized)
-    out (index; index < 0 || this.topLevel.outSlots[index].target == &definition)
-    {
+    out (index) {
+        if (index >= 0) {
+            OutEdge e = this.topLevel.outSlots[index];
+            assert(e.targetNode == node);
+            assert(e.targetSlot == slot.id);
+        }
+    } do {
         // safety check before getting a mutable alias
-        auto node = definition.owner;
-        auto storage = this.inArena(node);
+        NodeStorage* storage = this.inArena(node);
         if (storage == null) {
             version (assert) assert(false, "can't export definition from outside the graph");
             else return -EACCES;
         }
-        InEdge* def = storage.asNode.opIndex(definition.id);
 
         // grow the export array if needed (does not cause any rehashing)
         if (this._exported.full) {
@@ -407,12 +374,13 @@ struct Graph {
         }
 
         // push the new export and only then update the "public" view
-        const failed = this._exported.push(OutEdge(def.kind, def));
+        OutEdge edge = OutEdge(slot.kind, storage.asNode, slot.id);
+        const failed = this._exported.push(edge);
         assert(!failed);
         this.topLevel.outSlots = this._exported.usedSlice;
 
         // remember to register the top-level as an in-neighbor before returning
-        this.getInNeighbors(node).add(this.topLevel.asNode);
+        this.adjacencies[HashConsedNode(storage.asNode)].add(this.topLevel.asNode);
         int index = this.exported - 1;
         return index;
     }
@@ -433,8 +401,8 @@ struct Graph {
     {
         if (consumed is this) return 0; // #noAlias
 
-        // TCC: what if one graph is a macro node in the other?
-        // TCC: implement macro expansion
+        // TODO: what if one graph is a macro node in the other?
+        // TODO: implement macro expansion
 
         // in case the arena can't fit both graphs, we'll create a bigger third
         // graph and merge the other two into it (in the right order)
@@ -459,31 +427,22 @@ struct Graph {
         // we begin by reallocating this graph's import and export arrays
         const ins = this.imported + consumed.imported;
         const outs = this.exported + consumed.exported;
-        auto newImports = allocate!InEdge(ins);
+        auto newImports = allocate!InSlot(ins);
         auto newExports = allocate!OutEdge(outs);
         if ((ins > 0 && newImports == null) || (outs > 0 && newExports == null)) {
-            newImports.deallocate();
             newExports.deallocate();
+            newImports.deallocate();
             return ENOMEM;
         }
+        //
+        const oldImportCount = this.imported;
         foreach (i, inEdge; this.topLevel.inSlots) newImports[i] = inEdge;
         foreach (i, outEdge; this.topLevel.outSlots) newExports[i] = outEdge;
-
-        // we still need to rewire in-neighbors of this graph's top-level, so
-        // we do that before deallocating its current import array. since a macro
-        // node's hash depends only on its ID, we don't need to invalidate caches
-        auto oldImports = this.topLevel.inSlots;
-        const oldImportCount = oldImports.length;
-        this.topLevel.inSlots = newImports;
-        foreach (inNeighbor; this.getInNeighbors(this.topLevel.asNode).byKey) {
-            foreach (ref edge; NodeStorage.ofNode(inNeighbor).outEdges) {
-                if (edge.target.owner == this.topLevel.asNode) {
-                    edge.rewire(this._topLevel, edge.target.id);
-                }
-            }
-        }
-        oldImports.deallocate(); // ok to free now that there are no refs to it
+        //
         this._exported.array.deallocate();
+        this.topLevel.inSlots.deallocate();
+        //
+        this.topLevel.inSlots = newImports;
         this._exported.array = newExports;
         this.topLevel.outSlots = this._exported.usedSlice;
 
@@ -491,9 +450,12 @@ struct Graph {
         // graph, so before mutating anything we'll save its in-neighbor set
         UnsafeHashSet!(Node*) invalidationFrontier;
         scope(exit) invalidationFrontier.dispose();
-        err_t error = 0;
-        invalidationFrontier = consumed.getInNeighbors(consumed.topLevel.asNode).dup(error);
-        assert(!error);
+        {
+            err_t error = 0;
+            const key = HashConsedNode(consumed.topLevel.asNode);
+            invalidationFrontier = consumed.adjacencies[key].dup(error);
+            assert(!error);
+        }
 
         // now we do the actual merge of imports & exports. once this happens,
         // our two graphs are interwined: this graph's top-level has edges into
@@ -509,9 +471,8 @@ struct Graph {
             assert(inEdge.id == offset);
             const newIndex = oldImportCount + offset;
             assert(newIndex >= oldImportCount);
-            this.topLevel.inSlots[newIndex] = InEdge(
+            this.topLevel.inSlots[newIndex] = InSlot(
                 inEdge.kind, // same kind
-                this.topLevel.asNode, // different owner
                 cast(uint)newIndex // ID with offset
             );
         }
@@ -519,12 +480,12 @@ struct Graph {
         // reachable, which means the GC will never move it into this graph
         foreach (inNeighbor; invalidationFrontier.byKey) {
             foreach (ref edge; NodeStorage.ofNode(inNeighbor).outEdges) {
-                if (edge.target.owner == consumed.topLevel.asNode) {
-                    const offset = edge.target.id;
-                    assert(edge.target == &consumed.topLevel.inSlots[offset]);
+                if (edge.targetNode == consumed.topLevel.asNode) {
+                    const offset = edge.targetSlot;
+                    assert(consumed.topLevel.inSlots[offset].id == offset);
                     const newIndex = oldImportCount + offset;
-                    assert(newIndex <= InEdge.ID.max);
-                    edge.rewire(this._topLevel, cast(InEdge.ID)newIndex);
+                    edge.targetNode = this.topLevel.asNode;
+                    edge.targetSlot = InSlot(edge.kind, newIndex).id;
                 }
             }
         }
@@ -532,12 +493,13 @@ struct Graph {
         // before the GC moves the consumed graph, we'll refresh its cached hashes
         consumed.refreshHashes(invalidationFrontier);
 
-        // the GC itself does precise mark & sweep, where we use the forwading bit
-        // on every node to signal whether its been visited already or not.
+        // the GC itself is similar to a copying GC, where we use the forwading
+        // bit on every node to signal whether its been visited already or not.
         // after visiting a node, we'll set that bit and leave the node with a
         // "broken heart", a forwarding pointer which leads us to its new place.
         // also, since we're moving nodes, we might as well improve locality of
         // future traversals, so we do them in "root-first-depth-second" order
+        // by using an auxiliary stack (this is where it deviates from Cheney's)
 
         // since we're going depth-first, we'll use a stack to hold grey objects
         alias Stack = List!(NodeStorage*);
@@ -571,16 +533,14 @@ struct Graph {
 
         // step 1: we begin by greying out roots, i.e. the merged exports
         foreach (edge; this._exported[beginGcRoots .. endGcRoots]) {
-            auto root = edge.target.owner;
-            assert(!root.wasVisited && !root.isForwarding);
-            root.wasVisited = true;
-            forcePush(stack, NodeStorage.ofNode(root));
+            auto node = edge.targetNode;
+            assert(!node.wasVisited && !node.isForwarding);
+            node.wasVisited = true;
+            forcePush(stack, NodeStorage.ofNode(node));
         }
 
         // step 2: mark phase darkens all grey objects and what they can reach
         auto addedBegin = this.cursor;
-        UnsafeHashSet!(Node*) hitList;
-        scope(exit) hitList.dispose();
         while (!stack.empty) {
             // we always pop a grey object which is in the CONSUMED graph
             auto oldStorage = pop(stack);
@@ -593,12 +553,9 @@ struct Graph {
             bool wasRedundant = false;
             auto newStorage = this.add(oldStorage, wasRedundant);
             assert(newStorage != null);
-            // in order to avoid leaking memory when hash consing kicks in, we need
+            // avoid leaking memory when hash consing kicks in
             // to remember this node and free it later (when it is safe to do so)
-            if (wasRedundant) {
-                error = hitList.add(oldNode);
-                assert(!error);
-            }
+            if (wasRedundant) oldStorage.dispose();
             oldNode.forwardingPointer = newStorage.asNode;
 
             // now, we darken this node's neighbors, but only if they're white
@@ -606,7 +563,7 @@ struct Graph {
             // graph (so that we never stack nodes from THIS graph, which would
             // have been possible in the case of a hash consed node)
             foreach (outEdge; newStorage.outEdges) {
-                auto neighbor = outEdge.target.owner;
+                auto neighbor = outEdge.targetNode;
                 if (neighbor.wasVisited) continue;
                 if (!consumed.inArena(neighbor)) continue;
                 neighbor.wasVisited = true;
@@ -625,12 +582,12 @@ struct Graph {
             // all of its out-neighbors were transfered as well, so we chase
             // outgoing pointers in order to adjust edges and in-neighbor sets
             foreach (ref outEdge; storage.outEdges) {
-                auto outNeighbor = outEdge.target.owner;
+                auto outNeighbor = outEdge.targetNode;
                 if (outNeighbor.isForwarding) {
                     outNeighbor = outNeighbor.forwardingPointer;
-                    outEdge.rewire(NodeStorage.ofNode(outNeighbor), outEdge.target.id);
+                    outEdge.targetNode = outNeighbor;
                 }
-                error = this.getInNeighbors(outNeighbor).add(node);
+                const error = this.adjacencies[HashConsedNode(outNeighbor)].add(node);
                 assert(!error);
             }
 
@@ -640,28 +597,12 @@ struct Graph {
 
         // step 4: the "sweep" phase happens when we free the consumed graph
         // (notice that NodeStorage.dispose() takes moved nodes into account)
-        // but before that we need to restore type info for hash consed nodes
-        foreach (ref redundantNode; hitList.byKey) {
-            assert(consumed.inArena(redundantNode));
-            assert(redundantNode.isForwarding);
-            auto vptr = redundantNode.forwardingPointer.vptr;
-            redundantNode.vptr = vptr;
-            assert(!redundantNode.isForwarding);
-        }
         consumed.dispose();
         return 0;
     }
 
  private:
-    inout(InNeighbors)* getInNeighbors(const(Node)* node) inout pure {
-        auto key = const(HashConsedNode)(node);
-        inout(HashConsedNode)* found;
-        inout(InNeighbors)* inNeighbors;
-        this.adjacencies.get(key, found, inNeighbors);
-        return found ? inNeighbors : null;
-    }
-
-    inout(NodeStorage)* inArena(inout(Node)* node) inout pure
+    inout(NodeStorage)* inArena(const(Node)* node) inout pure
     out (result; result == null || result.asNode == node)
     {
         auto ptr = NodeStorage.ofNode(node);
@@ -678,7 +619,7 @@ struct Graph {
     // shallow copy a node into the graph assuming there's space for it,
     // returning the resulting internal pointer (stable until the next GC)
     // NOTE: node structure must be stable and its hash already cached, which
-    // implies its dependencies were also hashed (may need a topological sort)
+    // implies its dependencies were also hashed (may need a reverse toposort)
     NodeStorage* add(NodeStorage* temp, out bool redundant)
     in (this.cursor < this.arena.length, "no space in the graph")
     in (!temp.asNode.isForwarding, "nodes added to the graph must be valid")
@@ -694,7 +635,6 @@ struct Graph {
         // add the new node to the graph, with an empty set of in-neighbors
         NodeStorage* newStorage = &this.arena[this.cursor];
         copyEmplace(*temp, *newStorage);
-        newStorage.opPostMove(*temp);
         auto handle = HashConsedNode(newStorage.asNode);
         const error = (this.adjacencies[handle] = InNeighbors.init);
         assert(!error);
@@ -704,6 +644,7 @@ struct Graph {
     }
 
     // updates invalidated hashes in this graph, starting from the given set
+    // TODO: consider a queue for better performance. also, test this
     void refreshHashes(ref UnsafeHashSet!(Node*) workSet) {
         Node* popAny(ref UnsafeHashSet!(Node*) set) {
             auto popped = set.byKey.front;
@@ -742,7 +683,7 @@ struct Graph {
     }
 }
 
-// TODO: expose a query/pass/transformation API over Graphs (check other libs for inspiration)
+// TODO: expose a query/pass/transformation API over Graphs (check out other frameworks for inspiration)
 
 
 /++
@@ -750,7 +691,7 @@ Temporary buffer used to add nodes to a [Graph].
 
 Most operations on a graph involve adding multiple nodes at once.
 This type does precisely that, while verifying IR rules, expanding graph memory as needed and wiring up in-neighbors correctly.
-Last but not least: it will also perform "bread-and-butter" peephole optimizations (e.g. arithmetic simplification, constant folding and strength reduction) automatically.
+Last but not least: it will also perform some peephole optimizations (e.g. arithmetic simplification, constant folding and weak strength reduction) automatically.
 +/
 struct Subgraph {
  private:
@@ -768,7 +709,7 @@ struct Subgraph {
         return this.nursery.rehash(n);
     }
 
-    /// This type's resources get automatically deallocated on scope exit (also, it is not copyable).
+    /// Subgraph resources are automatically freed on scope exit (also, it is not a copyable type).
     ~this() {
         foreach (storage; this.nursery.byKey) {
             storage.dispose();
@@ -831,40 +772,37 @@ struct Subgraph {
         }
     }
 
+    // TODO: make this API less repetitive
     /++
     Links two edge slots within this subgraph.
 
-    The updated out-edge's slot kind will be automatically set to match `to`'s'.
+    The updated out-edge's color will be automatically set to match `slot`'s'.
 
     Params:
         node = Node being updated.
         index = Required when the field is only accessible through an indirection.
-        to = Target in-edge slot.
+        target = Target node.
+        slot = Target slot.
     +/
-    err_t link(string member, NodeType)(NodeType* node, InEdge* to)
+    err_t link(string member, U, V)(U* node, V* target, InSlot slot)
     if (is(typeof(mixin(`node.` ~ member)) == OutEdge))
     in (
-        NodeStorage.ofNode(node.asNode) in this.nursery && NodeStorage.ofNode(to.owner) in this.nursery,
+        NodeStorage.ofNode(node.asNode) in this.nursery && NodeStorage.ofNode(target.asNode) in this.nursery,
         "tried to update a node from another subgraph"
     ) do {
-        auto link = OutEdge(to.kind, to);
+        auto link = OutEdge(slot.kind, target.asNode, slot.id);
         mixin(`node.` ~ member ~ ` = link;`);
         return 0;
     }
 
     /// ditto
-    pragma(inline) err_t link(string member, NodeType)(NodeType* node, ref InEdge to) {
-        return link!member(node, &to);
-    }
-
-    /// ditto
-    err_t link(string member, NodeType)(NodeType* node, size_t index, InEdge* to)
+    err_t link(string member, U, V)(U* node, size_t index, V* target, InSlot slot)
     if (__traits(compiles, mixin(`node.` ~ member ~ `[index] = OutEdge.init`)))
     in (
-        NodeStorage.ofNode(node.asNode) in this.nursery && NodeStorage.ofNode(to.owner) in this.nursery,
+        NodeStorage.ofNode(node.asNode) in this.nursery && NodeStorage.ofNode(target.asNode) in this.nursery,
         "tried to update a node from another subgraph"
     ) do {
-        auto link = OutEdge(to.kind, to);
+        auto link = OutEdge(slot.kind, target.asNode, slot.id);
         alias FieldType = typeof(mixin(`node.` ~ member));
         static if (is(FieldType == UnsafeHashMap!(ulong, OutEdge))) {
             return mixin(`node.` ~ member ~ `[index] = link`);
@@ -873,11 +811,6 @@ struct Subgraph {
             mixin(`node.` ~ member ~ `[index] = link;`);
             return 0;
         }
-    }
-
-    /// ditto
-    pragma(inline) err_t link(string member, NodeType)(NodeType* node, size_t index, ref InEdge to) {
-        return link!member(node, index, &to);
     }
 
     /++
@@ -892,6 +825,8 @@ struct Subgraph {
     In fact, the only thing users can do in the post-hook is to use the first argument to choose whether or not to call [Graph] methods on the second argument.
     +/
     alias PostHook = void delegate(const(Node)*, const(Node)*) @nogc nothrow;
+    // TODO: this scheme wouldn't really be needed if `Subgraph` was actually a
+    // `Transaction`, which we could implement with some more metaprogramming
 
     /++
     Commits this subgraph into a parent graph.
@@ -902,7 +837,7 @@ struct Subgraph {
     Returns: Zero on success, non-zero otherwise.
     +/
     err_t commit(ref Graph graph, scope PostHook postHook) {
-        // TCC: validate nodes and check IR rules BEFORE mutating anything
+        // TODO: validate nodes and check IR rules BEFORE mutating anything
 
         // compute how much space we need and how much we have available
         const neededSpace = this.nursery.length;
@@ -923,10 +858,6 @@ struct Subgraph {
             move(newGraph, graph);
         }
 
-        // set of nodes which were hash-consed and therefore need to be deallocated
-        UnsafeHashSet!(Node*) hitList;
-        scope(exit) hitList.dispose();
-
         // set of nodes which still need fixing after the depth-first traversal
         UnsafeHashSet!(JoinNode*) joinNodes;
         scope(exit) joinNodes.dispose();
@@ -942,13 +873,13 @@ struct Subgraph {
             // (except on join nodes, since they are allowed to induce cycles)
             if (!isJoinNode) {
                 foreach (ref outEdge; original.outEdges) {
-                    auto outNeighbor = NodeStorage.ofNode(outEdge.target.owner);
+                    auto outNeighbor = NodeStorage.ofNode(outEdge.targetNode);
                     // we'll only recurse if the out-neighbor's also in the nursery
                     if (outNeighbor !in this.nursery) continue;
                     auto newNeighbor = depthFirstAdd(outNeighbor);
                     assert(newNeighbor != null);
                     // then, rewire this node's out-edge to its updated neighbor
-                    outEdge.rewire(newNeighbor, outEdge.target.id);
+                    outEdge.targetNode = newNeighbor.asNode;
                 }
             }
 
@@ -959,13 +890,8 @@ struct Subgraph {
             assert(transferred != null);
             Node* newNode = transferred.asNode;
             // small detail: if hash consing reveals that this node is redundant,
-            // we need to deallocate its payload (if any) to avoid leaks. however,
-            // since there may still be pointers into it, we need to defer this
-            // until after edges are adjusted to avoid use-after free bugs
-            if (wasRedundant) {
-                const error = hitList.add(oldNode);
-                assert(!error);
-            }
+            // we need to deallocate its payload (if any) to avoid leaks.
+            if (wasRedundant) original.dispose();
             // sanity check: the old node has a broken heart, not the new one
             oldNode.forwardingPointer = newNode;
             assert(oldNode.isForwarding && !newNode.isForwarding);
@@ -974,9 +900,9 @@ struct Subgraph {
             // add it to the in-neighbor set of each of its out-neighbors
             if (!isJoinNode) {
                 foreach (ref outEdge; transferred.outEdges) {
-                    auto outNeighbor = outEdge.target.owner;
+                    auto outNeighbor = Graph.HashConsedNode(outEdge.targetNode);
                     assert(!outNeighbor.isForwarding);
-                    const error = graph.getInNeighbors(outNeighbor).add(newNode);
+                    const error = graph.adjacencies[outNeighbor].add(newNode);
                     assert(!error);
                 }
             } else {
@@ -996,14 +922,15 @@ struct Subgraph {
         // their edges were rewired and that they have been registered as in-neighbors
         foreach (join; joinNodes.byKey) {
             foreach (ref outEdge; join.outEdges) {
-                Node* outNeighbor = outEdge.target.owner;
+                Node* outNeighbor = outEdge.targetNode;
                 // some of their pointers may still need to be rewired
                 if (outNeighbor.isForwarding) {
                     outNeighbor = outNeighbor.forwardingPointer;
-                    outEdge.rewire(NodeStorage.ofNode(outNeighbor), outEdge.target.id);
+                    outEdge.targetNode = outNeighbor;
                 }
                 // and we must ensure the join is registered as an in-neighbor
-                const error = graph.getInNeighbors(outNeighbor).add(join.asNode);
+                const key = Graph.HashConsedNode(outNeighbor);
+                const error = graph.adjacencies[key].add(join.asNode);
                 assert(!error);
             }
         }
@@ -1016,17 +943,8 @@ struct Subgraph {
             postHook(oldNode, newNode);
         }
 
-        // no one should still have pointers to hash-consed nodes, so we can
-        // restore their type info to let the destructor free their payloads
-        foreach (ref redundantNode; hitList.byKey) {
-            assert(redundantNode.isForwarding);
-            auto vptr = redundantNode.forwardingPointer.vptr;
-            redundantNode.vptr = vptr;
-            assert(!redundantNode.isForwarding);
-        }
-
-        // TCC: pre-hook to connect TO external nodes (e.g. imports)
-        // TCC: peephole optimizations
+        // TODO: pre-hook to connect TO external nodes (e.g. imports)
+        // TODO: peephole optimizations
 
         destroy(this);
         return 0;
@@ -1062,27 +980,27 @@ struct Subgraph {
         auto c1 = insert!const_(1);
 
         auto params = foo.channels[0];
-        auto ret = &params[0];
-        auto x = &params[1];
+        auto ret = params[0];
+        auto x = params[1];
 
-        link!"control"(foo, jmp.control);
+        link!"control"(foo, jmp, jmp.control);
 
-        link!"continuation"(jmp, ret);
-        link!"arguments"(jmp, 0, y.quotient);
+        link!"continuation"(jmp, foo, ret);
+        link!"arguments"(jmp, 0, y, y.quotient);
 
-        link!"dividend"(y, a.result);
-        link!"divisor"(y, b.result);
+        link!"dividend"(y, a, a.result);
+        link!"divisor"(y, b, b.result);
 
-        link!"lhs"(a, x);
-        link!"rhs"(a, c1.value);
+        link!"lhs"(a, foo, x);
+        link!"rhs"(a, c1, c1.value);
 
-        link!"lhs"(b, c1.value);
-        link!"rhs"(b, x);
+        link!"lhs"(b, c1, c1.value);
+        link!"rhs"(b, foo, x);
 
         commit(graph, (node, inGraph){
             if (node is foo.asNode) {
                 auto fooInGraph = JoinNode.ofNode(inGraph);
-                graph.export_(fooInGraph.definition);
+                graph.export_(inGraph, fooInGraph.definition);
             }
         });
     }
@@ -1104,25 +1022,25 @@ struct Subgraph {
         auto c1 = insert!const_(1);
         auto y = insert!add;
 
-        link!"lhs"(y, c1.value);
-        link!"rhs"(y, c1.value);
+        link!"lhs"(y, c1, c1.value);
+        link!"rhs"(y, c1, c1.value);
 
         // these have a dynamic payload, but are subject to hash consing, so
         // this helps us test that both payloads get deallocated correctly
         auto deadCode2 = insert!sel;
-        link!"selector"(deadCode2, c1.value);
-        link!"inputs"(deadCode2, 0, y.result);
-        link!"inputs"(deadCode2, 1, c1.value);
+        link!"selector"(deadCode2, c1, c1.value);
+        link!"inputs"(deadCode2, 0, y, y.result);
+        link!"inputs"(deadCode2, 1, c1, c1.value);
         auto deadCode1 = insert!sel;
-        link!"selector"(deadCode1, c1.value);
-        link!"inputs"(deadCode1, 0, y.result);
-        link!"inputs"(deadCode1, 1, c1.value);
+        link!"selector"(deadCode1, c1, c1.value);
+        link!"inputs"(deadCode1, 0, y, y.result);
+        link!"inputs"(deadCode1, 1, c1, c1.value);
 
         commit(g1, (node, inGraph){
             if (node is y.asNode) {
                 auto yInGraph = AdditionNode.ofNode(inGraph);
                 assert(yInGraph);
-                g1.export_(yInGraph.result);
+                g1.export_(inGraph, yInGraph.result);
             }
         });
     }
@@ -1140,14 +1058,14 @@ struct Subgraph {
         auto c1 = insert!const_(1);
         auto y = insert!add;
 
-        link!"lhs"(y, c1.value);
-        link!"rhs"(y, c1.value);
+        link!"lhs"(y, c1, c1.value);
+        link!"rhs"(y, c1, c1.value);
 
         commit(g2, (node, inGraph){
             if (node is y.asNode) {
                 auto incInGraph = AdditionNode.ofNode(inGraph);
                 assert(incInGraph);
-                g2.export_(incInGraph.result);
+                g2.export_(inGraph, incInGraph.result);
             }
         });
     }

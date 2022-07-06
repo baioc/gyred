@@ -236,15 +236,19 @@ struct UnsafeHashMap(Key, Value) {
     }
 
     /++
-    Returns the value associated with a given key, or its `.init` in case it's not in the table.
+    Returns (a ref to) the value associated with a given key.
+
+    If there is no entry associated with the given key, dereferencing this function's return value leads to undefined behavior.
 
     See_Also: [require], [get]
     +/
-    static if (Value.sizeof > 0) inout(Value) opIndex()(auto ref const(Key) key) inout {
+    static if (Value.sizeof > 0) ref inout(Value) opIndex()(auto ref const(Key) key) inout
+    in (key in this, "tried to index a key which was not in the hash table")
+    {
         inout(Key)* keyp;
         inout(Value)* valp;
-        const found = this.get(key, keyp, valp);
-        return found ? *valp : Value.init;
+        this.get(key, keyp, valp);
+        return *valp;
     }
 
     /++
@@ -372,12 +376,7 @@ struct UnsafeHashMap(Key, Value) {
 
     /// ditto
     err_t rehash() {
-        enum targetLoadFactor = Rational!size_t(1, 2);
-        enum allocationAdjustment = maxLoadFactor / targetLoadFactor;
-        static assert(allocationAdjustment >= 1.0);
-        auto newCapacity = cast(size_t)(this.length * allocationAdjustment);
-        newCapacity = newCapacity < this.length ? this.length : newCapacity; // overflow check
-        return this.rehash(newCapacity);
+        return this.rehash(this.length);
     }
 
     private pragma(inline) bool getEntry(
@@ -620,6 +619,7 @@ struct UnsafeHashMap(Key, Value) {
             private this(typeof(this.table) t) {
                 this.table = t;
                 this.updateIndexFrom(0);
+                // OPT: what if we already knew a good starting index
             }
 
             private void updateIndexFrom(size_t i) {
@@ -818,9 +818,9 @@ nothrow @safe unittest {
 
 
 /++
-Safe version of [UnsafeHashMap]; same API.
+Safe version of [UnsafeHashMap].
 
-Uses reference counting to avoid manual deallocation problems (i.e. double free) and never exposes references to its internal storage (so the API is actually just slightly different).
+Uses reference counting to avoid manual deallocation problems (i.e. double free) and never exposes references to its internal storage (so the API is similar but not the same).
 Again, this type uses reference counting, so cycles must be avoided to ensure memory doesn't leak.
 +/
 struct HashMap(Key, Value) {

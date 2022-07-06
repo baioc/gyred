@@ -7,7 +7,7 @@
 	"mainSourceFile": "source/app.d",
 
 	"dependencies": {
-		"betterclist": "~>0.2.2"
+		"betterclist": "==0.2.2"
 	},
 
 	"toolchainRequirements": {
