@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+        <title>Graph.initialize (gyre.graph.Graph.initialize)</title>
+	<meta charset="utf-8" />
+	<meta content="width=device-width, initial-scale=1" name="viewport" />
+        <link href="style.css" rel="stylesheet" />
+        <script src="script.js" type="text/javascript"></script>
+
+	
+	<link href="search-results.html" rel="prefetch" />
+</head>
+<body>
+	<div id="page-header">
+		<div id="logotype">
+		<span>Documentation</span>
+		<nav>
+			<a href="http://dlang.org/">Dlang.org</a>
+		<a href="https://github.com/baioc/gyred/">GyreD (source)</a></nav>
+		</div>
+
+		<form action="search-docs.html" id="search">
+			<input name="searchTerm" placeholder="Find a symbol name..." type="search" />
+			<input type="submit" value="Go" />
+		</form>
+	</div>
+	<div id="page-body">
+		<div id="page-content">
+		<h1>Graph.initialize</h1><div class="breadcrumbs"><a class="breadcrumb" href="gyre.html">gyre</a> <a class="breadcrumb" href="gyre.graph.html">graph</a> <a class="breadcrumb" href="gyre.graph.Graph.html">Graph</a> </div><div><div class="documentation-comment synopsis"><div><p>Initializes an empty Gyre graph, must be later <a class="xref" href="gyre.graph.Graph.dispose.html">dispose</a>d to avoid leaking memory.</p><p>Our graphs eliminate dead code automatically.
+    Therefore, every static top-level definition must be &quot;anchored&quot; to the graph, as if it was being &quot;exported&quot; to code outside of this graph.
+    Nodes which are not directly exported and aren't reachable by an exported node may be marked as dead code and silently eliminated.
+    Similarly, a graph may also depend on external information (<tt class="inline-code">type</tt> parameters, for instance), in which case it needs to point to these imported definitions.</p></div></div></div><div class="annotated-prototype"><div class="function-prototype"><div class="parent-prototype"><span class="builtin-type">struct</span> <span class="name">Graph</span></div><div><div class="attributes">@<span class="name" data-ident="nogc">nogc</span> nothrow </div><div class="return-type"><a class="name" data-ident="err_t" href="eris.core.err_t.html" title="eris.core.err_t">err_t</a></div><div class="function-name">initialize</div><div class="template-parameters" data-count="0"></div><div class="runtime-parameters" data-count="4"><div class="parameters-list toplevel"><span class="paren">(</span><div class="runtime-parameter-item parameter-item"><span class="parameter-type-holder"><span class="parameter-type"><span class="name" data-ident="MacroNode">MacroNode.ID</span></span></span> <span class="parameter-name name" data-ident="id"><a href="#param-id">id</a></span></div><span class="comma">,</span><div class="runtime-parameter-item parameter-item"><span class="parameter-type-holder"><span class="parameter-type"><span class="builtin-type">uint</span></span></span> <span class="parameter-name name" data-ident="exports"><a href="#param-exports">exports</a></span><span class="parameter-default-value">&#160;=&#160;1</span></div><span class="comma">,</span><div class="runtime-parameter-item parameter-item"><span class="parameter-type-holder"><span class="parameter-type"><span class="builtin-type">uint</span></span></span> <span class="parameter-name name" data-ident="imports"><a href="#param-imports">imports</a></span><span class="parameter-default-value">&#160;=&#160;0</span></div><span class="comma">,</span><div class="runtime-parameter-item parameter-item"><span class="parameter-type-holder"><span class="parameter-type"><span class="name" data-ident="size_t">size_t</span></span></span> <span class="parameter-name name" data-ident="capacity"><a href="#param-capacity">capacity</a></span><span class="parameter-default-value">&#160;=&#160;64</span></div><span class="paren">)</span></div></div><div class="function-contracts"></div></div></div></div><div><h2 id="parameters">Parameters</h2><dl class="parameter-descriptions"><dt id="param-id"><a class="parameter-name" data-ident="id" href="#param-id">id</a> <span class="parameter-type"><a class="xref" href="gyre.nodes.MacroNode.ID.html" title="gyre.nodes.MacroNode.ID"><span class="name" data-ident="MacroNode">MacroNode</span>.<span class="name" data-ident="ID">ID</span></a></span></dt><dd><div class="documentation-comment"><div><p>This graph's unique identifier.</p></div></div></dd><dt id="param-exports"><a class="parameter-name" data-ident="exports" href="#param-exports">exports</a> <span class="parameter-type"><span class="builtin-type">uint</span></span></dt><dd><div class="documentation-comment"><div><p>Preallocated number of &quot;exported&quot; defs (or <a class="xref" href="gyre.nodes.InEdge.html">in-edge</a>s for <a class="xref" href="gyre.nodes.MacroNode.html">macro node</a> definitions).</p></div></div></dd><dt id="param-imports"><a class="parameter-name" data-ident="imports" href="#param-imports">imports</a> <span class="parameter-type"><span class="builtin-type">uint</span></span></dt><dd><div class="documentation-comment"><div><p>Maximum number of &quot;imported&quot; defs (or <a class="xref" href="gyre.nodes.OutEdge.html">out-edge</a>s for <a class="xref" href="gyre.nodes.MacroNode.html">macro node</a> definitions).</p></div></div></dd><dt id="param-capacity"><a class="parameter-name" data-ident="capacity" href="#param-capacity">capacity</a> <span class="parameter-type"><span class="name" data-ident="size_t">size_t</span></span></dt><dd><div class="documentation-comment"><div><p>Number of nodes to preallocate.</p></div></div></dd></dl><h2 id="returns">Return Value</h2><div><div class="return-type-holder">Type: <span class="return-type"><a class="xref" href="eris.core.err_t.html" title="eris.core.err_t"><span class="name" data-ident="err_t">err_t</span></a></span></div><div class="documentation-comment returns-description"><div><p>Zero on success, non-zero on failure (in which case the graph can't be safely used).</p></div></div></div></div></div>
+		<div id="page-nav"><a class="parent" href="gyre.html">gyre</a> <a class="parent" href="gyre.graph.html">graph</a> <a class="parent" href="gyre.graph.Graph.html">Graph</a> 
+		<span class="type-separator">functions</span><ul><li><a class="function" href="gyre.graph.Graph.dispose.html">dispose</a></li><li><a class="function" href="gyre.graph.Graph.export_.html">export_</a></li><li><a class="function current" href="gyre.graph.Graph.initialize.html">initialize</a></li><li><a class="function" href="gyre.graph.Graph.merge.html">merge</a></li></ul><span class="type-separator">properties</span><ul><li><a class="property" href="gyre.graph.Graph.exported.html">exported</a></li><li><a class="property" href="gyre.graph.Graph.id.html">id</a></li><li><a class="property" href="gyre.graph.Graph.imported.html">imported</a></li><li><a class="property" href="gyre.graph.Graph.length.html">length</a></li></ul></div>
+	</div>
+	<div id="page-footer">Page generated by <a href="https://github.com/adamdruppe/adrdox">adrdox</a></div>
+</body>
+</html>

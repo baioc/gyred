@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+        <title>MacroNode.initialize (gyre.nodes.MacroNode.initialize)</title>
+	<meta charset="utf-8" />
+	<meta content="width=device-width, initial-scale=1" name="viewport" />
+        <link href="style.css" rel="stylesheet" />
+        <script src="script.js" type="text/javascript"></script>
+
+	
+	<link href="search-results.html" rel="prefetch" />
+</head>
+<body>
+	<div id="page-header">
+		<div id="logotype">
+		<span>Documentation</span>
+		<nav>
+			<a href="http://dlang.org/">Dlang.org</a>
+		<a href="https://github.com/baioc/gyred/">GyreD (source)</a></nav>
+		</div>
+
+		<form action="search-docs.html" id="search">
+			<input name="searchTerm" placeholder="Find a symbol name..." type="search" />
+			<input type="submit" value="Go" />
+		</form>
+	</div>
+	<div id="page-body">
+		<div id="page-content">
+		<h1>MacroNode.initialize</h1><div class="breadcrumbs"><a class="breadcrumb" href="gyre.html">gyre</a> <a class="breadcrumb" href="gyre.nodes.html">nodes</a> <a class="breadcrumb" href="gyre.nodes.MacroNode.html">MacroNode</a> </div><div><div class="documentation-comment synopsis"><div><p>Initializes a macro node, must be later <a class="xref" href="gyre.nodes.MacroNode.dispose.html">dispose</a>d.</p><p>This procedure sets up unique indexes for each in-edge slot.
+    All slot kinds default to <tt class="inline-code">data</tt>; this can be changed later.</p></div></div></div><div class="annotated-prototype"><div class="function-prototype"><div class="parent-prototype"><span class="builtin-type">struct</span> <span class="name">MacroNode</span></div><div><div class="attributes">@<span class="name" data-ident="nogc">nogc</span> nothrow static </div><div class="return-type"><a class="name" data-ident="err_t" href="eris.core.err_t.html" title="eris.core.err_t">err_t</a></div><div class="function-name">initialize</div><div class="template-parameters" data-count="0"></div><div class="runtime-parameters" data-count="4"><div class="parameters-list toplevel"><span class="paren">(</span><div class="runtime-parameter-item parameter-item"><span class="parameter-type-holder"><span class="parameter-type"><a class="name" data-ident="MacroNode" href="gyre.nodes.MacroNode.html" title="gyre.nodes.MacroNode">MacroNode</a>*</span></span> <span class="parameter-name name" data-ident="self"><a href="#param-self">self</a></span></div><span class="comma">,</span><div class="runtime-parameter-item parameter-item"><span class="parameter-type-holder"><span class="parameter-type"><span class="builtin-type">uint</span></span></span> <span class="parameter-name name" data-ident="id"><a href="#param-id">id</a></span></div><span class="comma">,</span><div class="runtime-parameter-item parameter-item"><span class="parameter-type-holder"><span class="parameter-type"><span class="builtin-type">uint</span></span></span> <span class="parameter-name name" data-ident="ins"><a href="#param-ins">ins</a></span></div><span class="comma">,</span><div class="runtime-parameter-item parameter-item"><span class="parameter-type-holder"><span class="parameter-type"><span class="builtin-type">uint</span></span></span> <span class="parameter-name name" data-ident="outs"><a href="#param-outs">outs</a></span></div><span class="paren">)</span></div></div><div class="function-contracts"></div></div></div></div><div><h2 id="parameters">Parameters</h2><dl class="parameter-descriptions"><dt id="param-self"><a class="parameter-name" data-ident="self" href="#param-self">self</a> <span class="parameter-type"><a class="xref" href="gyre.nodes.MacroNode.html" title="gyre.nodes.MacroNode"><span class="name" data-ident="MacroNode">MacroNode</span></a>*</span></dt><dd><div class="documentation-comment"><div><p>Address of node being initialized.</p></div></div></dd><dt id="param-id"><a class="parameter-name" data-ident="id" href="#param-id">id</a> <span class="parameter-type"><span class="builtin-type">uint</span></span></dt><dd><div class="documentation-comment"><div><p>Macro node identification number.</p></div></div></dd><dt id="param-ins"><a class="parameter-name" data-ident="ins" href="#param-ins">ins</a> <span class="parameter-type"><span class="builtin-type">uint</span></span></dt><dd><div class="documentation-comment"><div><p>Number of (preallocated) in-edges in this node.</p></div></div></dd><dt id="param-outs"><a class="parameter-name" data-ident="outs" href="#param-outs">outs</a> <span class="parameter-type"><span class="builtin-type">uint</span></span></dt><dd><div class="documentation-comment"><div><p>Number of (preallocated) out-edges in this node.</p></div></div></dd></dl><h2 id="returns">Return Value</h2><div><div class="return-type-holder">Type: <span class="return-type"><a class="xref" href="eris.core.err_t.html" title="eris.core.err_t"><span class="name" data-ident="err_t">err_t</span></a></span></div><div class="documentation-comment returns-description"><div><p>Zero on success, non-zero on failure (OOM).</p></div></div></div></div></div>
+		<div id="page-nav"><a class="parent" href="gyre.html">gyre</a> <a class="parent" href="gyre.nodes.html">nodes</a> <a class="parent" href="gyre.nodes.MacroNode.html">MacroNode</a> 
+		<span class="type-separator">functions</span><ul><li><a class="function" href="gyre.nodes.MacroNode.opEquals.html">opEquals</a></li><li><a class="function" href="gyre.nodes.MacroNode.opIndex.html">opIndex</a></li><li><a class="function" href="gyre.nodes.MacroNode.toHash.html">toHash</a></li></ul><span class="type-separator">properties</span><ul><li><a class="property" href="gyre.nodes.MacroNode.inEdges.html">inEdges</a></li><li><a class="property" href="gyre.nodes.MacroNode.outEdges.html">outEdges</a></li></ul><span class="type-separator">static functions</span><ul><li><a class="static-function" href="gyre.nodes.MacroNode.dispose.html">dispose</a></li><li><a class="static-function current" href="gyre.nodes.MacroNode.initialize.html">initialize</a></li></ul><span class="type-separator">variables</span><ul><li><a class="variable" href="gyre.nodes.MacroNode.id.html">id</a></li><li><a class="variable" href="gyre.nodes.MacroNode.inSlots.html">inSlots</a></li><li><a class="variable" href="gyre.nodes.MacroNode.outSlots.html">outSlots</a></li></ul></div>
+	</div>
+	<div id="page-footer">Page generated by <a href="https://github.com/adamdruppe/adrdox">adrdox</a></div>
+</body>
+</html>

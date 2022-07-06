@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+        <title>HashablePointer (eris.util.HashablePointer)</title>
+	<meta charset="utf-8" />
+	<meta content="width=device-width, initial-scale=1" name="viewport" />
+        <link href="style.css" rel="stylesheet" />
+        <script src="script.js" type="text/javascript"></script>
+
+	
+	<link href="search-results.html" rel="prefetch" />
+</head>
+<body>
+	<div id="page-header">
+		<div id="logotype">
+		<span>Documentation</span>
+		<nav>
+			<a href="http://dlang.org/">Dlang.org</a>
+		<a href="https://github.com/baioc/gyred/">GyreD (source)</a></nav>
+		</div>
+
+		<form action="search-docs.html" id="search">
+			<input name="searchTerm" placeholder="Find a symbol name..." type="search" />
+			<input type="submit" value="Go" />
+		</form>
+	</div>
+	<div id="page-body">
+		<div id="page-content">
+		<h1>HashablePointer</h1><div class="breadcrumbs"><a class="breadcrumb" href="eris.html">eris</a> <a class="breadcrumb" href="eris.util.html">util</a> </div><div><div class="documentation-comment synopsis"><div><p>Generic pointer-like wrapper used to forward hash table operations to its pointed-to object.</p><p>This behaviour can be useful when one wishes to use references as hash table keys: whereas the default hash for pointers is solely based on the address it carries, using this wrapper as a key will call the pointed-to-type's custom hash and equality functions instead (if defined).
+Equality works similarly to <a href="https://dlang.org/spec/operatoroverloading.html#equals">object references</a>: two wrappers always compare equal when their pointers are equal, and the object's <tt class="inline-code">opEquals</tt> only gets called when that's not the case.</p></div></div></div><div class="annotated-prototype"><div class="aggregate-prototype"><div class="attributes"></div><span class="builtin-type">struct</span> HashablePointer (<div class="parameters-list toplevel"><div class="template-parameter-item parameter-item">	<span><span class="name" data-ident="T">T</span></span></div></div>) <a class="lang-feature" href="http://dpldocs.info/template-constraints">if</a> (<div class="template-constraint-expression">!<span class="name" data-ident="isPointer">isPointer</span>!<span class="name" data-ident="T">T</span></div>) {<div class="aggregate-member"><div class="attributes"></div><tt class="highlighted"><span class="hid">T</span>*</tt> <span class="name">ptr</span>;</div>}</div></div><h2 id="alias-this">Alias This</h2><div><a href="eris.util.HashablePointer.ptr.html">ptr</a></div><div><h2 id="examples"><a class="header-anchor" href="#examples">Examples</a></h2><div class="documentation-comment"><div></div></div><div class="unittest-example-holder"><div class="documentation-comment"></div><pre class="d_code highlighted"><span class="kwrd">static</span> <span class="type">bool</span> <span class="hid">usingCustomHash</span> = <span class="kwrd">false</span>;
+<span class="kwrd">struct</span> <span class="hid">S</span> {
+    <span class="kwrd">enum</span> <span class="hid">baz</span> = <span class="kwrd">false</span>;
+    <span class="type">string</span> <span class="hid">bar</span>(<span class="hid">S</span>* <span class="hid">f</span>) { <span class="kwrd">return</span> <span class="str">&quot;ok&quot;</span>; }
+    <span class="hid">size_t</span> <span class="hid">toHash</span>() <span class="kwrd">const</span> {
+        <span class="kwrd">debug</span> <span class="hid">usingCustomHash</span> = <span class="kwrd">true</span>;
+        <span class="kwrd">return</span> <span class="num">42</span>;
+    }
+    <span class="type">bool</span> <span class="hid">opEquals</span>(<span class="kwrd">ref</span> <span class="kwrd">const</span>(<span class="hid">S</span>) <span class="hid">rhs</span>) <span class="kwrd">const</span> {
+        <span class="kwrd">return</span> <span class="kwrd">false</span>; <span class="com">// &lt;- always false</span>
+    }
+}
+
+<span class="com">// a HashablePointer!T mostly works like a T* would</span>
+<span class="hid">S</span> <span class="hid">x</span>;
+<span class="hid">HashablePointer</span>!<span class="hid">S</span> <span class="hid">ptr</span> = &amp;<span class="hid">x</span>;
+<span class="kwrd">assert</span>(<span class="hid">ptr</span> == &amp;<span class="hid">x</span>);
+<span class="kwrd">assert</span>(<span class="hid">ptr</span>.<span class="hid">baz</span> == <span class="hid">x</span>.<span class="hid">baz</span>);
+<span class="kwrd">assert</span>(<span class="hid">ptr</span>.<span class="hid">bar</span>(<span class="hid">ptr</span>) == <span class="hid">x</span>.<span class="hid">bar</span>(&amp;<span class="hid">x</span>)); <span class="com">// implicit conversion</span>
+
+<span class="com">// equality checks may forward to the pointed-to element</span>
+<span class="hid">HashablePointer</span>!<span class="hid">S</span> <span class="hid">sameRef</span> = <span class="hid">ptr</span>;
+<span class="kwrd">assert</span>(<span class="hid">sameRef</span> == <span class="hid">ptr</span>);
+<span class="kwrd">assert</span>(*<span class="hid">sameRef</span> != *<span class="hid">ptr</span>); <span class="com">// see S.opEquals, above</span>
+
+<span class="com">// default raw pointer behaviour:</span>
+<span class="type">bool</span>[<span class="hid">S</span>*] <span class="hid">withRaw</span>;
+<span class="hid">withRaw</span>[&amp;<span class="hid">x</span>] = <span class="kwrd">true</span>;
+<span class="kwrd">debug</span> <span class="kwrd">assert</span>(!<span class="hid">usingCustomHash</span>);
+
+<span class="com">// hashable pointer behaviour:</span>
+<span class="type">bool</span>[<span class="hid">HashablePointer</span>!<span class="hid">S</span>] <span class="hid">withHashable</span>;
+<span class="hid">withHashable</span>[<span class="hid">ptr</span>] = <span class="kwrd">true</span>;
+<span class="kwrd">debug</span> <span class="kwrd">assert</span>(<span class="hid">usingCustomHash</span>);</pre></div></div></div>
+		<div id="page-nav"><a class="parent" href="eris.html">eris</a> <a class="parent" href="eris.util.html">util</a> 
+		<span class="type-separator">functions</span><ul><li><a class="function" href="eris.util.empty.html">empty</a></li></ul><span class="type-separator">structs</span><ul><li><a class="struct current" href="eris.util.HashablePointer.html">HashablePointer</a></li><li><a class="struct" href="eris.util.RefCountedTrusted.html">RefCountedTrusted</a></li></ul></div>
+	</div>
+	<div id="page-footer">Page generated by <a href="https://github.com/adamdruppe/adrdox">adrdox</a></div>
+</body>
+</html>

@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+        <title>gyre.graph (gyre.graph)</title>
+	<meta charset="utf-8" />
+	<meta content="width=device-width, initial-scale=1" name="viewport" />
+        <link href="style.css" rel="stylesheet" />
+        <script src="script.js" type="text/javascript"></script>
+
+	
+	<link href="search-results.html" rel="prefetch" />
+</head>
+<body>
+	<div id="page-header">
+		<div id="logotype">
+		<span>Documentation</span>
+		<nav>
+			<a href="http://dlang.org/">Dlang.org</a>
+		<a href="https://github.com/baioc/gyred/">GyreD (source)</a></nav>
+		</div>
+
+		<form action="search-docs.html" id="search">
+			<input name="searchTerm" placeholder="Find a symbol name..." type="search" />
+			<input type="submit" value="Go" />
+		</form>
+	</div>
+	<div id="page-body">
+		<div id="page-content">
+		<h1>gyre.graph</h1><div class="breadcrumbs"><a class="breadcrumb" href="gyre.html">gyre</a> </div><div><div class="documentation-comment synopsis"><div><p>Program construction and manipulation API.</p><p>Recommended Reading Order:</p><ol class="user-list"><li><a class="xref" href="gyre.nodes.EdgeKind.html">Edge slots</a> and their different kinds</li><li><a class="xref" href="gyre.nodes.Node.html">Generic nodes</a> and <a href="gyre.nodes.Node.html#details">structural sharing</a></li><li>Primitive control operations: <a class="xref" href="gyre.nodes.JoinNode.html">join</a>, <a class="xref" href="gyre.nodes.InstantiationNode.html">inst.</a>, <a class="xref" href="gyre.nodes.JumpNode.html">jump</a>, <a class="xref" href="gyre.nodes.ForkNode.html">fork</a> and <a class="xref" href="gyre.nodes.ConditionalNode.html">cond.</a></li><li><a href="gyre.nodes.html#poison-values-and-ub">Poison values and undefined behavior</a></li><li>Other <a href="gyre.nodes.html#prim-ops-rationale">primitive</a> and <a class="xref" href="gyre.nodes.MacroNode.html">non-primitive</a> nodes</li></ol></div> <a href="#details" id="more-link">More...</a></div></div><div class="annotated-prototype"></div><h2 id="public-imports">Public Imports</h2><div></div><dl class="member-list native"><dt><a href="gyre.nodes.html">gyre.nodes</a><div class="simplified-prototype" style="max-width: 28ch;"><span class="builtin-type">public</span> <tt class="highlighted">
+<span class="kwrd">import</span> <span class="hid">gyre</span>.<span class="hid">nodes</span>;</tt></div></dt><dd><div></div></dd></dl><h2 id="members">Members</h2><h3 class="member-list-header hide-from-toc" id="enum">Enums</h3><dl class="member-list native"><dt><a href="gyre.graph.NodeKind.html">NodeKind</a><div class="simplified-prototype" style="max-width: 14ch;"><span class="builtin-type">enum</span> <span class="name">NodeKind</span></div></dt><dd><div><p>Indicates node types in this module's API.</p></div></dd><dt><a href="gyre.graph.NodeSugar.html">NodeSugar</a><div class="simplified-prototype" style="max-width: 15ch;"><span class="builtin-type">enum</span> <span class="name">NodeSugar</span></div></dt><dd><div><p>Represents frequent <a class="xref" href="gyre.graph.NodeKind.html">NodeKind</a> use patterns.</p></div></dd></dl><h3 class="member-list-header hide-from-toc" id="struct">Structs</h3><dl class="member-list native"><dt><a href="gyre.graph.Graph.html">Graph</a><div class="simplified-prototype" style="max-width: 13ch;"><span class="builtin-type">struct</span> <span class="name">Graph</span></div></dt><dd><div><p>Graph structure storing a Gyre (sub)program.</p></div></dd><dt><a href="gyre.graph.Subgraph.html">Subgraph</a><div class="simplified-prototype" style="max-width: 16ch;"><span class="builtin-type">struct</span> <span class="name">Subgraph</span></div></dt><dd><div><p>Temporary buffer used to add nodes to a <a class="xref" href="gyre.graph.Graph.html">Graph</a>.</p></div></dd></dl><div><h2 id="details">Detailed Description</h2><div class="documentation-comment detailed-description"><div><p>The ADT which most closely resembles Gyre's structure is the directed multigraph: a set of nodes and directed edges, where different edges can have the same nodes at their endpoints.
+Although theoretically quadratic in the worst case, we expect the number of edges to be rougly proportional to the number of nodes in the graph; and we estimate that the number of nodes will grow as a polynomial function of source program size (varying by language being compiled, of course).
+Therefore, we want to keep <a class="xref" href="gyre.nodes.Node.html">node</a>s as slim as possible (and <a class="xref" href="gyre.nodes.EdgeKind.html">edge</a>s even more so), while still being able to transform subgraphs in an efficient manner.</p><p>As seen in <a href="http://beza1e1.tuxen.de/pdfs/braun11wir.pdf">libFIRM</a>, some optimizations can become inherent to the IR if we're able to identify common substructures in the graph.
+In order to make this as efficient as possible, we'll use hash tables and specially crafted hash functions for each node, leveraging <a href="https://en.wikipedia.org/wiki/Static_single_assignment_form">SSA form</a> to approximate semantic equivalence from structural equality.
+This means that hashing a node or comparing two nodes won't be trivial operations, so we better (a) cache hash values; and (b) be careful during structural comparisons, since Gyre graphs can be cyclic.
+More details <a href="gyre.nodes.Node.html#details">here</a>.</p><p><a href="https://www.oracle.com/technetwork/java/javase/tech/c2-ir95-150110.pdf">Click's sea of nodes</a> uses objects and pointers to represent a graph; lets copy that.
+In order to maintain referential integrity (i.e. keeping our pointers valid), we can either (a) allocate all nodes on the global heap and keep that memory pinned for as long as there are references to it (easily done with D's GC), or (b) allocate in bulk and manually manage our memory, fixing references whenever objects are moved (more performant but harder to get right).
+Since we'll want to call this library from other languages, we better err on the side of the <tt class="inline-code">betterC</tt>-compatible option, so (b) it is.
+We'll always manage memory like this in the context of a <a class="xref" href="gyre.graph.Graph.html">Graph</a>.</p></div></div></div></div>
+		<div id="page-nav"><a class="parent" href="gyre.html">gyre</a> 
+		<span class="type-separator">modules</span><ul><li><a class="module current" href="gyre.graph.html">graph</a></li><li><a class="module" href="gyre.mnemonics.html">mnemonics</a></li><li><a class="module" href="gyre.nodes.html">nodes</a></li></ul></div>
+	</div>
+	<div id="page-footer">Page generated by <a href="https://github.com/adamdruppe/adrdox">adrdox</a></div>
+</body>
+</html>

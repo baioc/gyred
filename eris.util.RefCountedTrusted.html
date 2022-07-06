@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+        <title>RefCountedTrusted (eris.util.RefCountedTrusted)</title>
+	<meta charset="utf-8" />
+	<meta content="width=device-width, initial-scale=1" name="viewport" />
+        <link href="style.css" rel="stylesheet" />
+        <script src="script.js" type="text/javascript"></script>
+
+	
+	<link href="search-results.html" rel="prefetch" />
+</head>
+<body>
+	<div id="page-header">
+		<div id="logotype">
+		<span>Documentation</span>
+		<nav>
+			<a href="http://dlang.org/">Dlang.org</a>
+		<a href="https://github.com/baioc/gyred/">GyreD (source)</a></nav>
+		</div>
+
+		<form action="search-docs.html" id="search">
+			<input name="searchTerm" placeholder="Find a symbol name..." type="search" />
+			<input type="submit" value="Go" />
+		</form>
+	</div>
+	<div id="page-body">
+		<div id="page-content">
+		<h1>RefCountedTrusted</h1><div class="breadcrumbs"><a class="breadcrumb" href="eris.html">eris</a> <a class="breadcrumb" href="eris.util.html">util</a> </div><div><div class="documentation-comment synopsis"><div><p>Adapted <a href="https://dlang.org/library/std/typecons/ref_counted.html#1">RefCounted</a> with a <tt class="inline-code">@trusted</tt> destructor.</p></div></div></div><div class="annotated-prototype"><div class="aggregate-prototype"><div class="attributes"></div><span class="builtin-type">struct</span> RefCountedTrusted (<div class="parameters-list toplevel"><div class="template-parameter-item parameter-item">	<span><span class="name" data-ident="T">T</span></span></div><div class="template-parameter-item parameter-item">	<span><span class="name" data-ident="RefCountedAutoInitialize">RefCountedAutoInitialize</span> <span class="name" data-ident="autoInit">autoInit</span> = <span class="name" data-ident="RefCountedAutoInitialize">RefCountedAutoInitialize</span>.<span class="name" data-ident="yes">yes</span></span></div></div>) <a class="lang-feature" href="http://dpldocs.info/template-constraints">if</a> (<div class="template-constraint-expression"><div class="andand-left">!<a class="lang-feature" href="http://dpldocs.info/is-expression">is</a>(<span class="name" data-ident="T">T</span> == class) &amp;&amp; </div><div class="andand-right">!<span class="parenthetical-expression">(<span class="parenthetical-expression-contents"><a class="lang-feature" href="http://dpldocs.info/is-expression">is</a>(<span class="name" data-ident="T">T</span> == interface)</span>)</span></div></div>) {<div class="aggregate-member"><a href="eris.util.RefCountedTrusted.RefCountedStore.html"><span class="builtin-type">struct</span> <span class="name">RefCountedStore</span>;</a></div><div class="aggregate-member"><a href="eris.util.RefCountedTrusted.~this.html"><span class="lang-feature name">~this</span>();</a></div><div class="aggregate-member"><a href="eris.util.RefCountedTrusted.refCountedStore.html"><tt class="highlighted"><span class="kwrd">inout</span>(<span class="hid">RefCountedStore</span>)</tt> <span class="name">refCountedStore</span> [@property getter];</a></div><div class="aggregate-member"><a href="eris.util.RefCountedTrusted.refCountedPayload.1.html"><div class="conditional-compilation-attributes"><span><span class="lang-feature">static if</span>(<span>autoInit == RefCountedAutoInitialize.yes</span>)</span><br />
+</div><tt class="highlighted"><span class="hid">T</span></tt> <span class="name">refCountedPayload</span> [@property getter];</a></div><div class="aggregate-member"><a href="eris.util.RefCountedTrusted.refCountedPayload.2.html"><tt class="highlighted"><span class="kwrd">inout</span>(<span class="hid">T</span>)</tt> <span class="name">refCountedPayload</span> [@property getter];</a></div>}</div></div><h2 id="destructor">Destructor</h2><dl class="member-list"><dt><a href="eris.util.RefCountedTrusted.~this.html">~this</a><div class="simplified-prototype" style="max-width: 7ch;"><span class="lang-feature name">~this</span>()</div></dt><dd><div><p>Can be <tt class="inline-code">@trusted</tt> as long as this type is used correctly.</p></div></dd></dl><h2 id="postblit">Postblit</h2><dl class="member-list"></dl><p>A postblit is present on this object, but not explicitly documented in the source.</p><h2 id="members">Members</h2><h3 class="member-list-header hide-from-toc" id="property">Properties</h3><dl class="member-list native"><dt><a href="eris.util.RefCountedTrusted.refCountedPayload.1.html">refCountedPayload</a><div class="simplified-prototype" style="max-width: 41ch;"><tt class="highlighted"><span class="hid">T</span></tt> <span class="name">refCountedPayload</span> [@property getter]</div></dt><dt><div class="simplified-prototype" style="max-width: 49ch;"><tt class="highlighted"><span class="kwrd">inout</span>(<span class="hid">T</span>)</tt> <span class="name">refCountedPayload</span> [@property getter]</div></dt><dd><div><p>These are the only ways to access the refcounted payload (but the store MUST be initialized)</p></div></dd><dt><a href="eris.util.RefCountedTrusted.refCountedStore.html">refCountedStore</a><div class="simplified-prototype" style="max-width: 62ch;"><tt class="highlighted"><span class="kwrd">inout</span>(<span class="hid">RefCountedStore</span>)</tt> <span class="name">refCountedStore</span> [@property getter]</div></dt><dd><div><p>Accesses the refcounted store, usually to check if (or ensure that) it is initialized.</p></div></dd></dl><h3 class="member-list-header hide-from-toc" id="struct">Structs</h3><dl class="member-list native"><dt><a href="eris.util.RefCountedTrusted.RefCountedStore.html">RefCountedStore</a><div class="simplified-prototype" style="max-width: 24ch;"><span class="builtin-type">struct</span> <span class="name">RefCountedStore</span></div></dt><dd><div><p>Protects a pointer to some reference counted payload.</p></div></dd></dl><div><h2 id="examples"><a class="header-anchor" href="#examples">Examples</a></h2><div class="documentation-comment"><div></div></div><div class="unittest-example-holder"><div class="documentation-comment"></div><pre class="d_code highlighted"><span class="kwrd">static</span> <span class="type">uint</span> <span class="hid">nDestroyed</span> = <span class="num">0</span>;
+<span class="kwrd">struct</span> <span class="hid">Resource</span> {
+    <span class="type">string</span> <span class="hid">name</span>;
+    <span class="kwrd">this</span>(<span class="type">string</span> <span class="hid">name</span>) { <span class="kwrd">this</span>.<span class="hid">name</span> = <span class="hid">name</span>; }
+    @<span class="hid">disable</span> <span class="kwrd">this</span>(<span class="kwrd">this</span>);
+    ~<span class="kwrd">this</span>() { <span class="kwrd">debug</span> ++<span class="hid">nDestroyed</span>; }
+}
+
+{
+    <span class="kwrd">auto</span> <span class="hid">rc1</span> = <span class="hid">RefCountedTrusted</span>!<span class="hid">Resource</span>(<span class="str">&quot;thing&quot;</span>);
+    <span class="kwrd">assert</span>(<span class="hid">rc1</span>.<span class="hid">refCountedStore</span>.<span class="hid">isInitialized</span>);
+    <span class="hid">rc1</span>.<span class="hid">refCountedStore</span>.<span class="hid">ensureInitialized</span>();
+
+    {
+        <span class="kwrd">auto</span> <span class="hid">rc2</span> = <span class="hid">rc1</span>;
+        <span class="hid">RefCountedTrusted</span>!<span class="hid">Resource</span> <span class="hid">rc3</span>;
+        <span class="hid">rc3</span> = <span class="hid">rc2</span>;
+        () @<span class="hid">trusted</span> { <span class="kwrd">assert</span>(<span class="hid">rc3</span>.<span class="hid">refCountedPayload</span>.<span class="hid">name</span> == <span class="str">&quot;thing&quot;</span>); }();
+    }
+
+    <span class="com">// ~rc2 and ~rc3 didn't destroy the resource: there's still one ref</span>
+    <span class="kwrd">debug</span> <span class="kwrd">assert</span>(<span class="hid">nDestroyed</span> == <span class="num">0</span>);
+}
+
+<span class="com">// now the last reference is removed and the resource is destroyed</span>
+<span class="kwrd">debug</span> <span class="kwrd">assert</span>(<span class="hid">nDestroyed</span> == <span class="num">1</span>);</pre></div><h2 id="meta">Meta</h2><div class="documentation-comment version-section other-section"><h3 id="version">Version</h3><div><p>XXX: See related <a href="https://issues.dlang.org/show_bug.cgi?id=17867">bug reports</a> and <a href="https://github.com/dlang/phobos/pull/8368">pull requests</a>.</p></div></div></div></div>
+		<div id="page-nav"><a class="parent" href="eris.html">eris</a> <a class="parent" href="eris.util.html">util</a> 
+		<span class="type-separator">functions</span><ul><li><a class="function" href="eris.util.empty.html">empty</a></li></ul><span class="type-separator">structs</span><ul><li><a class="struct" href="eris.util.HashablePointer.html">HashablePointer</a></li><li><a class="struct current" href="eris.util.RefCountedTrusted.html">RefCountedTrusted</a></li></ul></div>
+	</div>
+	<div id="page-footer">Page generated by <a href="https://github.com/adamdruppe/adrdox">adrdox</a></div>
+</body>
+</html>

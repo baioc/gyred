@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+        <title>EdgeKind (gyre.nodes.EdgeKind)</title>
+	<meta charset="utf-8" />
+	<meta content="width=device-width, initial-scale=1" name="viewport" />
+        <link href="style.css" rel="stylesheet" />
+        <script src="script.js" type="text/javascript"></script>
+
+	
+	<link href="search-results.html" rel="prefetch" />
+</head>
+<body>
+	<div id="page-header">
+		<div id="logotype">
+		<span>Documentation</span>
+		<nav>
+			<a href="http://dlang.org/">Dlang.org</a>
+		<a href="https://github.com/baioc/gyred/">GyreD (source)</a></nav>
+		</div>
+
+		<form action="search-docs.html" id="search">
+			<input name="searchTerm" placeholder="Find a symbol name..." type="search" />
+			<input type="submit" value="Go" />
+		</form>
+	</div>
+	<div id="page-body">
+		<div id="page-content">
+		<h1>EdgeKind</h1><div class="breadcrumbs"><a class="breadcrumb" href="gyre.html">gyre</a> <a class="breadcrumb" href="gyre.nodes.html">nodes</a> </div><div><div class="documentation-comment synopsis"><div><p>Possible edge kinds, or &quot;colors&quot;.</p><p>Each Gyre node has one or more edge slots, which act as directed connectors.
+This means that nodes don't reference each other directly.
+Instead, they contain slots which connect to the slots of other nodes.
+There are different kinds of edge slots, which indicate their meaning.
+RULE: Every pair of connecting edge slots must have a matching kind.</p><p>Please note the directionality difference between 'dependency' and 'flow' edges.</p></div></div></div><div class="annotated-prototype"></div><h2 id="values">Values</h2><table class="enum-members"><tr><th>Value</th><th>Meaning</th></tr><tr class="enum-member" id="control"><td><a class="enum-member-name" href="#control">control</a><div class="enum-attributes"></div></td><td><div><p>A control flow edge going from node A to B indicates that, after control reaches node A, it may then proceed to B. Multiple control flow edges leaving a node indicate either concurrency or a conditional branch.</p></div></td></tr><tr class="enum-member" id="data"><td><a class="enum-member-name" href="#data">data</a><div class="enum-attributes"></div></td><td><div><p>Data dependency edges represent use-def relations. They go from slots using the value to the one which produced it.</p></div></td></tr><tr class="enum-member" id="memory"><td><a class="enum-member-name" href="#memory">memory</a><div class="enum-attributes"></div></td><td><div><p>Memory dependencies are mostly like discriminated data dependencies. They must be treated differently because, unlike data dependencies which represent immutable values, memory is mutable and thus subject to more scheduling constraints, aliasing problems and data races.</p></div></td></tr><tr class="enum-member" id="type"><td><a class="enum-member-name" href="#type">type</a><div class="enum-attributes"></div></td><td><div><p>Type dependencies represent compile-time values carrying type information.</p></div></td></tr></table><div><h2 id="examples"><a class="header-anchor" href="#examples">Examples</a></h2><div class="documentation-comment"><div></div></div><div class="unittest-example-holder"><div class="documentation-comment"></div><pre class="d_code highlighted"><span class="hid">Node</span>* <span class="hid">node</span>;
+<span class="hid">InEdge</span>.<span class="hid">ID</span> <span class="hid">slot</span>;
+<span class="com">//</span>
+<span class="kwrd">auto</span> <span class="hid">sink</span> = <span class="hid">InEdge</span>.<span class="hid">control</span>(<span class="hid">node</span>, <span class="hid">slot</span>);
+<span class="kwrd">auto</span> <span class="hid">source</span> = <span class="hid">OutEdge</span>.<span class="hid">control</span>(&amp;<span class="hid">sink</span>);
+<span class="com">//</span>
+<span class="kwrd">auto</span> <span class="hid">def</span> = <span class="hid">InEdge</span>.<span class="hid">data</span>(<span class="hid">node</span>, <span class="hid">slot</span>);
+<span class="kwrd">auto</span> <span class="hid">use</span> = <span class="hid">OutEdge</span>.<span class="hid">data</span>(&amp;<span class="hid">def</span>);</pre></div><h2 id="see-also">See Also</h2><div class="documentation-comment see-also-section"><div><p><a class="xref" href="gyre.nodes.OutEdge.html">OutEdge</a>, <a class="xref" href="gyre.nodes.InEdge.html">InEdge</a></p></div></div></div></div>
+		<div id="page-nav"><a class="parent" href="gyre.html">gyre</a> <a class="parent" href="gyre.nodes.html">nodes</a> 
+		<span class="type-separator">enums</span><ul><li><a class="enum current" href="gyre.nodes.EdgeKind.html">EdgeKind</a></li></ul><span class="type-separator">structs</span><ul><li><a class="struct" href="gyre.nodes.AdditionNoOverflowSignedNode.html">AdditionNoOverflowSignedNode</a></li><li><a class="struct" href="gyre.nodes.AdditionNode.html">AdditionNode</a></li><li><a class="struct" href="gyre.nodes.AndNode.html">AndNode</a></li><li><a class="struct" href="gyre.nodes.ConditionalNode.html">ConditionalNode</a></li><li><a class="struct" href="gyre.nodes.ConstantNode.html">ConstantNode</a></li><li><a class="struct" href="gyre.nodes.EqualNode.html">EqualNode</a></li><li><a class="struct" href="gyre.nodes.ForkNode.html">ForkNode</a></li><li><a class="struct" href="gyre.nodes.InEdge.html">InEdge</a></li><li><a class="struct" href="gyre.nodes.InEdgeIterator.html">InEdgeIterator</a></li><li><a class="struct" href="gyre.nodes.InstantiationNode.html">InstantiationNode</a></li><li><a class="struct" href="gyre.nodes.JoinNode.html">JoinNode</a></li><li><a class="struct" href="gyre.nodes.JumpNode.html">JumpNode</a></li><li><a class="struct" href="gyre.nodes.LeftShiftNoOverflowNode.html">LeftShiftNoOverflowNode</a></li><li><a class="struct" href="gyre.nodes.LeftShiftNode.html">LeftShiftNode</a></li><li><a class="struct" href="gyre.nodes.MacroNode.html">MacroNode</a></li><li><a class="struct" href="gyre.nodes.MultiplexerNode.html">MultiplexerNode</a></li><li><a class="struct" href="gyre.nodes.MultiplicationNoOverflowSignedNode.html">MultiplicationNoOverflowSignedNode</a></li><li><a class="struct" href="gyre.nodes.MultiplicationNode.html">MultiplicationNode</a></li><li><a class="struct" href="gyre.nodes.Node.html">Node</a></li><li><a class="struct" href="gyre.nodes.NotEqualNode.html">NotEqualNode</a></li><li><a class="struct" href="gyre.nodes.OrNode.html">OrNode</a></li><li><a class="struct" href="gyre.nodes.OutEdge.html">OutEdge</a></li><li><a class="struct" href="gyre.nodes.OutEdgeIterator.html">OutEdgeIterator</a></li><li><a class="struct" href="gyre.nodes.SignedDivisionNode.html">SignedDivisionNode</a></li><li><a class="struct" href="gyre.nodes.SignedExtensionNode.html">SignedExtensionNode</a></li><li><a class="struct" href="gyre.nodes.SignedGreaterOrEqualNode.html">SignedGreaterOrEqualNode</a></li><li><a class="struct" href="gyre.nodes.SignedLessThanNode.html">SignedLessThanNode</a></li><li><a class="struct" href="gyre.nodes.SignedRemainderNode.html">SignedRemainderNode</a></li><li><a class="struct" href="gyre.nodes.SignedRightShiftNode.html">SignedRightShiftNode</a></li><li><a class="struct" href="gyre.nodes.SubtractionNoOverflowSignedNode.html">SubtractionNoOverflowSignedNode</a></li><li><a class="struct" href="gyre.nodes.SubtractionNode.html">SubtractionNode</a></li><li><a class="struct" href="gyre.nodes.TruncationNode.html">TruncationNode</a></li><li><a class="struct" href="gyre.nodes.UndefinedNode.html">UndefinedNode</a></li><li><a class="struct" href="gyre.nodes.UnsignedDivisionNode.html">UnsignedDivisionNode</a></li><li><a class="struct" href="gyre.nodes.UnsignedExtensionNode.html">UnsignedExtensionNode</a></li><li><a class="struct" href="gyre.nodes.UnsignedGreaterOrEqualNode.html">UnsignedGreaterOrEqualNode</a></li><li><a class="struct" href="gyre.nodes.UnsignedLessThanNode.html">UnsignedLessThanNode</a></li><li><a class="struct" href="gyre.nodes.UnsignedRemainderNode.html">UnsignedRemainderNode</a></li><li><a class="struct" href="gyre.nodes.UnsignedRightShiftNode.html">UnsignedRightShiftNode</a></li><li><a class="struct" href="gyre.nodes.XorNode.html">XorNode</a></li><li><a class="struct" href="gyre.nodes.mnemonic.html">mnemonic</a></li></ul></div>
+	</div>
+	<div id="page-footer">Page generated by <a href="https://github.com/adamdruppe/adrdox">adrdox</a></div>
+</body>
+</html>

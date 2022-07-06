@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+        <title>Subgraph.insert (gyre.graph.Subgraph.insert)</title>
+	<meta charset="utf-8" />
+	<meta content="width=device-width, initial-scale=1" name="viewport" />
+        <link href="style.css" rel="stylesheet" />
+        <script src="script.js" type="text/javascript"></script>
+
+	
+	<link href="search-results.html" rel="prefetch" />
+</head>
+<body>
+	<div id="page-header">
+		<div id="logotype">
+		<span>Documentation</span>
+		<nav>
+			<a href="http://dlang.org/">Dlang.org</a>
+		<a href="https://github.com/baioc/gyred/">GyreD (source)</a></nav>
+		</div>
+
+		<form action="search-docs.html" id="search">
+			<input name="searchTerm" placeholder="Find a symbol name..." type="search" />
+			<input type="submit" value="Go" />
+		</form>
+	</div>
+	<div id="page-body">
+		<div id="page-content">
+		<h1>Subgraph.insert</h1><div class="breadcrumbs"><a class="breadcrumb" href="gyre.html">gyre</a> <a class="breadcrumb" href="gyre.graph.html">graph</a> <a class="breadcrumb" href="gyre.graph.Subgraph.html">Subgraph</a> </div><div><div class="documentation-comment synopsis"><div><p>Allocates and initializes a new node.</p><p>The new node's address is stable as long as this subgraph isn't merged.</p></div></div></div><div class="annotated-prototype"><ol class="overloads"><li class="overload-option"><a href="gyre.graph.Subgraph.insert.1.html"><span class="overload-signature"><tt class="highlighted"><span class="hid">AllNodes</span>[<span class="hid">kind</span>]*</tt> <span class="name">insert</span>(InitParams!(AllNodes[kind]) args)</span></a></li><li class="overload-option"><a href="gyre.graph.Subgraph.insert.2.html"><span class="overload-signature"><tt class="highlighted"><span class="hid">JoinNode</span>*</tt> <span class="name">insert</span>(uint argc)</span></a></li><li class="overload-option"><a href="gyre.graph.Subgraph.insert.3.html"><span class="overload-signature"><tt class="highlighted"><span class="hid">InstantiationNode</span>*</tt> <span class="name">insert</span>()</span></a></li><li class="overload-option"><a href="gyre.graph.Subgraph.insert.4.html"><span class="overload-signature"><tt class="highlighted"><span class="hid">ConditionalNode</span>*</tt> <span class="name">insert</span>()</span></a></li><li class="active-overload-option"><span class="overload-signature"><tt class="highlighted"><span class="hid">MultiplexerNode</span>*</tt> <span class="name">insert</span>()</span><div class="function-prototype"><div class="parent-prototype"><span class="builtin-type">struct</span> <span class="name">Subgraph</span></div><div><div class="attributes">@<span class="name" data-ident="nogc">nogc</span> nothrow pragma(<span class="name" data-ident="inline">inline</span>) </div><div class="return-type"><a class="name" data-ident="MultiplexerNode" href="gyre.nodes.MultiplexerNode.html" title="gyre.nodes.MultiplexerNode">MultiplexerNode</a>*</div><div class="function-name">insert</div><div class="template-parameters" data-count="1">(<div class="parameters-list toplevel"><div class="template-parameter-item parameter-item">	<span><a class="name" data-ident="NodeSugar" href="gyre.graph.NodeSugar.html" title="gyre.graph.NodeSugar">NodeSugar</a> <span class="name" data-ident="sugar">sugar</span> : <a class="name" data-ident="NodeSugar" href="gyre.graph.NodeSugar.html#MultiplexerNodeBinary" title="gyre.graph.NodeSugar">NodeSugar.MultiplexerNodeBinary</a></span></div></div>)</div><div class="runtime-parameters" data-count="0"><div class="parameters-list toplevel"><span class="paren">(</span><span class="paren">)</span></div></div><div class="function-contracts"></div></div></div></li></ol></div><div><h2 id="returns">Return Value</h2><div><div class="return-type-holder">Type: <span class="return-type"><a class="xref" href="gyre.nodes.MultiplexerNode.html" title="gyre.nodes.MultiplexerNode"><span class="name" data-ident="MultiplexerNode">MultiplexerNode</span></a>*</span></div><div class="documentation-comment returns-description"><div><p>A pointer to the new node, which is <tt class="inline-code">null</tt> in case something went wrong (OOM or the provided arguments were rejected by the node's initializer).</p></div></div></div></div></div>
+		<div id="page-nav"><a class="parent" href="gyre.html">gyre</a> <a class="parent" href="gyre.graph.html">graph</a> <a class="parent" href="gyre.graph.Subgraph.html">Subgraph</a> 
+		<span class="type-separator">aliases</span><ul><li><a class="alias" href="gyre.graph.Subgraph.PostHook.html">PostHook</a></li></ul><span class="type-separator">constructors</span><ul><li><a class="constructor" href="gyre.graph.Subgraph.this.html">this</a></li></ul><span class="type-separator">destructors</span><ul><li><a class="destructor" href="gyre.graph.Subgraph.~this.html">~this</a></li></ul><span class="type-separator">functions</span><ul><li><a class="function" href="gyre.graph.Subgraph.commit.html">commit</a></li><li><a class="function current" href="gyre.graph.Subgraph.insert.1.html">insert</a></li><li><a class="function" href="gyre.graph.Subgraph.link.1.html">link</a></li><li><a class="function" href="gyre.graph.Subgraph.reserve.html">reserve</a></li></ul></div>
+	</div>
+	<div id="page-footer">Page generated by <a href="https://github.com/adamdruppe/adrdox">adrdox</a></div>
+</body>
+</html>

@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+        <title>UnsafeHashMap.add (eris.hash_table.UnsafeHashMap.add)</title>
+	<meta charset="utf-8" />
+	<meta content="width=device-width, initial-scale=1" name="viewport" />
+        <link href="style.css" rel="stylesheet" />
+        <script src="script.js" type="text/javascript"></script>
+
+	
+	<link href="search-results.html" rel="prefetch" />
+</head>
+<body>
+	<div id="page-header">
+		<div id="logotype">
+		<span>Documentation</span>
+		<nav>
+			<a href="http://dlang.org/">Dlang.org</a>
+		<a href="https://github.com/baioc/gyred/">GyreD (source)</a></nav>
+		</div>
+
+		<form action="search-docs.html" id="search">
+			<input name="searchTerm" placeholder="Find a symbol name..." type="search" />
+			<input type="submit" value="Go" />
+		</form>
+	</div>
+	<div id="page-body">
+		<div id="page-content">
+		<h1>UnsafeHashMap.add</h1><div class="breadcrumbs"><a class="breadcrumb" href="eris.html">eris</a> <a class="breadcrumb" href="eris.hash_table.html">hash_table</a> <a class="breadcrumb" href="eris.hash_table.UnsafeHashMap.html">UnsafeHashMap</a> </div><div><div class="documentation-comment synopsis"><div><p>Adds an element to the hash set; may <a class="xref" href="eris.hash_table.UnsafeHashMap.rehash.2.html">rehash</a>.</p></div></div></div><div class="annotated-prototype"><div class="function-prototype"><div class="parent-prototype"><span class="builtin-type">struct</span> <span class="name">UnsafeHashMap</span><span class="template-params">(Key, Value)</span></div><div><div class="attributes">pragma(<span class="name" data-ident="inline">inline</span>) <div class="uda"><span><span class="lang-feature">static if</span>(<span>Value.sizeof == 0</span>)</span></div></div><div class="return-type"><a class="name" data-ident="err_t" href="eris.core.err_t.html" title="eris.core.err_t">err_t</a></div><div class="function-name">add</div><div class="template-parameters" data-count="0"></div><div class="runtime-parameters" data-count="1"><div class="parameters-list toplevel"><span class="paren">(</span><div class="runtime-parameter-item parameter-item"><span class="parameter-type-holder"><span class="parameter-type"><span class="name" data-ident="Key">Key</span></span></span> <span class="parameter-name name" data-ident="element"><a href="#param-element">element</a></span></div><span class="paren">)</span></div></div><div class="function-contracts"></div></div></div></div><div><h2 id="returns">Return Value</h2><div><div class="return-type-holder">Type: <span class="return-type"><a class="xref" href="eris.core.err_t.html" title="eris.core.err_t"><span class="name" data-ident="err_t">err_t</span></a></span></div><div class="documentation-comment returns-description"><div><p>Zero on success, non-zero on failure (e.g. OOM or overflow).</p></div></div></div></div></div>
+		<div id="page-nav"><a class="parent" href="eris.html">eris</a> <a class="parent" href="eris.hash_table.html">hash_table</a> <a class="parent" href="eris.hash_table.UnsafeHashMap.html">UnsafeHashMap</a> 
+		<span class="type-separator">constructors</span><ul><li><a class="constructor" href="eris.hash_table.UnsafeHashMap.this.html">this</a></li></ul><span class="type-separator">functions</span><ul><li><a class="function current" href="eris.hash_table.UnsafeHashMap.add.html">add</a></li><li><a class="function" href="eris.hash_table.UnsafeHashMap.byKey.1.html">byKey</a></li><li><a class="function" href="eris.hash_table.UnsafeHashMap.byKeyValue.1.html">byKeyValue</a></li><li><a class="function" href="eris.hash_table.UnsafeHashMap.byValue.1.html">byValue</a></li><li><a class="function" href="eris.hash_table.UnsafeHashMap.clear.html">clear</a></li><li><a class="function" href="eris.hash_table.UnsafeHashMap.dispose.html">dispose</a></li><li><a class="function" href="eris.hash_table.UnsafeHashMap.dup.1.html">dup</a></li><li><a class="function" href="eris.hash_table.UnsafeHashMap.get.html">get</a></li><li><a class="function" href="eris.hash_table.UnsafeHashMap.opBinaryRight.html">opBinaryRight</a></li><li><a class="function" href="eris.hash_table.UnsafeHashMap.opEquals.html">opEquals</a></li><li><a class="function" href="eris.hash_table.UnsafeHashMap.opIndex.html">opIndex</a></li><li><a class="function" href="eris.hash_table.UnsafeHashMap.opIndexAssign.html">opIndexAssign</a></li><li><a class="function" href="eris.hash_table.UnsafeHashMap.rehash.1.html">rehash</a></li><li><a class="function" href="eris.hash_table.UnsafeHashMap.remove.html">remove</a></li><li><a class="function" href="eris.hash_table.UnsafeHashMap.require.1.html">require</a></li><li><a class="function" href="eris.hash_table.UnsafeHashMap.toHash.html">toHash</a></li><li><a class="function" href="eris.hash_table.UnsafeHashMap.update.1.html">update</a></li></ul><span class="type-separator">properties</span><ul><li><a class="property" href="eris.hash_table.UnsafeHashMap.capacity.html">capacity</a></li><li><a class="property" href="eris.hash_table.UnsafeHashMap.length.html">length</a></li></ul></div>
+	</div>
+	<div id="page-footer">Page generated by <a href="https://github.com/adamdruppe/adrdox">adrdox</a></div>
+</body>
+</html>

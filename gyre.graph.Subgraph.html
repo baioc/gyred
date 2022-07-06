@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+        <title>Subgraph (gyre.graph.Subgraph)</title>
+	<meta charset="utf-8" />
+	<meta content="width=device-width, initial-scale=1" name="viewport" />
+        <link href="style.css" rel="stylesheet" />
+        <script src="script.js" type="text/javascript"></script>
+
+	
+	<link href="search-results.html" rel="prefetch" />
+</head>
+<body>
+	<div id="page-header">
+		<div id="logotype">
+		<span>Documentation</span>
+		<nav>
+			<a href="http://dlang.org/">Dlang.org</a>
+		<a href="https://github.com/baioc/gyred/">GyreD (source)</a></nav>
+		</div>
+
+		<form action="search-docs.html" id="search">
+			<input name="searchTerm" placeholder="Find a symbol name..." type="search" />
+			<input type="submit" value="Go" />
+		</form>
+	</div>
+	<div id="page-body">
+		<div id="page-content">
+		<h1>Subgraph</h1><div class="breadcrumbs"><a class="breadcrumb" href="gyre.html">gyre</a> <a class="breadcrumb" href="gyre.graph.html">graph</a> </div><div><div class="documentation-comment synopsis"><div><p>Temporary buffer used to add nodes to a <a class="xref" href="gyre.graph.Graph.html">Graph</a>.</p><p>Most operations on a graph involve adding multiple nodes at once.
+This type does precisely that, while verifying IR rules, expanding graph memory as needed and wiring up in-neighbors correctly.
+Last but not least: it will also perform some peephole optimizations (e.g. arithmetic simplification, constant folding and weak strength reduction) automatically.</p></div></div></div><div class="annotated-prototype"><div class="aggregate-prototype"><div class="attributes"></div><span class="builtin-type">struct</span> Subgraph  {<div class="aggregate-member"><a href="gyre.graph.Subgraph.this.html"><span class="lang-feature name">this</span>(size_t n);</a></div><div class="aggregate-member"><a href="gyre.graph.Subgraph.reserve.html"><tt class="highlighted"><span class="hid">err_t</span></tt> <span class="name">reserve</span>(size_t n);</a></div><div class="aggregate-member"><a href="gyre.graph.Subgraph.~this.html"><span class="lang-feature name">~this</span>();</a></div><div class="aggregate-member"><a href="gyre.graph.Subgraph.insert.1.html"><tt class="highlighted"><span class="hid">AllNodes</span>[<span class="hid">kind</span>]*</tt> <span class="name">insert</span>(InitParams!(AllNodes[kind]) args);</a></div><div class="aggregate-member"><a href="gyre.graph.Subgraph.insert.2.html"><tt class="highlighted"><span class="hid">JoinNode</span>*</tt> <span class="name">insert</span>(uint argc);</a></div><div class="aggregate-member"><a href="gyre.graph.Subgraph.insert.3.html"><tt class="highlighted"><span class="hid">InstantiationNode</span>*</tt> <span class="name">insert</span>();</a></div><div class="aggregate-member"><a href="gyre.graph.Subgraph.insert.4.html"><tt class="highlighted"><span class="hid">ConditionalNode</span>*</tt> <span class="name">insert</span>();</a></div><div class="aggregate-member"><a href="gyre.graph.Subgraph.insert.5.html"><tt class="highlighted"><span class="hid">MultiplexerNode</span>*</tt> <span class="name">insert</span>();</a></div><div class="aggregate-member"><a href="gyre.graph.Subgraph.link.1.html"><tt class="highlighted"><span class="hid">err_t</span></tt> <span class="name">link</span>(NodeType* node, InEdge* slot);</a></div><div class="aggregate-member"><a href="gyre.graph.Subgraph.link.2.html"><tt class="highlighted"><span class="hid">err_t</span></tt> <span class="name">link</span>(NodeType* node, InEdge slot);</a></div><div class="aggregate-member"><a href="gyre.graph.Subgraph.link.3.html"><tt class="highlighted"><span class="hid">err_t</span></tt> <span class="name">link</span>(NodeType* node, size_t index, InEdge* slot);</a></div><div class="aggregate-member"><a href="gyre.graph.Subgraph.link.4.html"><tt class="highlighted"><span class="hid">err_t</span></tt> <span class="name">link</span>(NodeType* node, size_t index, InEdge slot);</a></div><div class="aggregate-member"><a href="gyre.graph.Subgraph.PostHook.html"><span class="builtin-type">alias</span> <span class="name">PostHook</span> = <tt class="highlighted"><span class="type">void</span> <span class="kwrd">delegate</span>(<span class="kwrd">const</span>(<span class="hid">Node</span>)*, <span class="kwrd">const</span>(<span class="hid">Node</span>)*) @(<span class="hid">nogc</span>) <span class="kwrd">nothrow</span></tt>;</a></div><div class="aggregate-member"><a href="gyre.graph.Subgraph.commit.html"><tt class="highlighted"><span class="hid">err_t</span></tt> <span class="name">commit</span>(Graph graph, PostHook postHook);</a></div>}</div></div><h2 id="constructors">Constructors</h2><dl class="member-list constructors"><dt><a href="gyre.graph.Subgraph.this.html">this</a><div class="simplified-prototype" style="max-width: 15ch;"><span class="lang-feature name">this</span>(size_t n)</div></dt><dd><div><p>Initializes a new subgraph with a certain number of preallocated nodes.</p></div></dd></dl><h2 id="destructor">Destructor</h2><dl class="member-list"><dt><a href="gyre.graph.Subgraph.~this.html">~this</a><div class="simplified-prototype" style="max-width: 7ch;"><span class="lang-feature name">~this</span>()</div></dt><dd><div><p>Subgraph resources are automatically freed on scope exit (also, it is not a copyable type).</p></div></dd></dl><h2 id="postblit">Postblit</h2><dl class="member-list"></dl><p>A postblit is present on this object, but not explicitly documented in the source.</p><h2 id="members">Members</h2><h3 class="member-list-header hide-from-toc" id="alias">Aliases</h3><dl class="member-list native"><dt><a href="gyre.graph.Subgraph.PostHook.html">PostHook</a><div class="simplified-prototype" style="max-width: 81ch;"><span class="builtin-type">alias</span> <span class="name">PostHook</span> = <tt class="highlighted"><span class="type">void</span> <span class="kwrd">delegate</span>(<span class="kwrd">const</span>(<span class="hid">Node</span>)*, <span class="kwrd">const</span>(<span class="hid">Node</span>)*) @(<span class="hid">nogc</span>) <span class="kwrd">nothrow</span></tt></div></dt><dd><div><p>Post-hook callback delegate.</p></div></dd></dl><h3 class="member-list-header hide-from-toc" id="function">Functions</h3><dl class="member-list native"><dt><a href="gyre.graph.Subgraph.commit.html">commit</a><div class="simplified-prototype" style="max-width: 48ch;"><tt class="highlighted"><span class="hid">err_t</span></tt> <span class="name">commit</span>(Graph graph, PostHook postHook)</div></dt><dd><div><p>Commits this subgraph into a parent graph.</p></div></dd><dt><a href="gyre.graph.Subgraph.insert.1.html">insert</a><div class="simplified-prototype" style="max-width: 61ch;"><tt class="highlighted"><span class="hid">AllNodes</span>[<span class="hid">kind</span>]*</tt> <span class="name">insert</span>(InitParams!(AllNodes[kind]) args)</div></dt><dt><div class="simplified-prototype" style="max-width: 29ch;"><tt class="highlighted"><span class="hid">JoinNode</span>*</tt> <span class="name">insert</span>(uint argc)</div></dt><dt><div class="simplified-prototype" style="max-width: 29ch;"><tt class="highlighted"><span class="hid">InstantiationNode</span>*</tt> <span class="name">insert</span>()</div></dt><dt><div class="simplified-prototype" style="max-width: 27ch;"><tt class="highlighted"><span class="hid">ConditionalNode</span>*</tt> <span class="name">insert</span>()</div></dt><dt><div class="simplified-prototype" style="max-width: 27ch;"><tt class="highlighted"><span class="hid">MultiplexerNode</span>*</tt> <span class="name">insert</span>()</div></dt><dd><div><p>Allocates and initializes a new node.</p></div></dd><dt><a href="gyre.graph.Subgraph.link.1.html">link</a><div class="simplified-prototype" style="max-width: 44ch;"><tt class="highlighted"><span class="hid">err_t</span></tt> <span class="name">link</span>(NodeType* node, InEdge* slot)</div></dt><dt><div class="simplified-prototype" style="max-width: 42ch;"><tt class="highlighted"><span class="hid">err_t</span></tt> <span class="name">link</span>(NodeType* node, InEdge slot)</div></dt><dt><div class="simplified-prototype" style="max-width: 59ch;"><tt class="highlighted"><span class="hid">err_t</span></tt> <span class="name">link</span>(NodeType* node, size_t index, InEdge* slot)</div></dt><dt><div class="simplified-prototype" style="max-width: 58ch;"><tt class="highlighted"><span class="hid">err_t</span></tt> <span class="name">link</span>(NodeType* node, size_t index, InEdge slot)</div></dt><dd><div><p>Links two edge slots within this subgraph.</p></div></dd><dt><a href="gyre.graph.Subgraph.reserve.html">reserve</a><div class="simplified-prototype" style="max-width: 25ch;"><tt class="highlighted"><span class="hid">err_t</span></tt> <span class="name">reserve</span>(size_t n)</div></dt><dd><div><p>Ensures a certain number of preallocated nodes.</p></div></dd></dl><div><h2 id="examples"><a class="header-anchor" href="#examples">Examples</a></h2><div class="documentation-comment"><div></div></div><div class="unittest-example-holder"><div class="documentation-comment"></div><pre class="d_code highlighted with-line-wrappers"><span class="br">1 </span><span class="kwrd">import</span> <span class="hid">gyre</span>.<span class="hid">mnemonics</span>;
+<span class="br">2 </span>
+<span class="br">3 </span><span class="hid">Graph</span> <span class="hid">graph</span>;
+<span class="br">4 </span><span class="hid">graph</span>.<span class="hid">initialize</span>(<span class="hid">MacroNode</span>.<span class="hid">ID</span>(<span class="num">42</span>));
+<span class="br">5 </span><span class="kwrd">scope</span>(<span class="hid">exit</span>) <span class="hid">graph</span>.<span class="hid">dispose</span>();
+<span class="br">6 </span>
+<span class="br">7 </span><span class="kwrd">assert</span>(<span class="hid">graph</span>.<span class="hid">exported</span> == <span class="num">0</span>);
+<span class="br">8 </span><span class="kwrd">assert</span>(<span class="hid">graph</span>.<span class="hid">length</span> == <span class="num">0</span>);
+<span class="br">9 </span>
+<span class="br">10 </span><span class="com">// imagine we're compiling something like</span>
+<span class="br">11 </span><span class="com">//    foo(ret, x) {</span>
+<span class="br">12 </span><span class="com">//        a = x + 1</span>
+<span class="br">13 </span><span class="com">//        b = 1 + x</span>
+<span class="br">14 </span><span class="com">//        y = a / b</span>
+<span class="br">15 </span><span class="com">//        ret(y)</span>
+<span class="br">16 </span><span class="com">//    }</span>
+<span class="br">17 </span><span class="kwrd">with</span> (<span class="hid">Subgraph</span>.<span class="hid">init</span>) {
+<span class="br">18 </span>    <span class="hid">reserve</span>(<span class="num">6</span>);
+<span class="br">19 </span>
+<span class="br">20 </span>    <span class="kwrd">auto</span> <span class="hid">foo</span> = <span class="hid">insert</span>!<span class="hid">func</span>(<span class="num">2</span>);
+<span class="br">21 </span>    <span class="kwrd">auto</span> <span class="hid">jmp</span> = <span class="hid">insert</span>!<span class="hid">jump</span>(<span class="num">1</span>);
+<span class="br">22 </span>    <span class="kwrd">auto</span> <span class="hid">y</span> = <span class="hid">insert</span>!<span class="hid">divu</span>;
+<span class="br">23 </span>    <span class="kwrd">auto</span> <span class="hid">a</span> = <span class="hid">insert</span>!<span class="hid">addnos</span>;
+<span class="br">24 </span>    <span class="kwrd">auto</span> <span class="hid">b</span> = <span class="hid">insert</span>!<span class="hid">addnos</span>;
+<span class="br">25 </span>    <span class="kwrd">auto</span> <span class="hid">c1</span> = <span class="hid">insert</span>!<span class="hid">const_</span>(<span class="num">1</span>);
+<span class="br">26 </span>
+<span class="br">27 </span>    <span class="kwrd">auto</span> <span class="hid">params</span> = <span class="hid">foo</span>.<span class="hid">channels</span>[<span class="num">0</span>];
+<span class="br">28 </span>    <span class="kwrd">auto</span> <span class="hid">ret</span> = &amp;<span class="hid">params</span>[<span class="num">0</span>];
+<span class="br">29 </span>    <span class="kwrd">auto</span> <span class="hid">x</span> = &amp;<span class="hid">params</span>[<span class="num">1</span>];
+<span class="br">30 </span>
+<span class="br">31 </span>    <span class="hid">link</span>!<span class="str">&quot;control&quot;</span>(<span class="hid">foo</span>, <span class="hid">jmp</span>.<span class="hid">control</span>);
+<span class="br">32 </span>
+<span class="br">33 </span>    <span class="hid">link</span>!<span class="str">&quot;continuation&quot;</span>(<span class="hid">jmp</span>, <span class="hid">ret</span>);
+<span class="br">34 </span>    <span class="hid">link</span>!<span class="str">&quot;arguments&quot;</span>(<span class="hid">jmp</span>, <span class="num">0</span>, <span class="hid">y</span>.<span class="hid">quotient</span>);
+<span class="br">35 </span>
+<span class="br">36 </span>    <span class="hid">link</span>!<span class="str">&quot;dividend&quot;</span>(<span class="hid">y</span>, <span class="hid">a</span>.<span class="hid">result</span>);
+<span class="br">37 </span>    <span class="hid">link</span>!<span class="str">&quot;divisor&quot;</span>(<span class="hid">y</span>, <span class="hid">b</span>.<span class="hid">result</span>);
+<span class="br">38 </span>
+<span class="br">39 </span>    <span class="hid">link</span>!<span class="str">&quot;lhs&quot;</span>(<span class="hid">a</span>, <span class="hid">x</span>);
+<span class="br">40 </span>    <span class="hid">link</span>!<span class="str">&quot;rhs&quot;</span>(<span class="hid">a</span>, <span class="hid">c1</span>.<span class="hid">value</span>);
+<span class="br">41 </span>
+<span class="br">42 </span>    <span class="hid">link</span>!<span class="str">&quot;lhs&quot;</span>(<span class="hid">b</span>, <span class="hid">c1</span>.<span class="hid">value</span>);
+<span class="br">43 </span>    <span class="hid">link</span>!<span class="str">&quot;rhs&quot;</span>(<span class="hid">b</span>, <span class="hid">x</span>);
+<span class="br">44 </span>
+<span class="br">45 </span>    <span class="hid">commit</span>(<span class="hid">graph</span>, (<span class="hid">node</span>, <span class="hid">inGraph</span>){
+<span class="br">46 </span>        <span class="kwrd">if</span> (<span class="hid">node</span> <span class="kwrd">is</span> <span class="hid">foo</span>.<span class="hid">asNode</span>) {
+<span class="br">47 </span>            <span class="kwrd">auto</span> <span class="hid">fooInGraph</span> = <span class="hid">JoinNode</span>.<span class="hid">ofNode</span>(<span class="hid">inGraph</span>);
+<span class="br">48 </span>            <span class="hid">graph</span>.<span class="hid">export_</span>(<span class="hid">fooInGraph</span>.<span class="hid">definition</span>);
+<span class="br">49 </span>        }
+<span class="br">50 </span>    });
+<span class="br">51 </span>}
+<span class="br">52 </span>
+<span class="br">53 </span><span class="com">// since `a` and `b` compute the same value, one was CSE'd away</span>
+<span class="br">54 </span><span class="kwrd">assert</span>(<span class="hid">graph</span>.<span class="hid">length</span> == <span class="num">5</span>);
+<span class="br">55 </span><span class="kwrd">assert</span>(<span class="hid">graph</span>.<span class="hid">exported</span> == <span class="num">1</span>);</pre></div></div></div>
+		<div id="page-nav"><a class="parent" href="gyre.html">gyre</a> <a class="parent" href="gyre.graph.html">graph</a> 
+		<span class="type-separator">enums</span><ul><li><a class="enum" href="gyre.graph.NodeKind.html">NodeKind</a></li><li><a class="enum" href="gyre.graph.NodeSugar.html">NodeSugar</a></li></ul><span class="type-separator">structs</span><ul><li><a class="struct" href="gyre.graph.Graph.html">Graph</a></li><li><a class="struct current" href="gyre.graph.Subgraph.html">Subgraph</a></li></ul></div>
+	</div>
+	<div id="page-footer">Page generated by <a href="https://github.com/adamdruppe/adrdox">adrdox</a></div>
+</body>
+</html>
