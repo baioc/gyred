@@ -66,7 +66,7 @@ RULE: Every pair of connecting edge slots must have a matching kind.
 
 Please note the directionality difference between 'dependency' and 'flow' edges.
 
-See_Also: [OutEdge], [InSlot]
+See_Also: [OutEdge], [InEdge]
 +/
 enum EdgeKind : ubyte {
     /// A control flow edge going from node A to B indicates that, after control reaches node A, it may then proceed to B. Multiple control flow edges leaving a node indicate either concurrency or a conditional branch.
@@ -85,13 +85,13 @@ enum EdgeKind : ubyte {
 ///
 @nogc nothrow pure unittest {
     Node* node;
-    InSlot.ID slot;
+    InEdge.ID slot;
     //
-    auto sink = InSlot.control(slot);
-    auto source = OutEdge.control(node, sink.id);
+    auto sink = InEdge.control(node, slot);
+    auto source = OutEdge.control(&sink);
     //
-    auto def = InSlot.data(slot);
-    auto use = OutEdge.data(node, def.id);
+    auto def = InEdge.data(node, slot);
+    auto use = OutEdge.data(&def);
 }
 
 private mixin template StaticEdgeFactories() {
@@ -111,43 +111,36 @@ private mixin template StaticEdgeFactories() {
 /++
 An outgoing edge.
 
-Connects to exactly one [InSlot].
+Connects to exactly one [InEdge].
 +/
 struct OutEdge {
     version (D_Ddoc) {
         EdgeKind kind; /// Edge "color".
-        Node* targetNode; /// Target node.
+        InEdge* target; /// Target in-slot.
     } else {
         mixin(taggedPointer!(
-            Node*, "targetNode",
+            InEdge*, "target",
             EdgeKind, "kind", 2
         ));
     }
-    InSlot.ID targetSlot; /// Target slot.
 
     version (D_BetterC) {} else {
         string toString() const {
             import std.format : format;
-            if (this.targetNode == null) {
+            if (this.target == null) {
                 return "(%s -> NULL)".format(this.kind);
             } else {
                 assert(this.validateUse);
-                return "(%s -> %s[%d])".format(this.kind, this.targetNode, this.targetSlot);
+                return "(%s -> %s)".format(this.kind, this.target.toString);
             }
         }
     }
 
  pragma(inline) @nogc nothrow pure:
-    /// Combines a node-slot pair into a single pointer, assuming they represent a valid reference.
-    @property inout(InSlot)* target() inout in (this.validateUse) {
-        return this.targetNode.opIndex(this.targetSlot);
-    }
-
     ///
-    this(EdgeKind kind, Node* targetNode = null, uint targetSlot = 0) {
+    this(EdgeKind kind, InEdge* target = null) {
         this.kind = kind;
-        this.targetNode = targetNode;
-        this.targetSlot = InSlot(kind, targetSlot).id;
+        this.target = target;
     }
     mixin StaticEdgeFactories;
 
@@ -159,20 +152,18 @@ struct OutEdge {
     bool opEquals(const(OutEdge) other) const
     in (this.validateUse && other.validateUse)
     {
-        if ((this.kind != other.kind) | (this.targetSlot != other.targetSlot)) return false;
-        else return *this.targetNode == *other.targetNode;
+        if ((this.kind != other.kind) | (this.target.id != other.target.id)) return false;
+        else return *this.target.owner == *other.target.owner;
     }
 
     /// Combines the hash of the target node-slot pair.
     hash_t toHash() const in (this.validateUse) {
-        return this.targetSlot.hashOf ^ this.targetNode.toHash();
+        return this.target.id.hashOf ^ this.target.owner.toHash();
     }
 
     private bool validateUse() const {
-        assert(this.targetNode != null, "can't traverse a null out-edge");
-        InSlot* target = this.targetNode.opIndex(this.targetSlot);
-        assert(target != null, "slot not found in target node");
-        assert(target.kind == this.kind, "edge slot color mismatch");
+        assert(this.target != null, "can't traverse a null out-edge");
+        assert(this.target.kind == this.kind, "edge slot color mismatch");
         return true;
     }
 }
@@ -182,16 +173,24 @@ An in-edge slot.
 
 Can receive any number of [OutEdge]s.
 +/
-struct InSlot {
+struct InEdge {
     alias ID = ushort; /// In-slot identifier.
 
+    version (D_Ddoc) {
+        EdgeKind kind; /// The "color" of this edge slot.
+        Node* owner; /// Node which owns this slot.
+    } else {
+        mixin(taggedPointer!(
+            Node*, "owner",
+            EdgeKind, "kind", 2
+        ));
+    }
     ID _id;
-    EdgeKind kind; /// The "color" of this edge slot.
 
     version (D_BetterC) {} else {
         string toString() const {
             import std.format : format;
-            return "%s@%d".format(this.kind, this.id);
+            return "%s[%d]".format(this.owner, this.id);
         }
     }
 
@@ -200,12 +199,14 @@ struct InSlot {
     @property ID id() const { return this._id; }
 
     ///
-    this(EdgeKind kind, uint id = 0)
+    this(EdgeKind kind, Node* owner, uint id = 0)
     in (id <= ID.max, "in-edge slot IDs must be at most " ~ ID.max.stringof)
     {
         this.kind = kind;
+        this.owner = owner;
         this._id = cast(ID)id;
     }
+    @disable this();
     mixin StaticEdgeFactories;
 }
 
@@ -225,7 +226,7 @@ This is essentially [GVN](https://en.wikipedia.org/wiki/Value_numbering).
 Doing this perfectly in all cases has a prohibitive canonicalization cost, so we approximate it on a per-node basis: whenever we're about to add a new node to the graph, we'll check if it is redundant, in which case it can be [hash-consed](https://en.wikipedia.org/wiki/Hash_consing), with its uses rewired into the existing graph.
 This check requires a way to compare two nodes for equivalence, i.e., whether swapping one for the other preserves program semantics.
 
-In data-only operations, this usually reduces to structural equality: a node produces the same value (in a corresponding [InSlot]) as another when they perform the same operation and their inputs are equal (notice the recursion here).
+In data-only operations, this usually reduces to structural equality: a node produces the same value (in a corresponding [InEdge]) as another when they perform the same operation and their inputs are equal (notice the recursion here).
 Structural comparisons are relatively expensive operations (especially since the graph could be cyclic), so we want to leverage hashing to do as few comparisons as possible.
 Therefore, a node's hash value better reflect its semantic structure: having equal hashes is a necessary (but insufficient) condition for two nodes to be equal.
 Now, computing a node's hash value becomes an expensive operation as well, but fortunately it can be cached once a node's structure has stabilized.
@@ -244,7 +245,7 @@ struct Node {
      @nogc nothrow pure:
         bool function(const(Node)*, const(Node)*) opEquals;
         hash_t function(const(Node)*) toHash;
-        InSlot* function(Node*, InSlot.ID) opIndex;
+        InEdge* function(Node*, InEdge.ID) opIndex;
     }
 
     struct CommonPrefix {
@@ -290,6 +291,8 @@ struct Node {
     );
 
  public pragma(inline) @nogc nothrow pure:
+    @disable this(this); // just to make it harder to use this type on the stack
+
     /++
     Updates a node's cached hash value.
 
@@ -324,7 +327,7 @@ struct Node {
     /++
     Fetches a specific in-edge slot in this node.
 
-    NOTE: When nodes are initialized, they must identify each of their [InSlot]s with a unique ID.
+    NOTE: When nodes are initialized, they must identify each of their [InEdge]s with a unique ID.
     Our graph takes advantage of this method when rewiring edges between different nodes.
 
     Params:
@@ -333,7 +336,7 @@ struct Node {
     Returns:
         A pointer to the identified in-edge, or `null` if it doesn't exist.
     +/
-    InSlot* opIndex(InSlot.ID slot)
+    InEdge* opIndex(InEdge.ID slot)
     return // XXX: fuck v2.100.0
     {
         return this.vptr.opIndex(&this, slot);
@@ -345,6 +348,8 @@ private mixin template NodeInheritance() {
 
     package Node.CommonPrefix _node = { cast(void*)&vtbl };
     alias _node this;
+
+    @disable this(this); // because copying these guys around is unsafe
 
     package static immutable(Node.VTable) vtbl = {
         opEquals: (const(Node)* lhs, const(Node)* rhs) @nogc nothrow pure {
@@ -366,7 +371,7 @@ private mixin template NodeInheritance() {
             );
             return self.toHash();
         },
-        opIndex: (Node* node, InSlot.ID slot) @nogc nothrow pure {
+        opIndex: (Node* node, InEdge.ID slot) @nogc nothrow pure {
             This* self = This.ofNode(node);
             assert(self != null);
             static assert(
@@ -397,6 +402,19 @@ private mixin template NodeInheritance() {
             if (node == null || node._vptr != &vtbl) return null;
             return cast(inout(This)*)node;
         }
+
+        static assert(
+            __traits(hasMember, This, "outEdges") && __traits(hasMember, This, "inEdges"),
+            "all nodes must provide iterators for their out-edge and in-edge slots"
+        );
+
+        /// Post-move adjusts in-edge slots' owner pointer.
+        void opPostMove(ref const(This) old) pure {
+            alias Callable = int delegate(ref InEdge) @nogc nothrow pure;
+            foreach (ref slot; this.inEdges!Callable) {
+                slot.owner = this.asNode;
+            }
+        }
     }
 }
 
@@ -423,10 +441,26 @@ version (unittest) private { // for some reason, this needs to be in global scop
             return this.value;
         }
 
-        inout(InSlot)* opIndex(InSlot.ID slot) inout pure
+        inout(InEdge)* opIndex(InEdge.ID slot) inout pure
         return // XXX: fuck v2.100.0
         {
             return null;
+        }
+
+        @property OutEdgeIterator!Callable
+        outEdges(Callable = int delegate(ref OutEdge) @nogc nothrow)() {
+            return OutEdgeIterator!Callable(
+                this.asNode,
+                (Node* self, scope Callable iter) => 0
+            );
+        }
+
+        @property InEdgeIterator!Callable
+        inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+            return InEdgeIterator!Callable(
+                this.asNode,
+                (Node* self, scope Callable iter) => 0
+            );
         }
     }
 }
@@ -491,7 +525,7 @@ private {
         scope void delegate(ref NodeType node) @nogc nothrow postInitTest = (ref NodeType node){}
     ) @nogc nothrow {
         // initialize one guy
-        NodeType tmp;
+        NodeType tmp = NodeType.init;
 
         // sanity check: vptr is set-up and GC bits are unset
         assert(tmp.vptr == &NodeType.vtbl);
@@ -500,11 +534,12 @@ private {
 
         // allocate payload (if any) and move it
         NodeType.initialize(&tmp, args);
-        NodeType node;
+        NodeType node = void;
         moveEmplace(tmp, node);
 
         // check if everything is fine
         foreach (ref inEdge; node.inEdges) {
+            assert(inEdge.owner == node.asNode);
             assert(&inEdge == node[inEdge.id]);
         }
         postInitTest(node);
@@ -525,8 +560,8 @@ if (is(Parameters!Callable[0] : const(OutEdge)))
 }
 
 /// Iterates (with `foreach`) over a node's in-edges.
-struct InSlotIterator(Callable)
-if (is(Parameters!Callable[0] : const(InSlot)))
+struct InEdgeIterator(Callable)
+if (is(Parameters!Callable[0] : const(InEdge)))
 {
     mixin EdgeSlotIterator!Callable;
 }
@@ -568,13 +603,13 @@ See_Also: [InstantiationNode], [JumpNode], [ForkNode]
     mixin NodeInheritance;
 
     /// This join node's definition (a `data` slot), used to instantiate and invoke it.
-    InSlot definition;
+    InEdge definition;
 
     /// Control flow edge into the join node's body.
     OutEdge control;
 
     /// Non-empty collection of channels, each containing zero or more of this node's parameters (either data or memory edges).
-    InSlot[][] channels; // SSO: InSlot[][1] most of the time
+    InEdge[][] channels; // SSO: InEdge[][1] most of the time
 
  @nogc nothrow:
     /++
@@ -585,25 +620,25 @@ See_Also: [InstantiationNode], [JumpNode], [ForkNode]
 
     Params:
         self = Address of node being initialized.
-        size = Slice indicating the number of parameters on each channel.
+        sizes = Slice indicating the number of parameters on each channel.
 
     Returns:
         Zero on success, non-zero on failure (OOM or invalid number of channels).
     +/
-    static err_t initialize(JoinNode* self, uint[] size)
-    in (size.length >= 1, "at least one channel is needed")
+    static err_t initialize(JoinNode* self, uint[] sizes)
+    in (sizes.length >= 1, "at least one channel is needed")
     {
-        if (size.length < 1) return EINVAL;
+        if (sizes.length < 1) return EINVAL;
         *self = JoinNode.init;
 
-        self.definition = InSlot.data(0);
+        self.definition = InEdge.data(self.asNode, 0);
         self.control = OutEdge.control;
 
-        self.channels = allocate!(InSlot[])(size.length);
+        self.channels = allocate!(InEdge[])(sizes.length);
         if (self.channels == null) return ENOMEM;
         int id = 1;
-        foreach (i, m; size) {
-            self.channels[i] = allocate!InSlot(m);
+        foreach (i, m; sizes) {
+            self.channels[i] = allocate!InEdge(m);
 
             // on failure, undo all previous allocations
             if (m > 0 && self.channels[i] == null) {
@@ -616,7 +651,7 @@ See_Also: [InstantiationNode], [JumpNode], [ForkNode]
             }
 
             foreach (j; 0 .. m) {
-                self.channels[i][j] = InSlot.data(id);
+                self.channels[i][j] = InEdge.data(self.asNode, id);
                 id++;
             }
         }
@@ -653,7 +688,7 @@ See_Also: [InstantiationNode], [JumpNode], [ForkNode]
     }
 
     /// See [Node.opIndex].
-    inout(InSlot)* opIndex(InSlot.ID slot) inout pure
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
         if (slot == 0) return &this.definition;
@@ -690,9 +725,9 @@ See_Also: [InstantiationNode], [JumpNode], [ForkNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    @property InSlotIterator!Callable
-    inEdges(Callable = int delegate(ref InSlot) @nogc nothrow)() {
-        return InSlotIterator!Callable(
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
                 auto node = JoinNode.ofNode(self);
@@ -741,7 +776,7 @@ See_Also: [JoinNode], [JumpNode]
     OutEdge definition;
 
     /// Non-empty collection of live continuations, each corresponding to a channel in the join pattern.
-    InSlot[] continuations; // SSO: InSlot[1] most of the time
+    InEdge[] continuations; // SSO: InEdge[1] most of the time
 
  @nogc nothrow:
     /++
@@ -763,10 +798,10 @@ See_Also: [JoinNode], [JumpNode]
         *self = InstantiationNode.init;
 
         self.definition = OutEdge.data;
-        self.continuations = allocate!InSlot(n);
+        self.continuations = allocate!InEdge(n);
         if (self.continuations == null) return ENOMEM;
         foreach (i; 0 .. n)
-            self.continuations[i] = InSlot.data(i);
+            self.continuations[i] = InEdge.data(self.asNode, i);
 
         return 0;
     }
@@ -793,7 +828,7 @@ See_Also: [JoinNode], [JumpNode]
     }
 
     /// See [Node.opIndex].
-    inout(InSlot)* opIndex(InSlot.ID slot) inout pure
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
         if (slot >= this.continuations.length) return null;
@@ -814,9 +849,9 @@ See_Also: [JoinNode], [JumpNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    @property InSlotIterator!Callable
-    inEdges(Callable = int delegate(ref InSlot) @nogc nothrow)() {
-        return InSlotIterator!Callable(
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
                 auto node = InstantiationNode.ofNode(self);
@@ -861,14 +896,13 @@ See_Also: [JoinNode]
     mixin NodeInheritance;
 
     /// Incoming control flow which is about to be yielded to the target continuation.
-    InSlot control;
+    InEdge control;
 
     /// A `data` dependency on some live continuation.
     OutEdge continuation;
 
     /// Arguments to be sent into the continuation and later used inside a join pattern's body.
     OutEdge[] arguments;
-
 
  @nogc nothrow:
     /++
@@ -886,7 +920,7 @@ See_Also: [JoinNode]
     static err_t initialize(JumpNode* self, uint n) {
         *self = JumpNode.init;
 
-        self.control = InSlot.control;
+        self.control = InEdge.control(self.asNode);
         self.continuation = OutEdge.data;
         self.arguments = allocate!OutEdge(n);
         if (n > 0 && self.arguments == null) return ENOMEM;
@@ -922,7 +956,7 @@ See_Also: [JoinNode]
     }
 
     /// See [Node.opIndex].
-    inout(InSlot)* opIndex(InSlot.ID slot) inout pure
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
         return slot == 0 ? &this.control : null;
@@ -948,9 +982,9 @@ See_Also: [JoinNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    @property InSlotIterator!Callable
-    inEdges(Callable = int delegate(ref InSlot) @nogc nothrow)() {
-        return InSlotIterator!Callable(
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
                 auto node = JumpNode.ofNode(self);
@@ -990,7 +1024,7 @@ See_Also: [JoinNode], [JumpNode]
     mixin NodeInheritance;
 
     /// Incoming single control flow.
-    InSlot control;
+    InEdge control;
 
     /// At least two concurrent control flows resulting from this fork.
     OutEdge[] threads;
@@ -1012,7 +1046,7 @@ See_Also: [JoinNode], [JumpNode]
         if (n < 2) return EINVAL;
         *self = ForkNode.init;
 
-        self.control = InSlot.control;
+        self.control = InEdge.control(self.asNode);
         self.threads = allocate!OutEdge(n);
         if (self.threads == null) return ENOMEM;
         foreach (ref thread; self.threads) thread = OutEdge.control;
@@ -1044,7 +1078,7 @@ See_Also: [JoinNode], [JumpNode]
     }
 
     /// See [Node.opIndex].
-    inout(InSlot)* opIndex(InSlot.ID slot) inout pure
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
         return slot == 0 ? &this.control : null;
@@ -1068,9 +1102,9 @@ See_Also: [JoinNode], [JumpNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    @property InSlotIterator!Callable
-    inEdges(Callable = int delegate(ref InSlot) @nogc nothrow)() {
-        return InSlotIterator!Callable(
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
                 auto node = ForkNode.ofNode(self);
@@ -1109,7 +1143,7 @@ See_Also: [MultiplexerNode]
     OutEdge selector;
 
     /// Incoming control flow edge.
-    InSlot control;
+    InEdge control;
 
     // SSO: binary branches will probably be the most common
     private UnsafeHashMap!(ulong, OutEdge)* _options;
@@ -1141,7 +1175,7 @@ See_Also: [MultiplexerNode]
         *self = ConditionalNode.init;
 
         self.selector = OutEdge.data;
-        self.control = InSlot.control;
+        self.control = InEdge.control(self.asNode);
 
         self._options = allocate!(UnsafeHashMap!(ulong, OutEdge));
         if (self._options == null) return ENOMEM;
@@ -1179,7 +1213,7 @@ See_Also: [MultiplexerNode]
     }
 
     /// See [Node.opIndex].
-    inout(InSlot)* opIndex(InSlot.ID slot) inout pure
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
         return slot == 0 ? &this.control : null;
@@ -1205,9 +1239,9 @@ See_Also: [MultiplexerNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    @property InSlotIterator!Callable
-    inEdges(Callable = int delegate(ref InSlot) @nogc nothrow)() {
-        return InSlotIterator!Callable(
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
                 auto node = ConditionalNode.ofNode(self);
@@ -1263,7 +1297,7 @@ It is this identification which allows the compiler to, later in the compilation
     OutEdge[] outSlots;
 
     /// Edges (of any kind) which point into this node.
-    InSlot[] inSlots;
+    InEdge[] inSlots;
 
  @nogc nothrow:
     /++
@@ -1288,10 +1322,10 @@ It is this identification which allows the compiler to, later in the compilation
 
         self.id = cast(ID)id;
 
-        self.inSlots = allocate!InSlot(ins);
+        self.inSlots = allocate!InEdge(ins);
         if (ins > 0 && self.inSlots == null) return ENOMEM;
         foreach (i; 0 .. ins)
-            self.inSlots[i] = InSlot.data(i);
+            self.inSlots[i] = InEdge.data(self.asNode, i);
 
         self.outSlots = allocate!OutEdge(outs);
         if (outs > 0 && self.outSlots == null) {
@@ -1326,7 +1360,7 @@ It is this identification which allows the compiler to, later in the compilation
     }
 
     /// See [Node.opIndex].
-    inout(InSlot)* opIndex(InSlot.ID slot) inout pure
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
         if (slot >= this.inSlots.length) return null;
@@ -1351,9 +1385,9 @@ It is this identification which allows the compiler to, later in the compilation
     }
 
     /// Provides an iterator over this node's in-edges.
-    @property InSlotIterator!Callable
-    inEdges(Callable = int delegate(ref InSlot) @nogc nothrow)() {
-        return InSlotIterator!Callable(
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
                 auto node = MacroNode.ofNode(self);
@@ -1391,7 +1425,7 @@ See_Also: [UndefinedNode]
     ulong literal;
 
     /// The constant's (run-time) value.
-    InSlot value;
+    InEdge value;
 
  @nogc nothrow:
     /++
@@ -1408,7 +1442,7 @@ See_Also: [UndefinedNode]
         *self = ConstantNode.init;
 
         self.literal = literal;
-        self.value = InSlot.data;
+        self.value = InEdge.data(self.asNode);
 
         return 0;
     }
@@ -1433,7 +1467,7 @@ See_Also: [UndefinedNode]
     }
 
     /// See [Node.opIndex].
-    inout(InSlot)* opIndex(InSlot.ID slot) inout pure
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
         return slot == 0 ? &this.value : null;
@@ -1449,9 +1483,9 @@ See_Also: [UndefinedNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    @property InSlotIterator!Callable
-    inEdges(Callable = int delegate(ref InSlot) @nogc nothrow)() {
-        return InSlotIterator!Callable(
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
                 auto node = ConstantNode.ofNode(self);
@@ -1485,7 +1519,7 @@ See_Also: [ConstantNode]
     mixin NodeInheritance;
 
     /// The resulting value.
-    InSlot value;
+    InEdge value;
 
  @nogc nothrow:
     /++
@@ -1499,7 +1533,7 @@ See_Also: [ConstantNode]
     +/
     static err_t initialize(UndefinedNode* self) {
         *self = UndefinedNode.init;
-        self.value = InSlot.data;
+        self.value = InEdge.data(self.asNode);
         return 0;
     }
 
@@ -1523,7 +1557,7 @@ See_Also: [ConstantNode]
     }
 
     /// See [Node.opIndex].
-    inout(InSlot)* opIndex(InSlot.ID slot) inout pure
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
         return slot == 0 ? &this.value : null;
@@ -1539,9 +1573,9 @@ See_Also: [ConstantNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    @property InSlotIterator!Callable
-    inEdges(Callable = int delegate(ref InSlot) @nogc nothrow)() {
-        return InSlotIterator!Callable(
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
                 auto node = UndefinedNode.ofNode(self);
@@ -1562,7 +1596,7 @@ See_Also: [ConstantNode]
     OutEdge input;
 
     /// Lowermost input bits.
-    InSlot output;
+    InEdge output;
 
  @nogc nothrow:
     /++
@@ -1577,7 +1611,7 @@ See_Also: [ConstantNode]
     static err_t initialize(TruncationNode* self) {
         *self = TruncationNode.init;
         self.input = OutEdge.data;
-        self.output = InSlot.data;
+        self.output = InEdge.data(self.asNode);
         return 0;
     }
 
@@ -1597,7 +1631,7 @@ See_Also: [ConstantNode]
     }
 
     /// See [Node.opIndex].
-    inout(InSlot)* opIndex(InSlot.ID slot) inout pure
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
         return slot == 0 ? &this.output : null;
@@ -1617,9 +1651,9 @@ See_Also: [ConstantNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    @property InSlotIterator!Callable
-    inEdges(Callable = int delegate(ref InSlot) @nogc nothrow)() {
-        return InSlotIterator!Callable(
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
                 auto node = TruncationNode.ofNode(self);
@@ -1644,7 +1678,7 @@ See_Also: [SignedExtensionNode]
     OutEdge input;
 
     /// Resulting bit pattern.
-    InSlot output;
+    InEdge output;
 
  @nogc nothrow:
     /++
@@ -1659,7 +1693,7 @@ See_Also: [SignedExtensionNode]
     static err_t initialize(UnsignedExtensionNode* self) {
         *self = UnsignedExtensionNode.init;
         self.input = OutEdge.data;
-        self.output = InSlot.data;
+        self.output = InEdge.data(self.asNode);
         return 0;
     }
 
@@ -1679,7 +1713,7 @@ See_Also: [SignedExtensionNode]
     }
 
     /// See [Node.opIndex].
-    inout(InSlot)* opIndex(InSlot.ID slot) inout pure
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
         return slot == 0 ? &this.output : null;
@@ -1699,9 +1733,9 @@ See_Also: [SignedExtensionNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    @property InSlotIterator!Callable
-    inEdges(Callable = int delegate(ref InSlot) @nogc nothrow)() {
-        return InSlotIterator!Callable(
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
                 auto node = UnsignedExtensionNode.ofNode(self);
@@ -1726,7 +1760,7 @@ See_Also: [UnsignedExtensionNode]
     OutEdge input;
 
     /// Resulting bit pattern.
-    InSlot output;
+    InEdge output;
 
  @nogc nothrow:
     /++
@@ -1741,7 +1775,7 @@ See_Also: [UnsignedExtensionNode]
     static err_t initialize(SignedExtensionNode* self) {
         *self = SignedExtensionNode.init;
         self.input = OutEdge.data;
-        self.output = InSlot.data;
+        self.output = InEdge.data(self.asNode);
         return 0;
     }
 
@@ -1761,7 +1795,7 @@ See_Also: [UnsignedExtensionNode]
     }
 
     /// See [Node.opIndex].
-    inout(InSlot)* opIndex(InSlot.ID slot) inout pure
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
         return slot == 0 ? &this.output : null;
@@ -1781,9 +1815,9 @@ See_Also: [UnsignedExtensionNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    @property InSlotIterator!Callable
-    inEdges(Callable = int delegate(ref InSlot) @nogc nothrow)() {
-        return InSlotIterator!Callable(
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
                 auto node = SignedExtensionNode.ofNode(self);
@@ -1816,7 +1850,7 @@ See_Also: [ConditionalNode]
     OutEdge selector;
 
     /// Resulting value.
-    InSlot output;
+    InEdge output;
 
     // SSO: binary mux will probably be the most common
     private UnsafeHashMap!(ulong, OutEdge)* _inputs;
@@ -1848,7 +1882,7 @@ See_Also: [ConditionalNode]
         *self = MultiplexerNode.init;
 
         self.selector = OutEdge.data;
-        self.output = InSlot.data;
+        self.output = InEdge.data(self.asNode);
 
         self._inputs = allocate!(UnsafeHashMap!(ulong, OutEdge));
         if (self._inputs == null) return ENOMEM;
@@ -1882,7 +1916,7 @@ See_Also: [ConditionalNode]
     }
 
     /// See [Node.opIndex].
-    inout(InSlot)* opIndex(InSlot.ID slot) inout pure
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
         return slot == 0 ? &this.output : null;
@@ -1908,9 +1942,9 @@ See_Also: [ConditionalNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    @property InSlotIterator!Callable
-    inEdges(Callable = int delegate(ref InSlot) @nogc nothrow)() {
-        return InSlotIterator!Callable(
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
                 auto node = MultiplexerNode.ofNode(self);
@@ -1936,7 +1970,7 @@ See_Also: [ConditionalNode]
     mixin NodeInheritance;
 
     /// Resulting bit pattern.
-    InSlot result;
+    InEdge result;
 
     /// Operands.
     OutEdge lhs;
@@ -1954,7 +1988,7 @@ See_Also: [ConditionalNode]
     +/
     static err_t initialize(AndNode* self) {
         *self = AndNode.init;
-        self.result = InSlot.data;
+        self.result = InEdge.data(self.asNode);
         self.lhs = OutEdge.data;
         self.rhs = OutEdge.data;
         return 0;
@@ -1977,7 +2011,7 @@ See_Also: [ConditionalNode]
     }
 
     /// See [Node.opIndex].
-    inout(InSlot)* opIndex(InSlot.ID slot) inout pure
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
         return slot == 0 ? &this.result : null;
@@ -2000,9 +2034,9 @@ See_Also: [ConditionalNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    @property InSlotIterator!Callable
-    inEdges(Callable = int delegate(ref InSlot) @nogc nothrow)() {
-        return InSlotIterator!Callable(
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
                 auto node = AndNode.ofNode(self);
@@ -2020,7 +2054,7 @@ See_Also: [ConditionalNode]
     mixin NodeInheritance;
 
     /// Resulting bit pattern.
-    InSlot result;
+    InEdge result;
 
     /// Operands.
     OutEdge lhs;
@@ -2038,7 +2072,7 @@ See_Also: [ConditionalNode]
     +/
     static err_t initialize(OrNode* self) {
         *self = OrNode.init;
-        self.result = InSlot.data;
+        self.result = InEdge.data(self.asNode);
         self.lhs = OutEdge.data;
         self.rhs = OutEdge.data;
         return 0;
@@ -2061,7 +2095,7 @@ See_Also: [ConditionalNode]
     }
 
     /// See [Node.opIndex].
-    inout(InSlot)* opIndex(InSlot.ID slot) inout pure
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
         return slot == 0 ? &this.result : null;
@@ -2084,9 +2118,9 @@ See_Also: [ConditionalNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    @property InSlotIterator!Callable
-    inEdges(Callable = int delegate(ref InSlot) @nogc nothrow)() {
-        return InSlotIterator!Callable(
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
                 auto node = OrNode.ofNode(self);
@@ -2108,7 +2142,7 @@ Can be used as a unary `NOT` operation when one operand is an all-ones constant.
     mixin NodeInheritance;
 
     /// Resulting bit pattern.
-    InSlot result;
+    InEdge result;
 
     /// Operands.
     OutEdge lhs;
@@ -2126,7 +2160,7 @@ Can be used as a unary `NOT` operation when one operand is an all-ones constant.
     +/
     static err_t initialize(XorNode* self) {
         *self = XorNode.init;
-        self.result = InSlot.data;
+        self.result = InEdge.data(self.asNode);
         self.lhs = OutEdge.data;
         self.rhs = OutEdge.data;
         return 0;
@@ -2149,7 +2183,7 @@ Can be used as a unary `NOT` operation when one operand is an all-ones constant.
     }
 
     /// See [Node.opIndex].
-    inout(InSlot)* opIndex(InSlot.ID slot) inout pure
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
         return slot == 0 ? &this.result : null;
@@ -2172,9 +2206,9 @@ Can be used as a unary `NOT` operation when one operand is an all-ones constant.
     }
 
     /// Provides an iterator over this node's in-edges.
-    @property InSlotIterator!Callable
-    inEdges(Callable = int delegate(ref InSlot) @nogc nothrow)() {
-        return InSlotIterator!Callable(
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
                 auto node = XorNode.ofNode(self);
@@ -2204,7 +2238,7 @@ See_Also: [LeftShiftNoOverflowNode]
     OutEdge shift;
 
     /// Resulting bit pattern.
-    InSlot output;
+    InEdge output;
 
  @nogc nothrow:
     /++
@@ -2220,7 +2254,7 @@ See_Also: [LeftShiftNoOverflowNode]
         *self = LeftShiftNode.init;
         self.input = OutEdge.data;
         self.shift = OutEdge.data;
-        self.output = InSlot.data;
+        self.output = InEdge.data(self.asNode);
         return 0;
     }
 
@@ -2242,7 +2276,7 @@ See_Also: [LeftShiftNoOverflowNode]
     }
 
     /// See [Node.opIndex].
-    inout(InSlot)* opIndex(InSlot.ID slot) inout pure
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
         return slot == 0 ? &this.output : null;
@@ -2265,9 +2299,9 @@ See_Also: [LeftShiftNoOverflowNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    @property InSlotIterator!Callable
-    inEdges(Callable = int delegate(ref InSlot) @nogc nothrow)() {
-        return InSlotIterator!Callable(
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
                 auto node = LeftShiftNode.ofNode(self);
@@ -2299,7 +2333,7 @@ See_Also: [LeftShiftNode]
     OutEdge shift;
 
     /// Resulting bit pattern.
-    InSlot output;
+    InEdge output;
 
  @nogc nothrow:
     /++
@@ -2315,7 +2349,7 @@ See_Also: [LeftShiftNode]
         *self = LeftShiftNoOverflowNode.init;
         self.input = OutEdge.data;
         self.shift = OutEdge.data;
-        self.output = InSlot.data;
+        self.output = InEdge.data(self.asNode);
         return 0;
     }
 
@@ -2337,7 +2371,7 @@ See_Also: [LeftShiftNode]
     }
 
     /// See [Node.opIndex].
-    inout(InSlot)* opIndex(InSlot.ID slot) inout pure
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
         return slot == 0 ? &this.output : null;
@@ -2360,9 +2394,9 @@ See_Also: [LeftShiftNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    @property InSlotIterator!Callable
-    inEdges(Callable = int delegate(ref InSlot) @nogc nothrow)() {
-        return InSlotIterator!Callable(
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
                 auto node = LeftShiftNoOverflowNode.ofNode(self);
@@ -2392,7 +2426,7 @@ See_Also: [SignedRightShiftNode]
     OutEdge shift;
 
     /// Resulting bit pattern.
-    InSlot output;
+    InEdge output;
 
  @nogc nothrow:
     /++
@@ -2408,7 +2442,7 @@ See_Also: [SignedRightShiftNode]
         *self = UnsignedRightShiftNode.init;
         self.input = OutEdge.data;
         self.shift = OutEdge.data;
-        self.output = InSlot.data;
+        self.output = InEdge.data(self.asNode);
         return 0;
     }
 
@@ -2430,7 +2464,7 @@ See_Also: [SignedRightShiftNode]
     }
 
     /// See [Node.opIndex].
-    inout(InSlot)* opIndex(InSlot.ID slot) inout pure
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
         return slot == 0 ? &this.output : null;
@@ -2453,9 +2487,9 @@ See_Also: [SignedRightShiftNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    @property InSlotIterator!Callable
-    inEdges(Callable = int delegate(ref InSlot) @nogc nothrow)() {
-        return InSlotIterator!Callable(
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
                 auto node = UnsignedRightShiftNode.ofNode(self);
@@ -2485,7 +2519,7 @@ See_Also: [UnsignedRightShiftNode]
     OutEdge shift;
 
     /// Resulting bit pattern.
-    InSlot output;
+    InEdge output;
 
  @nogc nothrow:
     /++
@@ -2501,7 +2535,7 @@ See_Also: [UnsignedRightShiftNode]
         *self = SignedRightShiftNode.init;
         self.input = OutEdge.data;
         self.shift = OutEdge.data;
-        self.output = InSlot.data;
+        self.output = InEdge.data(self.asNode);
         return 0;
     }
 
@@ -2523,7 +2557,7 @@ See_Also: [UnsignedRightShiftNode]
     }
 
     /// See [Node.opIndex].
-    inout(InSlot)* opIndex(InSlot.ID slot) inout pure
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
         return slot == 0 ? &this.output : null;
@@ -2546,9 +2580,9 @@ See_Also: [UnsignedRightShiftNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    @property InSlotIterator!Callable
-    inEdges(Callable = int delegate(ref InSlot) @nogc nothrow)() {
-        return InSlotIterator!Callable(
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
                 auto node = SignedRightShiftNode.ofNode(self);
@@ -2572,7 +2606,7 @@ See_Also: [AdditionNoOverflowSignedNode]
     mixin NodeInheritance;
 
     /// Resulting sum.
-    InSlot result;
+    InEdge result;
 
     /// Operands.
     OutEdge lhs;
@@ -2591,7 +2625,7 @@ See_Also: [AdditionNoOverflowSignedNode]
     static err_t initialize(AdditionNode* self) {
         *self = AdditionNode.init;
 
-        self.result = InSlot.data;
+        self.result = InEdge.data(self.asNode);
         self.lhs = OutEdge.data;
         self.rhs = OutEdge.data;
 
@@ -2615,7 +2649,7 @@ See_Also: [AdditionNoOverflowSignedNode]
     }
 
     /// See [Node.opIndex].
-    inout(InSlot)* opIndex(InSlot.ID slot) inout pure
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
         return slot == 0 ? &this.result : null;
@@ -2638,9 +2672,9 @@ See_Also: [AdditionNoOverflowSignedNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    @property InSlotIterator!Callable
-    inEdges(Callable = int delegate(ref InSlot) @nogc nothrow)() {
-        return InSlotIterator!Callable(
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
                 auto node = AdditionNode.ofNode(self);
@@ -2664,7 +2698,7 @@ See_Also: [AdditionNode]
     mixin NodeInheritance;
 
     /// Resulting sum.
-    InSlot result;
+    InEdge result;
 
     /// Operands.
     OutEdge lhs;
@@ -2682,7 +2716,7 @@ See_Also: [AdditionNode]
     +/
     static err_t initialize(AdditionNoOverflowSignedNode* self) {
         *self = AdditionNoOverflowSignedNode.init;
-        self.result = InSlot.data;
+        self.result = InEdge.data(self.asNode);
         self.lhs = OutEdge.data;
         self.rhs = OutEdge.data;
         return 0;
@@ -2705,7 +2739,7 @@ See_Also: [AdditionNode]
     }
 
     /// See [Node.opIndex].
-    inout(InSlot)* opIndex(InSlot.ID slot) inout pure
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
         return slot == 0 ? &this.result : null;
@@ -2728,9 +2762,9 @@ See_Also: [AdditionNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    @property InSlotIterator!Callable
-    inEdges(Callable = int delegate(ref InSlot) @nogc nothrow)() {
-        return InSlotIterator!Callable(
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
                 auto node = AdditionNoOverflowSignedNode.ofNode(self);
@@ -2760,7 +2794,7 @@ See_Also: [SubtractionNoOverflowSignedNode]
     OutEdge rhs;
 
     /// Result of the subtraction.
-    InSlot result;
+    InEdge result;
 
  @nogc nothrow:
     /++
@@ -2776,7 +2810,7 @@ See_Also: [SubtractionNoOverflowSignedNode]
         *self = SubtractionNode.init;
         self.lhs = OutEdge.data;
         self.rhs = OutEdge.data;
-        self.result = InSlot.data;
+        self.result = InEdge.data(self.asNode);
         return 0;
     }
 
@@ -2798,7 +2832,7 @@ See_Also: [SubtractionNoOverflowSignedNode]
     }
 
     /// See [Node.opIndex].
-    inout(InSlot)* opIndex(InSlot.ID slot) inout pure
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
         return slot == 0 ? &this.result : null;
@@ -2821,9 +2855,9 @@ See_Also: [SubtractionNoOverflowSignedNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    @property InSlotIterator!Callable
-    inEdges(Callable = int delegate(ref InSlot) @nogc nothrow)() {
-        return InSlotIterator!Callable(
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
                 auto node = SubtractionNode.ofNode(self);
@@ -2853,7 +2887,7 @@ See_Also: [SubtractionNode]
     OutEdge rhs;
 
     /// Result of the subtraction.
-    InSlot result;
+    InEdge result;
 
  @nogc nothrow:
     /++
@@ -2869,7 +2903,7 @@ See_Also: [SubtractionNode]
         *self = SubtractionNoOverflowSignedNode.init;
         self.lhs = OutEdge.data;
         self.rhs = OutEdge.data;
-        self.result = InSlot.data;
+        self.result = InEdge.data(self.asNode);
         return 0;
     }
 
@@ -2891,7 +2925,7 @@ See_Also: [SubtractionNode]
     }
 
     /// See [Node.opIndex].
-    inout(InSlot)* opIndex(InSlot.ID slot) inout pure
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
         return slot == 0 ? &this.result : null;
@@ -2914,9 +2948,9 @@ See_Also: [SubtractionNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    @property InSlotIterator!Callable
-    inEdges(Callable = int delegate(ref InSlot) @nogc nothrow)() {
-        return InSlotIterator!Callable(
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
                 auto node = SubtractionNoOverflowSignedNode.ofNode(self);
@@ -2941,7 +2975,7 @@ See_Also: [MultiplicationNoOverflowSignedNode]
     mixin NodeInheritance;
 
     /// Resulting product.
-    InSlot result;
+    InEdge result;
 
     /// Operands.
     OutEdge lhs;
@@ -2959,7 +2993,7 @@ See_Also: [MultiplicationNoOverflowSignedNode]
     +/
     static err_t initialize(MultiplicationNode* self) {
         *self = MultiplicationNode.init;
-        self.result = InSlot.data;
+        self.result = InEdge.data(self.asNode);
         self.lhs = OutEdge.data;
         self.rhs = OutEdge.data;
         return 0;
@@ -2982,7 +3016,7 @@ See_Also: [MultiplicationNoOverflowSignedNode]
     }
 
     /// See [Node.opIndex].
-    inout(InSlot)* opIndex(InSlot.ID slot) inout pure
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
         return slot == 0 ? &this.result : null;
@@ -3005,9 +3039,9 @@ See_Also: [MultiplicationNoOverflowSignedNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    @property InSlotIterator!Callable
-    inEdges(Callable = int delegate(ref InSlot) @nogc nothrow)() {
-        return InSlotIterator!Callable(
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
                 auto node = MultiplicationNode.ofNode(self);
@@ -3031,7 +3065,7 @@ See_Also: [MultiplicationNode]
     mixin NodeInheritance;
 
     /// Resulting product.
-    InSlot result;
+    InEdge result;
 
     /// Operands.
     OutEdge lhs;
@@ -3049,7 +3083,7 @@ See_Also: [MultiplicationNode]
     +/
     static err_t initialize(MultiplicationNoOverflowSignedNode* self) {
         *self = MultiplicationNoOverflowSignedNode.init;
-        self.result = InSlot.data;
+        self.result = InEdge.data(self.asNode);
         self.lhs = OutEdge.data;
         self.rhs = OutEdge.data;
         return 0;
@@ -3072,7 +3106,7 @@ See_Also: [MultiplicationNode]
     }
 
     /// See [Node.opIndex].
-    inout(InSlot)* opIndex(InSlot.ID slot) inout pure
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
         return slot == 0 ? &this.result : null;
@@ -3095,9 +3129,9 @@ See_Also: [MultiplicationNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    @property InSlotIterator!Callable
-    inEdges(Callable = int delegate(ref InSlot) @nogc nothrow)() {
-        return InSlotIterator!Callable(
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
                 auto node = MultiplicationNoOverflowSignedNode.ofNode(self);
@@ -3127,7 +3161,7 @@ See_Also: [SignedDivisionNode]
     OutEdge divisor;
 
     /// Resulting quotient.
-    InSlot quotient;
+    InEdge quotient;
 
  @nogc nothrow:
     /++
@@ -3143,7 +3177,7 @@ See_Also: [SignedDivisionNode]
         *self = UnsignedDivisionNode.init;
         self.dividend = OutEdge.data;
         self.divisor = OutEdge.data;
-        self.quotient = InSlot.data;
+        self.quotient = InEdge.data(self.asNode);
         return 0;
     }
 
@@ -3165,7 +3199,7 @@ See_Also: [SignedDivisionNode]
     }
 
     /// See [Node.opIndex].
-    inout(InSlot)* opIndex(InSlot.ID slot) inout pure
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
         return slot == 0 ? &this.quotient : null;
@@ -3188,9 +3222,9 @@ See_Also: [SignedDivisionNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    @property InSlotIterator!Callable
-    inEdges(Callable = int delegate(ref InSlot) @nogc nothrow)() {
-        return InSlotIterator!Callable(
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
                 auto node = UnsignedDivisionNode.ofNode(self);
@@ -3221,7 +3255,7 @@ See_Also: [UnsignedDivisionNode]
     OutEdge divisor;
 
     /// Resulting quotient.
-    InSlot quotient;
+    InEdge quotient;
 
  @nogc nothrow:
     /++
@@ -3237,7 +3271,7 @@ See_Also: [UnsignedDivisionNode]
         *self = SignedDivisionNode.init;
         self.dividend = OutEdge.data;
         self.divisor = OutEdge.data;
-        self.quotient = InSlot.data;
+        self.quotient = InEdge.data(self.asNode);
         return 0;
     }
 
@@ -3259,7 +3293,7 @@ See_Also: [UnsignedDivisionNode]
     }
 
     /// See [Node.opIndex].
-    inout(InSlot)* opIndex(InSlot.ID slot) inout pure
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
         return slot == 0 ? &this.quotient : null;
@@ -3282,9 +3316,9 @@ See_Also: [UnsignedDivisionNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    @property InSlotIterator!Callable
-    inEdges(Callable = int delegate(ref InSlot) @nogc nothrow)() {
-        return InSlotIterator!Callable(
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
                 auto node = SignedDivisionNode.ofNode(self);
@@ -3314,7 +3348,7 @@ See_Also: [SignedRemainderNode]
     OutEdge divisor;
 
     /// Resulting remainder.
-    InSlot remainder;
+    InEdge remainder;
 
  @nogc nothrow:
     /++
@@ -3330,7 +3364,7 @@ See_Also: [SignedRemainderNode]
         *self = UnsignedRemainderNode.init;
         self.dividend = OutEdge.data;
         self.divisor = OutEdge.data;
-        self.remainder = InSlot.data;
+        self.remainder = InEdge.data(self.asNode);
         return 0;
     }
 
@@ -3352,7 +3386,7 @@ See_Also: [SignedRemainderNode]
     }
 
     /// See [Node.opIndex].
-    inout(InSlot)* opIndex(InSlot.ID slot) inout pure
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
         return slot == 0 ? &this.remainder : null;
@@ -3375,9 +3409,9 @@ See_Also: [SignedRemainderNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    @property InSlotIterator!Callable
-    inEdges(Callable = int delegate(ref InSlot) @nogc nothrow)() {
-        return InSlotIterator!Callable(
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
                 auto node = UnsignedRemainderNode.ofNode(self);
@@ -3408,7 +3442,7 @@ See_Also: [UnsignedRemainderNode]
     OutEdge divisor;
 
     /// Resulting remainder.
-    InSlot remainder;
+    InEdge remainder;
 
  @nogc nothrow:
     /++
@@ -3424,7 +3458,7 @@ See_Also: [UnsignedRemainderNode]
         *self = SignedRemainderNode.init;
         self.dividend = OutEdge.data;
         self.divisor = OutEdge.data;
-        self.remainder = InSlot.data;
+        self.remainder = InEdge.data(self.asNode);
         return 0;
     }
 
@@ -3446,7 +3480,7 @@ See_Also: [UnsignedRemainderNode]
     }
 
     /// See [Node.opIndex].
-    inout(InSlot)* opIndex(InSlot.ID slot) inout pure
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
         return slot == 0 ? &this.remainder : null;
@@ -3469,9 +3503,9 @@ See_Also: [UnsignedRemainderNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    @property InSlotIterator!Callable
-    inEdges(Callable = int delegate(ref InSlot) @nogc nothrow)() {
-        return InSlotIterator!Callable(
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
                 auto node = SignedRemainderNode.ofNode(self);
@@ -3493,7 +3527,7 @@ See_Also: [UnsignedRemainderNode]
     OutEdge rhs; /// ditto
 
     /// A single resulting bit indicating whether operands are equal.
-    InSlot result;
+    InEdge result;
 
  @nogc nothrow:
     /++
@@ -3509,7 +3543,7 @@ See_Also: [UnsignedRemainderNode]
         *self = EqualNode.init;
         self.lhs = OutEdge.data;
         self.rhs = OutEdge.data;
-        self.result = InSlot.data;
+        self.result = InEdge.data(self.asNode);
         return 0;
     }
 
@@ -3530,7 +3564,7 @@ See_Also: [UnsignedRemainderNode]
     }
 
     /// See [Node.opIndex].
-    inout(InSlot)* opIndex(InSlot.ID slot) inout pure
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
         return slot == 0 ? &this.result : null;
@@ -3553,9 +3587,9 @@ See_Also: [UnsignedRemainderNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    @property InSlotIterator!Callable
-    inEdges(Callable = int delegate(ref InSlot) @nogc nothrow)() {
-        return InSlotIterator!Callable(
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
                 auto node = EqualNode.ofNode(self);
@@ -3577,7 +3611,7 @@ See_Also: [UnsignedRemainderNode]
     OutEdge rhs; /// ditto
 
     /// A single resulting bit indicating whether operands are different.
-    InSlot result;
+    InEdge result;
 
  @nogc nothrow:
     /++
@@ -3593,7 +3627,7 @@ See_Also: [UnsignedRemainderNode]
         *self = NotEqualNode.init;
         self.lhs = OutEdge.data;
         self.rhs = OutEdge.data;
-        self.result = InSlot.data;
+        self.result = InEdge.data(self.asNode);
         return 0;
     }
 
@@ -3614,7 +3648,7 @@ See_Also: [UnsignedRemainderNode]
     }
 
     /// See [Node.opIndex].
-    inout(InSlot)* opIndex(InSlot.ID slot) inout pure
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
         return slot == 0 ? &this.result : null;
@@ -3637,9 +3671,9 @@ See_Also: [UnsignedRemainderNode]
     }
 
     /// Provides an iterator over this node's in-edges.
-    @property InSlotIterator!Callable
-    inEdges(Callable = int delegate(ref InSlot) @nogc nothrow)() {
-        return InSlotIterator!Callable(
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
                 auto node = NotEqualNode.ofNode(self);
@@ -3667,7 +3701,7 @@ There is no equivalent for `>` because it suffices to swap this node's operands.
     OutEdge rhs;
 
     /// A single resulting bit indicating `lhs < rhs`.
-    InSlot result;
+    InEdge result;
 
  @nogc nothrow:
     /++
@@ -3683,7 +3717,7 @@ There is no equivalent for `>` because it suffices to swap this node's operands.
         *self = UnsignedLessThanNode.init;
         self.lhs = OutEdge.data;
         self.rhs = OutEdge.data;
-        self.result = InSlot.data;
+        self.result = InEdge.data(self.asNode);
         return 0;
     }
 
@@ -3705,7 +3739,7 @@ There is no equivalent for `>` because it suffices to swap this node's operands.
     }
 
     /// See [Node.opIndex].
-    inout(InSlot)* opIndex(InSlot.ID slot) inout pure
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
         return slot == 0 ? &this.result : null;
@@ -3728,9 +3762,9 @@ There is no equivalent for `>` because it suffices to swap this node's operands.
     }
 
     /// Provides an iterator over this node's in-edges.
-    @property InSlotIterator!Callable
-    inEdges(Callable = int delegate(ref InSlot) @nogc nothrow)() {
-        return InSlotIterator!Callable(
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
                 auto node = UnsignedLessThanNode.ofNode(self);
@@ -3758,7 +3792,7 @@ There is no equivalent for `>` because it suffices to swap this node's operands.
     OutEdge rhs;
 
     /// A single resulting bit indicating `lhs < rhs`.
-    InSlot result;
+    InEdge result;
 
  @nogc nothrow:
     /++
@@ -3774,7 +3808,7 @@ There is no equivalent for `>` because it suffices to swap this node's operands.
         *self = SignedLessThanNode.init;
         self.lhs = OutEdge.data;
         self.rhs = OutEdge.data;
-        self.result = InSlot.data;
+        self.result = InEdge.data(self.asNode);
         return 0;
     }
 
@@ -3796,7 +3830,7 @@ There is no equivalent for `>` because it suffices to swap this node's operands.
     }
 
     /// See [Node.opIndex].
-    inout(InSlot)* opIndex(InSlot.ID slot) inout pure
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
         return slot == 0 ? &this.result : null;
@@ -3819,9 +3853,9 @@ There is no equivalent for `>` because it suffices to swap this node's operands.
     }
 
     /// Provides an iterator over this node's in-edges.
-    @property InSlotIterator!Callable
-    inEdges(Callable = int delegate(ref InSlot) @nogc nothrow)() {
-        return InSlotIterator!Callable(
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
                 auto node = SignedLessThanNode.ofNode(self);
@@ -3849,7 +3883,7 @@ There is no equivalent for `<=` because it suffices to swap this node's operands
     OutEdge rhs;
 
     /// A single resulting bit indicating `lhs >= rhs`.
-    InSlot result;
+    InEdge result;
 
  @nogc nothrow:
     /++
@@ -3865,7 +3899,7 @@ There is no equivalent for `<=` because it suffices to swap this node's operands
         *self = UnsignedGreaterOrEqualNode.init;
         self.lhs = OutEdge.data;
         self.rhs = OutEdge.data;
-        self.result = InSlot.data;
+        self.result = InEdge.data(self.asNode);
         return 0;
     }
 
@@ -3887,7 +3921,7 @@ There is no equivalent for `<=` because it suffices to swap this node's operands
     }
 
     /// See [Node.opIndex].
-    inout(InSlot)* opIndex(InSlot.ID slot) inout pure
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
         return slot == 0 ? &this.result : null;
@@ -3910,9 +3944,9 @@ There is no equivalent for `<=` because it suffices to swap this node's operands
     }
 
     /// Provides an iterator over this node's in-edges.
-    @property InSlotIterator!Callable
-    inEdges(Callable = int delegate(ref InSlot) @nogc nothrow)() {
-        return InSlotIterator!Callable(
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
                 auto node = UnsignedGreaterOrEqualNode.ofNode(self);
@@ -3940,7 +3974,7 @@ There is no equivalent for `<=` because it suffices to swap this node's operands
     OutEdge rhs;
 
     /// A single resulting bit indicating `lhs >= rhs`.
-    InSlot result;
+    InEdge result;
 
  @nogc nothrow:
     /++
@@ -3956,7 +3990,7 @@ There is no equivalent for `<=` because it suffices to swap this node's operands
         *self = SignedGreaterOrEqualNode.init;
         self.lhs = OutEdge.data;
         self.rhs = OutEdge.data;
-        self.result = InSlot.data;
+        self.result = InEdge.data(self.asNode);
         return 0;
     }
 
@@ -3978,7 +4012,7 @@ There is no equivalent for `<=` because it suffices to swap this node's operands
     }
 
     /// See [Node.opIndex].
-    inout(InSlot)* opIndex(InSlot.ID slot) inout pure
+    inout(InEdge)* opIndex(InEdge.ID slot) inout pure
     return // XXX: fuck v2.100.0
     {
         return slot == 0 ? &this.result : null;
@@ -4001,9 +4035,9 @@ There is no equivalent for `<=` because it suffices to swap this node's operands
     }
 
     /// Provides an iterator over this node's in-edges.
-    @property InSlotIterator!Callable
-    inEdges(Callable = int delegate(ref InSlot) @nogc nothrow)() {
-        return InSlotIterator!Callable(
+    @property InEdgeIterator!Callable
+    inEdges(Callable = int delegate(ref InEdge) @nogc nothrow)() {
+        return InEdgeIterator!Callable(
             this.asNode,
             (Node* self, scope Callable iter){
                 auto node = SignedGreaterOrEqualNode.ofNode(self);
